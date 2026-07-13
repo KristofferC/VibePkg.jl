@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+VibePkg = "3f0b6c73-7bb3-486f-8fc9-2db233a17ba0"
+
+[compat]
+Documenter = "1"

@@ -1,0 +1,437 @@
+# depot isolation + hermeticity guard for the whole process
+# (see test/local_pkg_server.jl — never touches ~/.julia)
+if !@isdefined(LocalPkgServer)
+    include("local_pkg_server.jl")
+end
+LocalPkgServer.isolate!()
+
+using Test
+using UUIDs: UUID
+using TOML
+using VibePkg
+using VibePkg.EnvFiles
+using VibePkg.EnvFiles: with_project, with_manifest, Compat, SourceSpec, AppInfo,
+    PathTracked, RepoTracked, RegistryTracked
+using VibePkg.Errors: PkgError
+using VibePkg.Versions: semver_spec
+
+@testset "app metadata validation" begin
+    valid = VibePkg.EnvFiles.read_project_apps(
+        Dict{String, Any}(
+            "hello-world" => Dict{String, Any}("submodule" => "CLI"),
+        )
+    )
+    @test valid["hello-world"].submodule == "CLI"
+
+    for name in ("", "../outside", "dir/app", raw"dir\app", "-leading")
+        @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
+            Dict{String, Any}(name => Dict{String, Any}())
+        )
+    end
+    @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
+        Dict{String, Any}("hello" => Dict{String, Any}("submodule" => "CLI.Sub"))
+    )
+    @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
+        Dict{String, Any}("hello" => Dict{String, Any}("submodule" => 1))
+    )
+
+    # Stored app entries use a qualified module name, but retain the same
+    # path-safe app-name contract.
+    manifest_app = Dict{String, Any}(
+        "julia_command" => joinpath(Sys.BINDIR, "julia"),
+        "submodule" => "AppPkg.CLI",
+    )
+    @test VibePkg.EnvFiles.read_apps(Dict("hello" => manifest_app))["hello"].submodule == "AppPkg.CLI"
+    @test_throws PkgError VibePkg.EnvFiles.read_apps(Dict("../outside" => manifest_app))
+end
+
+const MANIFEST_FIXTURES = joinpath(@__DIR__, "fixtures", "manifest")
+
+manifest_body(text) = split(text, "\n\n"; limit = 2)[2]  # strip header comment
+
+@testset "EnvFiles" begin
+
+    @testset "project round trip" begin
+        raw = """
+        name = "Example"
+        uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+        version = "1.2.3"
+        custom_key = "preserved"
+
+        [deps]
+        TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+        Example = "0000af07-990d-54b4-ab0e-23690620f79a"
+
+        [weakdeps]
+        SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+
+        [extensions]
+        SHAExt = "SHA"
+
+        [sources]
+        Example = { url = "https://example.com/Example.jl", rev = "main" }
+
+        [compat]
+        julia = "1.12"
+        TOML = "1"
+
+        [extras]
+        Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+        [targets]
+        test = ["Test"]
+        """
+        p = parse_project(TOML.parse(raw))
+        @test p.name == "Example"
+        @test p.uuid == UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+        @test p.version == v"1.2.3"
+        @test p.sources["Example"] == SourceSpec(nothing, "https://example.com/Example.jl", "main", nothing)
+        @test p.compat["TOML"].val == semver_spec("1")
+        @test p.raw["custom_key"] == "preserved"
+
+        text = render_project(p)
+        @test parse_project(TOML.parse(text)) == p
+        @test occursin("custom_key = \"preserved\"", text)
+        lines = split(text, '\n')
+        @test startswith(lines[1], "name = ")     # canonical key order
+        @test startswith(lines[2], "uuid = ")
+        @test occursin(r"Example = \{.*url = ", text)  # sources inline
+
+        # functional update leaves the original untouched
+        p2 = with_project(p; version = v"2.0.0")
+        @test p2.version == v"2.0.0" && p.version == v"1.2.3" && p2 != p
+    end
+
+    @testset "project semantics" begin
+        # deps ∩ weakdeps: weak-only in memory, merged back into [deps] on write
+        p = parse_project(
+            TOML.parse(
+                """
+                [deps]
+                SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+                [weakdeps]
+                SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+                """
+            )
+        )
+        @test !haskey(p.deps, "SHA") && haskey(p.deps_weak, "SHA")
+        out = TOML.parse(render_project(p))
+        @test haskey(out["deps"], "SHA") && haskey(out["weakdeps"], "SHA")
+
+        # legacy `path` key becomes entryfile; only entryfile is written back
+        p = parse_project(TOML.parse("path = \"src/other.jl\""))
+        @test p.entryfile == "src/other.jl"
+        out = TOML.parse(render_project(p))
+        @test out["entryfile"] == "src/other.jl" && !haskey(out, "path")
+
+        # a few validation errors
+        @test_throws PkgError parse_project(
+            TOML.parse(
+                """
+                [deps]
+                A = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+                B = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+                """
+            )
+        )
+        @test_throws PkgError parse_project(TOML.parse("[compat]\nNotADep = \"1\""))
+        @test_throws PkgError parse_project(
+            TOML.parse(
+                """
+                [deps]
+                A = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+                [sources]
+                A = { url = "https://example.com", path = "../A" }
+                """
+            )
+        )
+    end
+
+    @testset "manifest read + round trip" begin
+        m = read_manifest(joinpath(MANIFEST_FIXTURES, "good", "simple.toml"))
+        @test m.manifest_format == v"2.0.0"
+        example = only(e for (u, e) in m if e.name == "Example")
+        @test example.tracking isa RegistryTracked
+        @test entry_version(example) == v"0.5.1"
+        @test haskey(example.deps, "Test")
+        stdlib = only(e for (u, e) in m if e.name == "Base64")
+        @test entry_version(stdlib) === nothing && entry_tree_hash(stdlib) === nothing
+
+        text = render_manifest(m)
+        @test startswith(text, "# This file is machine-generated - editing it directly is not advised\n\n")
+        @test parse_manifest(TOML.parse(manifest_body(text)), "roundtrip") == m
+
+        # duplicate names round trip through the uuid-table deps form
+        m = read_manifest(joinpath(MANIFEST_FIXTURES, "good", "not_unique_names.toml"))
+        @test parse_manifest(TOML.parse(manifest_body(render_manifest(m))), "roundtrip") == m
+    end
+
+    @testset "manifest deps normalization" begin
+        # Pkg.jl#4631: vector-form deps may name a stdlib without a manifest
+        # entry of its own; it maps to the stdlib uuid
+        text = """
+        manifest_format = "2.0"
+
+        [[deps.Example]]
+        deps = ["SHA"]
+        git-tree-sha1 = "1111111111111111111111111111111111111111"
+        uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+        version = "0.5.1"
+        """
+        m = parse_manifest(TOML.parse(text), "test")
+        example = m[UUID("7876af07-990d-54b4-ab0e-23690620f79a")]
+        @test example.deps["SHA"] == UUID("ea8e919c-243c-51af-8825-aaa63cd721ce")
+        # a missing non-stdlib name still errors
+        @test_throws PkgError parse_manifest(TOML.parse(replace(text, "SHA" => "NotAThing")), "test")
+
+        # Pkg.jl#128: the short name-array deps form is only used when the
+        # recorded uuid matches the manifest entry of that name
+        text = """
+        manifest_format = "2.0"
+
+        [[deps.A]]
+        git-tree-sha1 = "1111111111111111111111111111111111111111"
+        uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        version = "1.0.0"
+
+            [deps.A.weakdeps]
+            B = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+        [[deps.B]]
+        git-tree-sha1 = "2222222222222222222222222222222222222222"
+        uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        version = "1.0.0"
+        """
+        m = parse_manifest(TOML.parse(text), "test")
+        m2 = parse_manifest(TOML.parse(manifest_body(render_manifest(m))), "roundtrip")
+        @test m2[UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")].weakdeps["B"] ==
+            UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    end
+
+    @testset "safe_realpath termination" begin
+        # Pkg.jl#3085: nonexistent, empty, and drive-like paths return without error
+        sr = VibePkg.Environments.safe_realpath
+        # Start below a canonical, platform-native root.  On Windows,
+        # `/no-such-root` is relative to the current drive and realpath(`/`)
+        # legitimately expands it to (for example) `D:\\`.
+        deep = joinpath(realpath(tempdir()), "vibepkg-no-such-root", fill("x", 30)...)
+        @test sr(deep) == deep
+        @test sr("") == ""
+        @test sr("Z:") == "Z:"
+    end
+
+    @testset "manifest entry states" begin
+        uuid = UUID("11111111-2222-3333-4444-555555555555")
+        sha = Base.SHA1("8eb7b4d4ca487caade9ba3e85932e28ce6d6e1f8")
+        mk(tracking; pinned = false) = with_manifest(
+            Manifest();
+            julia_version = v"1.12.0",
+            deps = Dict(
+                uuid => EnvFiles.ManifestEntry(
+                    "Foo", uuid, tracking, pinned,
+                    Dict{String, UUID}(), Dict{String, UUID}(),
+                    Dict{String, Union{String, Vector{String}}}(), Dict{String, AppInfo}(),
+                    nothing, nothing, Dict{String, Any}(),
+                )
+            ),
+        )
+        entry_toml(m) = TOML.parse(manifest_body(render_manifest(m)))["deps"]["Foo"][1]
+
+        e = entry_toml(mk(RegistryTracked(v"1.0.0", sha, ["General"])))
+        @test e["version"] == "1.0.0" && e["git-tree-sha1"] == string(sha)
+        @test e["registries"] == "General"          # single registry as bare string
+
+        e = entry_toml(mk(PathTracked("../Foo", v"1.0.0")))
+        @test e["path"] == "../Foo" && !haskey(e, "git-tree-sha1")
+
+        e = entry_toml(mk(RepoTracked("https://x.com/Foo.jl", "main", nothing, sha, v"1.0.0")))
+        @test e["repo-url"] == "https://x.com/Foo.jl" && e["repo-rev"] == "main"
+
+        e = entry_toml(mk(RegistryTracked(v"1.0.0", sha, String[]); pinned = true))
+        @test e["pinned"] === true
+
+        # repo tracking without a tree hash cannot be written
+        @test_throws PkgError render_manifest(mk(RepoTracked("https://x.com/Foo.jl", "main", nothing, nothing, nothing)))
+    end
+
+    @testset "manifest metadata" begin
+        text = """
+        julia_version = "1.12.0"
+        manifest_format = "2.1"
+        project_hash = "8eb7b4d4ca487caade9ba3e85932e28ce6d6e1f8"
+
+        [[deps.Example]]
+        entryfile = "src/other.jl"
+        git-tree-sha1 = "8eb7b4d4ca487caade9ba3e85932e28ce6d6e1f8"
+        uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+        version = "0.5.1"
+        """
+        m = parse_manifest(TOML.parse(text), "test")
+        # project_hash is a single typed channel
+        @test m.project_hash == Base.SHA1("8eb7b4d4ca487caade9ba3e85932e28ce6d6e1f8")
+        @test !haskey(m.raw, "project_hash")
+        m2 = with_manifest(m; project_hash = Base.SHA1("0000000000000000000000000000000000000000"))
+        @test occursin("project_hash = \"0000000000000000000000000000000000000000\"", render_manifest(m2))
+        # entryfile round-trips
+        @test m[UUID("7876af07-990d-54b4-ab0e-23690620f79a")].entryfile == "src/other.jl"
+        @test occursin("entryfile = \"src/other.jl\"", render_manifest(m))
+    end
+
+    @testset "JuliaProject.toml discovery" begin
+        # JuliaProject.toml is preferred over Project.toml (Base.project_names order)
+        mktempdir() do dir
+            write(joinpath(dir, "Project.toml"), "name = \"Plain\"\n")
+            write(joinpath(dir, "JuliaProject.toml"), "name = \"JuliaFlavored\"\n")
+            @test projectfile_path(dir) == joinpath(dir, "JuliaProject.toml")
+            # non-strict manifest pairing follows the project file flavor
+            @test manifestfile_path(dir) == joinpath(dir, "JuliaManifest.toml")
+
+            env = VibePkg.Environments.load_environment(dir; depots = VibePkg.Depots.depot_stack())
+            @test basename(env.project_file) == "JuliaProject.toml"
+            @test env.project.name == "JuliaFlavored"
+            @test basename(env.manifest_file) == "JuliaManifest.toml"
+        end
+        # without JuliaProject.toml, the plain names are used
+        mktempdir() do dir
+            write(joinpath(dir, "Project.toml"), "name = \"Plain\"\n")
+            @test projectfile_path(dir) == joinpath(dir, "Project.toml")
+            @test manifestfile_path(dir) == joinpath(dir, "Manifest.toml")
+        end
+    end
+
+    @testset "versioned manifest discovery" begin
+        mktempdir() do dir
+            vname = "Manifest-v$(VERSION.major).$(VERSION.minor).toml"
+            write(joinpath(dir, "Project.toml"), "")
+            versioned = joinpath(dir, vname)
+            write(
+                versioned, """
+                julia_version = "$(VERSION.major).$(VERSION.minor).0"
+                manifest_format = "2.0"
+
+                [[deps.Example]]
+                git-tree-sha1 = "1111111111111111111111111111111111111111"
+                uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+                version = "0.5.0"
+                """
+            )
+            plain = joinpath(dir, "Manifest.toml")
+            write(plain, "julia_version = \"1.0.0\"\nmanifest_format = \"2.0\"\n")
+            plain_bytes = read(plain)
+
+            @test manifestfile_path(dir) == versioned
+
+            depots = VibePkg.Depots.depot_stack()
+            env = VibePkg.Environments.load_environment(dir; depots)
+            @test basename(env.manifest_file) == vname
+            @test haskey(env.manifest, UUID("7876af07-990d-54b4-ab0e-23690620f79a"))
+
+            # a write goes through the versioned file; the plain one is untouched
+            m2 = with_manifest(env.manifest; julia_version = v"1.99.0")
+            env2 = VibePkg.Environments.Environment(
+                env.project_file, env.manifest_file, env.project, m2, env.workspace
+            )
+            @test VibePkg.Environments.write_environment(env, env2)
+            @test occursin("julia_version = \"1.99.0\"", read(versioned, String))
+            @test read_manifest(versioned).julia_version == v"1.99.0"
+            @test read(plain) == plain_bytes
+        end
+    end
+
+    @testset "manifest [registries] round trip" begin
+        text = """
+        julia_version = "1.12.0"
+        manifest_format = "2.1"
+
+        [registries.General]
+        uuid = "23338594-aafe-5451-b93e-139f81909106"
+        url = "https://github.com/JuliaRegistries/General.git"
+
+        [registries.Local]
+        uuid = "23338594-aafe-5451-b93e-139f81909107"
+
+        [[deps.Example]]
+        git-tree-sha1 = "1111111111111111111111111111111111111111"
+        uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+        version = "0.5.0"
+        """
+        m = parse_manifest(TOML.parse(text), "test")
+        general = m.registries["General"]
+        @test general.uuid == UUID("23338594-aafe-5451-b93e-139f81909106")
+        @test general.url == "https://github.com/JuliaRegistries/General.git"
+        local_reg = m.registries["Local"]
+        @test local_reg.uuid == UUID("23338594-aafe-5451-b93e-139f81909107")
+        @test local_reg.url === nothing    # url is optional
+
+        # read → write survives unchanged, `url` omitted when absent
+        rendered = render_manifest(m)
+        @test parse_manifest(TOML.parse(manifest_body(rendered)), "roundtrip") == m
+        raw = TOML.parse(manifest_body(rendered))
+        @test raw["registries"]["General"]["url"] == "https://github.com/JuliaRegistries/General.git"
+        @test !haskey(raw["registries"]["Local"], "url")
+
+        # a nonempty [registries] section requires format 2.1 on write
+        m20 = with_manifest(m; manifest_format = v"2.0.0")
+        @test TOML.parse(manifest_body(render_manifest(m20)))["manifest_format"] == "2.1"
+
+        # empty registries: the section is omitted entirely
+        m_empty = with_manifest(m; registries = Dict{String, EnvFiles.RegistryRef}())
+        @test !haskey(TOML.parse(manifest_body(render_manifest(m_empty))), "registries")
+
+        # `uuid` is required
+        @test_throws PkgError parse_manifest(
+            TOML.parse("manifest_format = \"2.1\"\n\n[registries.General]\nurl = \"https://x.com\"\n"),
+            "test",
+        )
+    end
+
+    @testset "manifest formats" begin
+        # v1 stays v1 on plain write, without v2 metadata
+        m = read_manifest(joinpath(MANIFEST_FIXTURES, "formats", "v1.0", "Manifest.toml"))
+        @test m.manifest_format == v"1.0.0"
+        raw = TOML.parse(manifest_body(render_manifest(m)))
+        @test !haskey(raw, "manifest_format") && !haskey(raw, "julia_version")
+
+        # missing and empty files
+        @test read_manifest(joinpath(@__DIR__, "does-not-exist", "Manifest.toml")) == Manifest()
+        mktempdir() do dir
+            f = joinpath(dir, "Manifest.toml")
+            write(f, "")
+            @test read_manifest(f).manifest_format == v"2.0.0"
+        end
+
+        # malformed manifests error
+        for f in readdir(joinpath(MANIFEST_FIXTURES, "bad"); join = true)
+            # a stdlib dep without its own entry is valid since Pkg.jl#4631
+            basename(f) == "missing_entry.toml" && continue
+            @test_throws Exception read_manifest(f)
+        end
+    end
+end
+
+# Malformed TOML values must error via PkgError (or be accepted when valid),
+# never silently convert or crash with a MethodError/TypeError.
+@testset "malformed TOML scalar and array values" begin
+    E = VibePkg.EnvFiles
+    # UUID(::Integer) exists, so an integer dep value must error, not convert
+    @test_throws PkgError E.read_project_deps(Dict{String, Any}("Foo" => 123), "deps")
+    @test_throws PkgError E.read_deps(Dict{String, Any}("Foo" => 123))
+
+    # empty TOML arrays parse as Vector{Any} but are valid dependency lists
+    @test E.read_project_targets(Dict{String, Any}("test" => Any[])) == Dict("test" => String[])
+    @test E.read_project_exts(Dict{String, Any}("Ext" => Any[])) == Dict("Ext" => String[])
+    @test E.read_exts(Dict{String, Any}("Ext" => Any[])) == Dict("Ext" => String[])
+
+    # ... including inside manifest entries (VibePkg itself can write these)
+    manifest = """
+    manifest_format = "2.0"
+
+    [[deps.Foo]]
+    uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+    version = "1.0.0"
+    registries = []
+    deps = []
+    """
+    m = read_manifest(IOBuffer(manifest))
+    @test haskey(m, UUID("7876af07-990d-54b4-ab0e-23690620f79a"))
+end
