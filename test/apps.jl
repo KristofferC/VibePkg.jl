@@ -14,7 +14,6 @@ using VibePkg.Registries: RegistryInstance, reachable_registries
 using VibePkg.Planning: PackageRequest
 using VibePkg.AppsOps
 using VibePkg.EnvFiles: read_manifest, entry_version, entry_path, is_path_tracked
-using VibePkg.TreeHash: tree_hash
 using VibePkg.Errors: PkgError
 import TOML
 
@@ -24,13 +23,27 @@ const DEP_UUID = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
 
 # The first run of a shim precompiles its app environment, printing progress
 # to the subprocess' stderr; capture both streams so the noise stays out of
-# the test log, surfacing them only when the shim fails.
-function run_shim(cmd::Cmd)
+# the test log, surfacing them only when the shim fails. Shims are `.bat`
+# scripts on Windows (run through `cmd /c`) and `sh` scripts elsewhere.
+function run_shim(shim::String, args::String...)
+    cmd = Sys.iswindows() ? `cmd /c $shim $args` : `sh $shim $args`
     buf = IOBuffer()
     p = run(pipeline(ignorestatus(cmd); stdout = buf, stderr = buf))
     output = String(take!(buf))
     success(p) || error("shim run failed ($cmd):\n$output")
     return output
+end
+
+# The registry fixture must record the hash of the tree git committed, as a
+# real registry does. Re-hashing the worktree is not equivalent on Windows,
+# where the ACL-derived executable bits can differ from the modes in the
+# committed tree (same reasoning as `git_tree_hash` in test/git.jl).
+function commit_tree_hash(repo::LibGit2.GitRepo, commit::LibGit2.GitHash)
+    return LibGit2.with(LibGit2.GitCommit(repo, commit)) do c
+        LibGit2.with(LibGit2.peel(LibGit2.GitTree, c)) do tree
+            string(LibGit2.GitHash(tree))
+        end
+    end
 end
 
 function write_app_package_toml(path::String, name::String, uuid::UUID, repo::String)
@@ -46,7 +59,6 @@ function write_app_package_toml(path::String, name::String, uuid::UUID, repo::St
 end
 
 @testset "apps" begin
-    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
         pkg = joinpath(dir, "AppPkg")
         mkpath(joinpath(pkg, "src"))
@@ -75,9 +87,10 @@ end
         depots = depot_stack([depot])
 
         AppsOps.app_develop(Config(depots), RegistryInstance[], pkg; io = devnull)
-        shim = joinpath(depot, "bin", "hello")
+        shim = AppsOps.shim_path(depots, "hello")
         @test isfile(shim)
-        @test !iszero(filemode(shim) & 0o100)          # executable
+        # executable (meaningless on Windows, where the .bat extension decides)
+        Sys.iswindows() || @test !iszero(filemode(shim) & 0o100)
 
         manifest = read_manifest(AppsOps.app_manifest_file(depots))
         entry = manifest[APP_UUID]
@@ -85,11 +98,11 @@ end
         @test entry.apps["hello"].submodule == "AppPkg"
 
         # the shim actually runs the app entry point
-        out = run_shim(`sh $shim a b`)
+        out = run_shim(shim, "a", "b")
         @test occursin("app says: a+b", out)
 
         # `--` splits julia args from app args; `--` itself never reaches the app
-        out = run_shim(`sh $shim --threads=2 -- a b`)
+        out = run_shim(shim, "--threads=2", "--", "a", "b")
         @test occursin("app says: a+b", out)
 
         # the windows flavor renders a .bat with the same protocol
@@ -115,7 +128,7 @@ end
         Base.rm(shim)
         AppsOps.app_update(Config(depots), RegistryInstance[]; io = devnull)
         @test isfile(shim)
-        @test occursin("app says: a+b", run_shim(`sh $shim a b`))
+        @test occursin("app says: a+b", run_shim(shim, "a", "b"))
 
         AppsOps.app_rm(depots, "AppPkg"; io = devnull)
         @test !isfile(shim)
@@ -127,7 +140,6 @@ end
 # `app_add` of a registered package: registry + local git repo fixture, no
 # pkg server (JULIA_PKG_SERVER="" forces the git-clone install fallback)
 @testset "apps: add by registry name" begin
-    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
         # the app package: two registered versions in a local git repo
         pkg = joinpath(dir, "AppPkg.jl")
@@ -157,8 +169,8 @@ end
                 """
             )
             LibGit2.add!(repo, "Project.toml", "src/AppPkg.jl")
-            LibGit2.commit(repo, "AppPkg v$v"; author = sig, committer = sig)
-            hashes[v] = bytes2hex(tree_hash(pkg))
+            commit = LibGit2.commit(repo, "AppPkg v$v"; author = sig, committer = sig)
+            hashes[v] = commit_tree_hash(repo, commit)
         end
         close(repo)
 
@@ -187,25 +199,25 @@ end
 
         depots = depot_stack([depot])
         regs = reachable_registries(depots)
-        shim = joinpath(depot, "bin", "hello")
+        shim = AppsOps.shim_path(depots, "hello")
         installed_version() = entry_version(read_manifest(AppsOps.app_manifest_file(depots))[APP_UUID])
 
         withenv("JULIA_PKG_SERVER" => "") do
             # by name: resolves to the latest version
             AppsOps.app_add(Config(depots), regs, PackageRequest("AppPkg"); io = devnull)
             @test installed_version() == v"2.0.0"
-            @test occursin("app v2.0.0 says: a+b", run_shim(`sh $shim a b`))
+            @test occursin("app v2.0.0 says: a+b", run_shim(shim, "a", "b"))
 
             # an explicit version is honored
             AppsOps.app_rm(depots, "AppPkg"; io = devnull)
             AppsOps.app_add(Config(depots), regs, PackageRequest("AppPkg", nothing, "1.2.3"); io = devnull)
             @test installed_version() == v"1.2.3"
-            @test occursin("app v1.2.3 says: a+b", run_shim(`sh $shim a b`))
+            @test occursin("app v1.2.3 says: a+b", run_shim(shim, "a", "b"))
 
             # `app update` moves a registry-tracked app to the latest version
             AppsOps.app_update(Config(depots), regs; io = devnull)
             @test installed_version() == v"2.0.0"
-            @test occursin("app v2.0.0 says: a+b", run_shim(`sh $shim a b`))
+            @test occursin("app v2.0.0 says: a+b", run_shim(shim, "a", "b"))
             # updating an unknown name errors
             @test_throws PkgError AppsOps.app_update(Config(depots), regs, "NoSuchApp"; io = devnull)
 
@@ -215,7 +227,7 @@ end
             AppsOps.app_add(Config(depots), regs, PackageRequest(nothing, APP_UUID, nothing); io = devnull)
             @test isdir(joinpath(depot, "environments", "apps", "AppPkg"))
             @test !isdir(joinpath(depot, "environments", "apps", string(APP_UUID)))
-            @test occursin("app v2.0.0 says: x", run_shim(`sh $shim x`))
+            @test occursin("app v2.0.0 says: x", run_shim(shim, "x"))
 
             # A failed update is prepared in a staging environment and must
             # not delete the last working installation.
@@ -235,14 +247,13 @@ end
             @test_throws ErrorException AppsOps.app_update(Config(depots), bad_regs; io = devnull)
             @test read(joinpath(env_dir, "Project.toml"), String) == project_before
             @test read(joinpath(env_dir, "Manifest.toml"), String) == manifest_before
-            @test occursin("app v2.0.0 says: still-works", run_shim(`sh $shim still-works`))
+            @test occursin("app v2.0.0 says: still-works", run_shim(shim, "still-works"))
             @test !any(startswith(".install-"), readdir(joinpath(depot, "environments", "apps")))
         end
     end
 end
 
 @testset "apps: ownership and stale shims" begin
-    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
         function make_app(path, name, uuid, app_name, message)
             mkpath(joinpath(path, "src"))
@@ -277,7 +288,7 @@ end
         depots = depot_stack([depot])
         config = Config(depots)
         AppsOps.app_develop(config, RegistryInstance[], first_pkg; io = devnull)
-        shim = joinpath(depot, "bin", "shared")
+        shim = AppsOps.shim_path(depots, "shared")
         manifest_before = read(AppsOps.app_manifest_file(depots), String)
         shim_before = read(shim, String)
 
@@ -291,21 +302,20 @@ end
         @test occursin("already installed by package `FirstApp`", err.msg)
         @test read(AppsOps.app_manifest_file(depots), String) == manifest_before
         @test read(shim, String) == shim_before
-        @test occursin("first owner", run_shim(`sh $shim`))
+        @test occursin("first owner", run_shim(shim))
 
         # Replacing a package's app set removes shims it no longer owns.
         project_file = joinpath(first_pkg, "Project.toml")
         write(project_file, replace(read(project_file, String), "shared = {}" => "renamed = {}"))
         AppsOps.app_develop(config, RegistryInstance[], first_pkg; io = devnull)
         @test !isfile(shim)
-        @test isfile(joinpath(depot, "bin", "renamed"))
+        @test isfile(AppsOps.shim_path(depots, "renamed"))
     end
 end
 
 # per-app `submodule` and `julia_flags` entries, plus the
 # `JULIA_APPS_JULIA_CMD` executable override honored by the shims
 @testset "apps: submodule, julia_flags, julia cmd override" begin
-    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
         pkg = joinpath(dir, "SubApp")
         mkpath(joinpath(pkg, "src"))
@@ -345,35 +355,43 @@ end
         # runs `julia -m SubApp.CLI` and the submodule's `@main` answers
         entry = read_manifest(AppsOps.app_manifest_file(depots))[SUBAPP_UUID]
         @test entry.apps["subcli"].submodule == "SubApp.CLI"
-        shim_sub = joinpath(depot, "bin", "subcli")
+        shim_sub = AppsOps.shim_path(depots, "subcli")
         @test occursin("SubApp.CLI", read(shim_sub, String))
-        @test occursin("cli submodule says: x,y", run_shim(`sh $shim_sub x y`))
+        @test occursin("cli submodule says: x,y", run_shim(shim_sub, "x", "y"))
 
         # baked `julia_flags` reach the app process ...
         @test entry.apps["nthr"].julia_flags == ["--threads=2"]
-        shim_thr = joinpath(depot, "bin", "nthr")
-        @test occursin("nthreads: 2", run_shim(`sh $shim_thr`))
+        shim_thr = AppsOps.shim_path(depots, "nthr")
+        @test occursin("nthreads: 2", run_shim(shim_thr))
         # ... and runtime julia args (before `--`) land after the baked
         # flags on the command line, so a repeated flag is overridden
-        @test occursin("nthreads: 3", run_shim(`sh $shim_thr --threads=3 --`))
+        # (cmd.exe splits `--threads=3` at the `=`; julia accepts the
+        # resulting space-separated form too)
+        @test occursin("nthreads: 3", run_shim(shim_thr, "--threads=3", "--"))
 
         # JULIA_APPS_JULIA_CMD replaces the recorded julia executable
-        wrapper = joinpath(dir, "juliawrap")
-        write(
-            wrapper, """
-            #!/bin/sh
-            echo "WRAPPER-MARKER"
-            exec $(Base.shell_escape(joinpath(Sys.BINDIR, "julia"))) "\$@"
-            """
-        )
-        chmod(wrapper, 0o755)
+        julia_exe = joinpath(Sys.BINDIR, Sys.iswindows() ? "julia.exe" : "julia")
+        if Sys.iswindows()
+            wrapper = joinpath(dir, "juliawrap.bat")
+            write(wrapper, "@echo off\r\necho WRAPPER-MARKER\r\n\"$julia_exe\" %*\r\n")
+        else
+            wrapper = joinpath(dir, "juliawrap")
+            write(
+                wrapper, """
+                #!/bin/sh
+                echo "WRAPPER-MARKER"
+                exec $(Base.shell_escape(julia_exe)) "\$@"
+                """
+            )
+            chmod(wrapper, 0o755)
+        end
         out = withenv("JULIA_APPS_JULIA_CMD" => wrapper) do
-            run_shim(`sh $shim_sub a`)
+            run_shim(shim_sub, "a")
         end
         @test occursin("WRAPPER-MARKER", out)
         @test occursin("cli submodule says: a", out)
         # without the override the recorded executable runs, no wrapper
-        @test !occursin("WRAPPER-MARKER", run_shim(`sh $shim_sub a`))
+        @test !occursin("WRAPPER-MARKER", run_shim(shim_sub, "a"))
     end
 end
 
@@ -381,7 +399,6 @@ end
 # its relative path is only valid next to the original checkout, not next
 # to the installed tree or the app environment  # Pkg.jl#4714
 @testset "apps: add with [sources] in the app package" begin
-    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
         sig = LibGit2.Signature("fixture", "fixture@localhost")
         # the dependency: registered, and a repository sibling of the app
@@ -404,9 +421,9 @@ end
         )
         repo = LibGit2.init(dep)
         LibGit2.add!(repo, "Project.toml", "src/DepPkg.jl")
-        LibGit2.commit(repo, "DepPkg v1.0.0"; author = sig, committer = sig)
+        commit = LibGit2.commit(repo, "DepPkg v1.0.0"; author = sig, committer = sig)
+        dep_hash = commit_tree_hash(repo, commit)
         close(repo)
-        dep_hash = bytes2hex(tree_hash(dep))
 
         # the app package: depends on DepPkg with a [sources] path that only
         # resolves relative to this checkout
@@ -441,9 +458,9 @@ end
         )
         repo = LibGit2.init(pkg)
         LibGit2.add!(repo, "Project.toml", "src/AppPkg.jl")
-        LibGit2.commit(repo, "AppPkg v1.0.0"; author = sig, committer = sig)
+        commit = LibGit2.commit(repo, "AppPkg v1.0.0"; author = sig, committer = sig)
+        pkg_hash = commit_tree_hash(repo, commit)
         close(repo)
-        pkg_hash = bytes2hex(tree_hash(pkg))
 
         depot = mkpath(joinpath(dir, "depot"))
         reg = joinpath(depot, "registries", "TestRegistry")
@@ -486,18 +503,17 @@ end
         withenv("JULIA_PKG_SERVER" => "") do
             AppsOps.app_add(Config(depots), regs, PackageRequest("AppPkg"); io = devnull)
         end
-        shim = joinpath(depot, "bin", "hello")
+        shim = AppsOps.shim_path(depots, "hello")
         @test isfile(shim)
         # the dep resolved from the registry, not the dangling path
         env_manifest = read_manifest(joinpath(depot, "environments", "apps", "AppPkg", "Manifest.toml"))
         @test !is_path_tracked(env_manifest[DEP_UUID])
-        @test occursin("app says: hello from dep", run_shim(`sh $shim`))
+        @test occursin("app says: hello from dep", run_shim(shim))
     end
 end
 
 # `app dev .` from inside the package directory  # Pkg.jl#4480
 @testset "apps: develop pwd" begin
-    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
         pkg = joinpath(dir, "AppPkg")
         mkpath(joinpath(pkg, "src"))
@@ -527,7 +543,7 @@ end
         cd(pkg) do
             AppsOps.app_develop(Config(depots), RegistryInstance[], "."; io = devnull)
         end
-        @test isfile(joinpath(depot, "bin", "hello"))
+        @test isfile(AppsOps.shim_path(depots, "hello"))
         entry = read_manifest(AppsOps.app_manifest_file(depots))[APP_UUID]
         recorded = entry_path(entry)
         @test isabspath(recorded)

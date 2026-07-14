@@ -18,8 +18,7 @@
 # Shim-format bumps reach already-installed apps via `migrate_shims!`, run at
 # the start of every mutating operation: it version-checks each installed shim
 # and rewrites the stale ones straight from the recorded manifest (no
-# reinstall). TODO: run the `.bat` shims on an actual Windows machine — they
-# are generated and content-tested, but the end-to-end test is skipped there.
+# reinstall).
 
 module AppsOps
 
