@@ -338,37 +338,43 @@ end
 end
 
 @testset "Pkg.jl#3269 artifact extraction does not preserve tarball file permissions [broken]" begin
-    mktempdir() do dir
-        # 1. Build a source tree with one file whose mode is -rw-r----- (0o640):
-        #    owner read/write, group read, NO other-read. This is the "raw"
-        #    (non-644) permission a tarball can legitimately carry.
-        srcdir = mkpath(joinpath(dir, "src"))
-        fpath = joinpath(srcdir, "secret.txt")
-        write(fpath, "hello")
-        chmod(fpath, 0o640)
-        @test (filemode(fpath) & 0o777) == 0o640      # source really is 0o640
+    if Sys.iswindows()
+        # POSIX modes are not representable on Windows (chmod is a no-op and
+        # filemode reports 0o666); skip
+        @test_skip true
+    else
+        mktempdir() do dir
+            # 1. Build a source tree with one file whose mode is -rw-r----- (0o640):
+            #    owner read/write, group read, NO other-read. This is the "raw"
+            #    (non-644) permission a tarball can legitimately carry.
+            srcdir = mkpath(joinpath(dir, "src"))
+            fpath = joinpath(srcdir, "secret.txt")
+            write(fpath, "hello")
+            chmod(fpath, 0o640)
+            @test (filemode(fpath) & 0o777) == 0o640      # source really is 0o640
 
-        # 2. Pack it with the SYSTEM tar, which stores the true 0o640 mode in the
-        #    header (Tar.jl's own create would normalize it away).
-        tarball = joinpath(dir, "art.tar.gz")
-        run(pipeline(`tar -czf $tarball -C $srcdir .`; stdout = devnull, stderr = devnull))
+            # 2. Pack it with the SYSTEM tar, which stores the true 0o640 mode in the
+            #    header (Tar.jl's own create would normalize it away).
+            tarball = joinpath(dir, "art.tar.gz")
+            run(pipeline(`tar -czf $tarball -C $srcdir .`; stdout = devnull, stderr = devnull))
 
-        # 3. Extract through VibePkg's real artifact extraction path
-        #    (Fetch.unpack -> Tar.extract).
-        ex = mkpath(joinpath(dir, "extracted"))
-        VibePkg.Fetch.unpack(tarball, ex)
-        exf = joinpath(ex, "secret.txt")
-        @test isfile(exf)
+            # 3. Extract through VibePkg's real artifact extraction path
+            #    (Fetch.unpack -> Tar.extract).
+            ex = mkpath(joinpath(dir, "extracted"))
+            VibePkg.Fetch.unpack(tarball, ex)
+            exf = joinpath(ex, "secret.txt")
+            @test isfile(exf)
 
-        # Precondition documenting the buggy state (holds today): Tar.extract
-        # normalizes every non-exec file to 0o644, spuriously ADDING other-read,
-        # so the extracted mode is 0o644 instead of the original 0o640.
-        @test (filemode(exf) & 0o777) == 0o644
+            # Precondition documenting the buggy state (holds today): Tar.extract
+            # normalizes every non-exec file to 0o644, spuriously ADDING other-read,
+            # so the extracted mode is 0o644 instead of the original 0o640.
+            @test (filemode(exf) & 0o777) == 0o644
 
-        # CORRECT behavior: extraction should preserve the tarball's original
-        # permissions (0o640 — no spurious o+r). Today it does not (it is 0o644),
-        # so this records Broken; it flips to Unexpected Pass once #3269 is fixed.
-        @test_broken (filemode(exf) & 0o777) == 0o640
+            # CORRECT behavior: extraction should preserve the tarball's original
+            # permissions (0o640 — no spurious o+r). Today it does not (it is 0o644),
+            # so this records Broken; it flips to Unexpected Pass once #3269 is fixed.
+            @test_broken (filemode(exf) & 0o777) == 0o640
+        end
     end
 end
 

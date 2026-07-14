@@ -26,6 +26,15 @@ if !@isdefined(make_test_registry)
     include("testhelpers.jl")
 end
 
+# Windows-safe interpolation: TOML basic strings treat `\` as an escape and
+# file:// URLs need /-separated absolute paths, so slash any temp path that
+# gets spliced into a TOML string or URL.
+slashpath(p::AbstractString) = replace(p, '\\' => '/')
+function file_url(p::AbstractString)
+    p = slashpath(p)
+    return startswith(p, '/') ? "file://" * p : "file:///" * p
+end
+
 @testset "Pkg.jl#4688 precompile/instantiate after [sources] path->url switch" begin
     mktempdir() do dir
         depot = mkpath(joinpath(dir, "depot"))
@@ -198,7 +207,7 @@ end
                 manifest_format = "2.0"
 
                 [[deps.BaseBenchmarks]]
-                path = "$missing_path"
+                path = "$(slashpath(missing_path))"
                 uuid = "$BB"
                 version = "0.1.0"
                 """
@@ -1505,7 +1514,7 @@ end
             Foo = "$FOO_UUID"
 
             [sources]
-            Foo = {url = "$src", rev = "$cA"}
+            Foo = {url = "$(slashpath(src))", rev = "$cA"}
             """
         )
         env = load_environment(projdir; depots)
@@ -1522,7 +1531,7 @@ end
             Foo = "$FOO_UUID"
 
             [sources]
-            Foo = {url = "$src", rev = "$cB"}
+            Foo = {url = "$(slashpath(src))", rev = "$cB"}
             """
         )
         env2 = load_environment(projdir; depots)
@@ -1644,13 +1653,22 @@ end
 @testset "Pkg.jl#2922 interrupting test does not orphan sandbox child" begin
     TestOps = VibePkg.TestOps
 
-    # true iff process `pid` still exists (unix `kill -0`)
+    # true iff process `pid` still exists (unix `kill -0`, windows `tasklist`)
     alive = function (pid)
-        try
-            run(pipeline(`kill -0 $pid`; stdout = devnull, stderr = devnull))
-            return true
-        catch
-            return false
+        if Sys.iswindows()
+            out = try
+                read(`tasklist /FI "PID eq $pid" /NH /FO CSV`, String)
+            catch
+                return false
+            end
+            return occursin("\"$pid\"", out)
+        else
+            try
+                run(pipeline(`kill -0 $pid`; stdout = devnull, stderr = devnull))
+                return true
+            catch
+                return false
+            end
         end
     end
 
@@ -1727,8 +1745,9 @@ end
         finally
             # never leave a stray child running past the test
             if child_pid !== nothing
+                forcekill = Sys.iswindows() ? `taskkill /F /PID $child_pid` : `kill -9 $child_pid`
                 try
-                    run(pipeline(`kill -9 $child_pid`; stdout = devnull, stderr = devnull))
+                    run(pipeline(forcekill; stdout = devnull, stderr = devnull))
                 catch
                 end
             end
@@ -2056,7 +2075,7 @@ end
             joinpath(repo, "Registry.toml"), """
             name = "MyReg"
             uuid = "11111111-2222-3333-4444-555555555555"
-            repo = "$(("file://" * repo))"
+            repo = "$(file_url(repo))"
 
             [packages]
             """
@@ -2073,14 +2092,14 @@ end
             # A branch-qualified registry URL must error clearly (no `#rev` parsing;
             # the whole spec is handed to git clone and fails loudly) rather than
             # silently landing on the wrong branch or writing a broken refspec.
-            spec = "file://" * repo * "#foo"
+            spec = file_url(repo) * "#foo"
             @test_throws PkgError VibePkg.Registries.add_registry!(depots, spec)
             # Nothing was installed.
             @test isempty(reachable_registries(depots))
 
             # Sanity: the same repo without the `#foo` suffix installs cleanly,
             # proving the error above is specifically about the branch suffix.
-            name = VibePkg.Registries.add_registry!(depots, "file://" * repo)
+            name = VibePkg.Registries.add_registry!(depots, file_url(repo))
             @test name == "MyReg"
             @test !isempty(reachable_registries(depots))
         end
@@ -2088,33 +2107,39 @@ end
 end
 
 @testset "Pkg.jl#3914 tilde-path completion offset" begin
-    mktempdir() do tmphome
-        # Create subdirs whose names share the typed 'jul' prefix.
-        mkpath(joinpath(tmphome, "julcode"))
-        mkpath(joinpath(tmphome, "juldocuments"))
-        mkpath(joinpath(tmphome, "other"))
+    if Sys.iswindows()
+        # expanduser is a no-op on Windows ('~' never expands), so the
+        # tilde-offset bug cannot occur there; skip.
+        @test_skip true
+    else
+        mktempdir() do tmphome
+            # Create subdirs whose names share the typed 'jul' prefix.
+            mkpath(joinpath(tmphome, "julcode"))
+            mkpath(joinpath(tmphome, "juldocuments"))
+            mkpath(joinpath(tmphome, "other"))
 
-        # Sanity: expanduser('~') must be materially longer than the typed '~'
-        # (the Pkg #3914 bug was the offset computed against the EXPANDED path).
-        withenv("HOME" => tmphome) do
-            @test length(expanduser("~")) > 1
+            # Sanity: expanduser('~') must be materially longer than the typed '~'
+            # (the Pkg #3914 bug was the offset computed against the EXPANDED path).
+            withenv("HOME" => tmphome) do
+                @test length(expanduser("~")) > 1
 
-            cands, word = VibePkg.REPLMode.completions_for("activate ~/jul")
+                cands, word = VibePkg.REPLMode.completions_for("activate ~/jul")
 
-            # Fixed behavior: the word-to-replace is the RAW typed fragment,
-            # NOT the expanduser-expanded path. This keeps the LineEdit offset
-            # correct.
-            @test word == "~/jul"
-            @test word == String(match(r"[^\s]*$", "activate ~/jul").match)
+                # Fixed behavior: the word-to-replace is the RAW typed fragment,
+                # NOT the expanduser-expanded path. This keeps the LineEdit offset
+                # correct.
+                @test word == "~/jul"
+                @test word == String(match(r"[^\s]*$", "activate ~/jul").match)
 
-            # Candidates preserve the tilde and match the raw fragment, so the
-            # replaced buffer range lines up with what the user typed.
-            @test !isempty(cands)
-            @test all(c -> startswith(c, "~/"), cands)
-            @test all(c -> startswith(c, word), cands)
-            @test "~/julcode" in cands
-            @test "~/juldocuments" in cands
-            @test !("~/other" in cands)
+                # Candidates preserve the tilde and match the raw fragment, so the
+                # replaced buffer range lines up with what the user typed.
+                @test !isempty(cands)
+                @test all(c -> startswith(c, "~/"), cands)
+                @test all(c -> startswith(c, word), cands)
+                @test "~/julcode" in cands
+                @test "~/juldocuments" in cands
+                @test !("~/other" in cands)
+            end
         end
     end
 end
@@ -3787,10 +3812,11 @@ end
             @test !occursin("~", planned.project.sources["PkgA"].path)
             @test !occursin(app, planned.project.sources["PkgA"].path)
 
-            # persist + reload: PkgB's Project.toml is updated in place with the clean path
+            # persist + reload: PkgB's Project.toml is updated in place with the
+            # clean path (stored /-separated on all platforms)
             @test write_environment(env, planned)
             reloaded = load_environment(pkgb; depots)
-            @test reloaded.project.sources["PkgA"].path == expected
+            @test reloaded.project.sources["PkgA"].path == slashpath(expected)
             @test entry_path(reloaded.manifest[uuida]) == expected
 
             # no literal '~' directory (nor mangled duplicate tree) created anywhere
@@ -4021,7 +4047,7 @@ end
                     io, """
 
                     [[deps.Foo]]
-                    path = "$foopath"
+                    path = "$(slashpath(foopath))"
                     uuid = "$FOO_UUID"
                     version = "0.1.0"
                     """
@@ -4464,7 +4490,7 @@ end
             joinpath(pkgdir, "Package.toml"), """
             name = "Example"
             uuid = "$(EXAMPLE_UUID)"
-            repo = "$(fx.git_repo)"
+            repo = "$(slashpath(fx.git_repo))"
             """
         )
         write(
@@ -4761,28 +4787,33 @@ end
 end
 
 @testset "Pkg.jl#3365 tree_hash ENOTDIRs on a non-directory special file" begin
-    # `/dev/null` is a character device present on macOS/Linux without root.
-    devnode = "/dev/null"
+    if Sys.iswindows()
+        # no /dev/null-style character device to hash on Windows; skip
+        @test_skip true
+    else
+        # `/dev/null` is a character device present on macOS/Linux without root.
+        devnode = "/dev/null"
 
-    # Preconditions (hold today): the path exists but is not a directory — this
-    # is exactly the shape that trips the unguarded top-level `readdir(root)` in
-    # TreeHash.tree_hash (src/TreeHash.jl:106).
-    @test ispath(devnode)
-    @test !isdir(devnode)
+        # Preconditions (hold today): the path exists but is not a directory — this
+        # is exactly the shape that trips the unguarded top-level `readdir(root)` in
+        # TreeHash.tree_hash (src/TreeHash.jl:106).
+        @test ispath(devnode)
+        @test !isdir(devnode)
 
-    # CORRECT behavior: hashing a non-directory root must be handled gracefully —
-    # either return a valid hash (treating a non-dir root the way git does) or
-    # throw a clean VibePkg ArgumentError. It must NOT surface a raw Base.IOError
-    # (ENOTDIR) from an unguarded readdir. Today it throws that IOError, so this
-    # records Broken; it flips to an Unexpected Pass once tree_hash guards the
-    # root. The op is inside the try so the file never crashes.
-    graceful = try
-        VibePkg.TreeHash.tree_hash(devnode)
-        true
-    catch e
-        e isa ArgumentError
+        # CORRECT behavior: hashing a non-directory root must be handled gracefully —
+        # either return a valid hash (treating a non-dir root the way git does) or
+        # throw a clean VibePkg ArgumentError. It must NOT surface a raw Base.IOError
+        # (ENOTDIR) from an unguarded readdir. Today it throws that IOError, so this
+        # records Broken; it flips to an Unexpected Pass once tree_hash guards the
+        # root. The op is inside the try so the file never crashes.
+        graceful = try
+            VibePkg.TreeHash.tree_hash(devnode)
+            true
+        catch e
+            e isa ArgumentError
+        end
+        @test graceful
     end
-    @test graceful
 end
 
 @testset "Pkg.jl#3150 pinned pkg wrongly marked upgradable (⌃)" begin
@@ -4948,38 +4979,44 @@ end
 end
 
 @testset "Pkg.jl#4553 uncompress_registry resolves `..` path segments" begin
-    Tar = VibePkg.Fetch.Tar
-    p7zip_jll = VibePkg.Fetch.p7zip_jll
+    if Sys.iswindows()
+        # Win32 collapses `..` lexically before hitting the filesystem, so the
+        # symlink-then-dotdot divergence this test needs cannot exist; skip
+        @test_skip true
+    else
+        Tar = VibePkg.Fetch.Tar
+        p7zip_jll = VibePkg.Fetch.p7zip_jll
 
-    root = mktempdir()
-    dir1 = mkpath(joinpath(root, "dir1"))
-    dir2 = mkpath(joinpath(root, "dir2"))
-    dir2sub = mkpath(joinpath(dir2, "sub"))
+        root = mktempdir()
+        dir1 = mkpath(joinpath(root, "dir1"))
+        dir2 = mkpath(joinpath(root, "dir2"))
+        dir2sub = mkpath(joinpath(dir2, "sub"))
 
-    # Build a minimal gzip-compressed registry tarball containing Registry.toml
-    src = mkpath(joinpath(root, "regsrc"))
-    write(joinpath(src, "Registry.toml"), "name = \"General\"\n")
-    plain = joinpath(root, "General.tar")
-    Tar.create(src, plain)
-    real_tarball = joinpath(dir2, "General.tar.gz")
-    run(pipeline(`$(p7zip_jll.p7zip()) a -tgzip $real_tarball $plain`; stdout = devnull))
+        # Build a minimal gzip-compressed registry tarball containing Registry.toml
+        src = mkpath(joinpath(root, "regsrc"))
+        write(joinpath(src, "Registry.toml"), "name = \"General\"\n")
+        plain = joinpath(root, "General.tar")
+        Tar.create(src, plain)
+        real_tarball = joinpath(dir2, "General.tar.gz")
+        run(pipeline(`$(p7zip_jll.p7zip()) a -tgzip $real_tarball $plain`; stdout = devnull))
 
-    # symlink dir1/mylink -> dir2/sub, so that a `..`-containing path resolves
-    # (via the kernel) to the real tarball, but collapses lexically to a file
-    # that does not exist.
-    symlink(dir2sub, joinpath(dir1, "mylink"))
-    path = joinpath(dir1, "mylink", "..", "General.tar.gz")
+        # symlink dir1/mylink -> dir2/sub, so that a `..`-containing path resolves
+        # (via the kernel) to the real tarball, but collapses lexically to a file
+        # that does not exist.
+        symlink(dir2sub, joinpath(dir1, "mylink"))
+        path = joinpath(dir1, "mylink", "..", "General.tar.gz")
 
-    # Preconditions establishing the buggy state (these hold today):
-    @test isfile(path)                                    # kernel-resolved: exists
-    @test realpath(path) == realpath(real_tarball)        # realpath -> dir2/General.tar.gz
-    @test !isfile(joinpath(dir1, "General.tar.gz"))       # lexical collapse target: missing
+        # Preconditions establishing the buggy state (these hold today):
+        @test isfile(path)                                    # kernel-resolved: exists
+        @test realpath(path) == realpath(real_tarball)        # realpath -> dir2/General.tar.gz
+        @test !isfile(joinpath(dir1, "General.tar.gz"))       # lexical collapse target: missing
 
-    # Correct behavior: uncompress_registry should realpath the argument (like
-    # upstream Pkg.jl get_extract_cmd) so 7z opens the real tarball. Today it
-    # passes the raw `..` path to 7z, which collapses it lexically to a
-    # nonexistent file and throws "Cannot open the file as archive".
-    @test haskey(VibePkg.Fetch.uncompress_registry(path), "Registry.toml")
+        # Correct behavior: uncompress_registry should realpath the argument (like
+        # upstream Pkg.jl get_extract_cmd) so 7z opens the real tarball. Today it
+        # passes the raw `..` path to 7z, which collapses it lexically to a
+        # nonexistent file and throws "Cannot open the file as archive".
+        @test haskey(VibePkg.Fetch.uncompress_registry(path), "Registry.toml")
+    end
 end
 
 @testset "Pkg.jl#3644 test_subprocess_flags forces --warn-overwrite=yes" begin
@@ -5113,7 +5150,7 @@ end
             PkgB = "$PKGB_UUID"
 
             [sources]
-            PkgB = {url = "$pkgB", rev = "$c1"}
+            PkgB = {url = "$(slashpath(pkgB))", rev = "$c1"}
             """
         )
 
