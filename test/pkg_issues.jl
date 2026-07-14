@@ -3049,3 +3049,850 @@ end
         end
     end
 end
+
+
+@testset "Pkg.jl#3138 add REPL vs API path#rev parity" begin
+    import LibGit2
+    using VibePkg.REPLMode: parse_package_word
+    using VibePkg.EnvFiles: entry_repo_rev, entry_repo_url, is_repo_tracked
+
+    mktempdir() do dir
+        # A local git repo holding package `Foo`, with a `mybranch` branch,
+        # standing in offline for the network MWE (oheil/Luxor.jl#multi_drawing).
+        foo_uuid = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        src = joinpath(dir, "Foo")
+        mkpath(joinpath(src, "src"))
+        write(
+            joinpath(src, "Project.toml"), """
+            name = "Foo"
+            uuid = "$foo_uuid"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(src, "src", "Foo.jl"), "module Foo end\n")
+        repo = LibGit2.init(src)
+        LibGit2.add!(repo, ".")
+        sig = LibGit2.Signature("tester", "tester@example.com")
+        LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+        LibGit2.branch!(repo, "mybranch")
+        LibGit2.close(repo)
+
+        # Core mechanism: the REPL word `<repo>#mybranch` and the API kwargs
+        # build the SAME immutable PackageSpec — a single rev "mybranch",
+        # never a doubled "mybranch#<default>".
+        spec_repl = parse_package_word(src * "#mybranch")
+        spec_api = VibePkg.PackageSpec(path = src, rev = "mybranch")
+        @test spec_repl.path == src
+        @test spec_repl.rev == "mybranch"
+        @test spec_repl.url === nothing
+        @test spec_repl == spec_api
+
+        # End to end: adding both ways into separate envs yields identical
+        # repo-tracked manifest entries (same url, same rev — no doubling).
+        depot = mkpath(joinpath(dir, "depot"))
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        env_repl = mkpath(joinpath(dir, "env_repl"))
+        env_api = mkpath(joinpath(dir, "env_api"))
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            withenv("JULIA_PKG_SERVER" => "") do
+                Base.ACTIVE_PROJECT[] = joinpath(env_repl, "Project.toml")
+                VibePkg.add([spec_repl]; io = devnull)
+                Base.ACTIVE_PROJECT[] = joinpath(env_api, "Project.toml")
+                VibePkg.add(path = src, rev = "mybranch", io = devnull)
+            end
+        finally
+            copy!(Base.DEPOT_PATH, old_depots)
+            Base.ACTIVE_PROJECT[] = old_active
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+
+        depots = depot_stack([depot])
+        e_repl = load_environment(env_repl; depots).manifest[foo_uuid]
+        e_api = load_environment(env_api; depots).manifest[foo_uuid]
+        @test is_repo_tracked(e_repl) && is_repo_tracked(e_api)
+        @test entry_repo_rev(e_repl) == "mybranch"
+        @test entry_repo_rev(e_repl) == entry_repo_rev(e_api)
+        @test entry_repo_url(e_repl) == entry_repo_url(e_api) == src
+
+        # The report's actual misuse `add(path="<repo>#mybranch")` must NOT
+        # silently produce a doubled rev — it errors cleanly on a missing path.
+        @test_throws PkgError VibePkg.add(path = src * "#mybranch", io = devnull)
+    end
+end
+
+@testset "Pkg.jl#3119 up upgrades and never downgrades" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            # Seed the manifest at the OLDER installable version 0.5.0.
+            envdir = mkpath(joinpath(dir, "env"))
+            env0 = load_environment(envdir; depots)
+            seeded = plan_add(env0, regs, cfg, [PackageRequest("Example", nothing, "0.5.0")])
+            @test entry_version(seeded.manifest[EXAMPLE_UUID]) == v"0.5.0"
+            write_environment(env0, seeded)
+            env = load_environment(envdir; depots)
+
+            # `up` must UPGRADE 0.5.0 -> 0.5.1 (symptom A was: up leaves it stuck).
+            up_all = plan_up(env, regs, cfg)
+            @test entry_version(up_all.manifest[EXAMPLE_UUID]) == v"0.5.1"
+            up_tgt = plan_up(env, regs, cfg, [PackageRequest("Example", nothing, nothing)])
+            @test entry_version(up_tgt.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # Now seed at the NEWEST installable 0.5.1 and confirm `up` never
+            # DOWNGRADES it to 0.5.0 (symptom B, the reported bug), nor jumps to
+            # the yanked 1.0.0.
+            envdir2 = mkpath(joinpath(dir, "env2"))
+            e0 = load_environment(envdir2; depots)
+            seeded2 = plan_add(e0, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
+            @test entry_version(seeded2.manifest[EXAMPLE_UUID]) == v"0.5.1"
+            write_environment(e0, seeded2)
+            env2 = load_environment(envdir2; depots)
+
+            @test entry_version(plan_up(env2, regs, cfg).manifest[EXAMPLE_UUID]) == v"0.5.1"
+            @test entry_version(
+                plan_up(env2, regs, cfg, [PackageRequest("Example", nothing, nothing)]).manifest[EXAMPLE_UUID],
+            ) == v"0.5.1"
+        end
+    end
+end
+
+@testset "Pkg.jl#3063 compat viewer/editor works on non-TTY io" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        old = copy(Base.DEPOT_PATH)
+        oldp = Base.ACTIVE_PROJECT[]
+        oldg = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            copy!(Base.DEPOT_PATH, [depot])
+            projdir = mkpath(joinpath(dir, "proj"))
+            projfile = joinpath(projdir, "Project.toml")
+            write(
+                projfile, """
+                [deps]
+                Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+
+                [compat]
+                Example = "0.5"
+                julia = "1"
+                """
+            )
+            Base.ACTIVE_PROJECT[] = projfile
+
+            # The reported bug: invoking the interactive compat editor with an
+            # io that isn't a real TTY did a raw!/ccall on io.handle and errored.
+            # In VibePkg the compat surface just prints/edits and must never
+            # touch raw-mode on a non-TTY io. The viewer path must run clean.
+            iobuf = IOBuffer()
+            @test (VibePkg.compat(; io = iobuf); true)
+            out = String(take!(iobuf))
+            @test occursin("Compat", out)
+            @test occursin("Example", out)
+        finally
+            copy!(Base.DEPOT_PATH, old)
+            Base.ACTIVE_PROJECT[] = oldp
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = oldg
+        end
+    end
+end
+
+@testset "Pkg.jl#2743 clean up bad registry tarball on EOF" begin
+    using Base: SHA1
+    local tree_hash = VibePkg.TreeHash.tree_hash
+    local registries_dir = VibePkg.Depots.registries_dir
+    local GENERAL_UUID = VibePkg.Registries.GENERAL_UUID
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        # a minimal but valid directory registry to pack into a tarball
+        regdir = mkpath(joinpath(dir, "registry"))
+        write(
+            joinpath(regdir, "Registry.toml"), """
+            name = "General"
+            uuid = "$GENERAL_UUID"
+            repo = "https://example.invalid/General"
+
+            [packages]
+            """
+        )
+        hash = SHA1(bytes2hex(tree_hash(regdir)))
+
+        # serve the tarball at /registry/<uuid>/<hash>, but TRUNCATED to half
+        # its bytes so decompression/tree-hash verification hits EOF
+        files = mkpath(joinpath(dir, "files"))
+        tarball = joinpath(files, "registry", string(GENERAL_UUID), string(hash))
+        LocalPkgServer.gzip_tarball(regdir, tarball)
+        bytes = read(tarball)
+        write(tarball, bytes[1:(length(bytes) ÷ 2)])
+
+        srv = LocalPkgServer.start_server(files)
+        try
+            # the issue's crash: EOF while verifying the corrupt tarball
+            @test_throws EOFError VibePkg.Registries.install_server_registry!(
+                depot, srv.url, GENERAL_UUID, hash; io = devnull
+            )
+            # FIXED behavior: nothing bad is left behind — no half .tar.gz and
+            # no stub .toml under registries/ (the download went to a tempname
+            # outside the registries dir and was cleaned up)
+            rd = registries_dir(depot)
+            @test !isdir(rd) || isempty(readdir(rd))
+        finally
+            close(srv.server)
+        end
+    end
+end
+
+@testset "Pkg.jl#2664 Overrides.toml suppresses artifact download" begin
+    # MWE: an Overrides.toml hash-form redirect for a non-lazy artifact must
+    # stop the original (undownloadable) artifact from being scheduled for
+    # download, mirroring the report's IntelOpenMP_jll / Overrides.toml case.
+    toml_path(p) = replace(p, '\\' => '/')
+    mktempdir() do dir
+        # a package declaring one non-lazy artifact with an unreachable source
+        hash = "1d5cc7b8" * "0"^32                 # fixed git-tree-sha1 (as in the report)
+        pkg = mkpath(joinpath(dir, "IntelOpenMP_jll"))
+        write(
+            joinpath(pkg, "Artifacts.toml"), """
+            [IntelOpenMP]
+            git-tree-sha1 = "$hash"
+
+                [[IntelOpenMP.download]]
+                url = "https://example.invalid/intelopenmp.tar.gz"
+                sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+            """
+        )
+
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # CONTROL: with no Overrides.toml the artifact IS scheduled for install
+        installs = VibePkg.ArtifactOps.collect_artifact_installs(depots, pkg)
+        @test length(installs) == 1
+        @test first(installs)[1] == "IntelOpenMP"
+
+        # override the artifact to a local dir via <depot>/artifacts/Overrides.toml
+        override_dir = mkpath(joinpath(dir, "local-intelopenmp"))
+        mkpath(joinpath(depot, "artifacts"))
+        write(
+            joinpath(depot, "artifacts", "Overrides.toml"), """
+            $hash = "$(toml_path(override_dir))"
+            """
+        )
+
+        # FIXED behavior: the overridden artifact is NOT scheduled for download
+        @test isempty(VibePkg.ArtifactOps.collect_artifact_installs(depots, pkg))
+    end
+end
+
+@testset "Pkg.jl#2615 Overrides.toml redirect must not mark downloaded pkg as →" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            env = plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.1")])
+            entry = env.manifest[EXAMPLE_UUID]
+            @test entry_version(entry) == v"0.5.1"
+
+            # Materialize Example's source tree so it counts as "downloaded".
+            th = VibePkg.EnvFiles.entry_tree_hash(entry)
+            srcpath = VibePkg.Depots.find_installed(depots, "Example", EXAMPLE_UUID, th)[1]
+            mkpath(srcpath)
+
+            # Reproduce the #2615 trigger: an artifacts Overrides.toml redirecting
+            # Example's UUID to a now-invalid path in the depot. This is unrelated
+            # to package source and must NOT influence the `→` status marker.
+            artdir = mkpath(joinpath(depot, "artifacts"))
+            write(
+                joinpath(artdir, "Overrides.toml"), """
+                [7876af07-990d-54b4-ab0e-23690620f79a]
+                some_artifact = "/nonexistent/invalid/path"
+                """
+            )
+
+            # Fixed behavior: source tree present => downloaded, regardless of the redirect.
+            @test VibePkg.Display.entry_downloaded(env, EXAMPLE_UUID, entry, depots) == true
+            out = sprint(io -> VibePkg.Display.print_status(io, env; depots))
+            @test occursin("Example", out)
+            @test !occursin("→", out)
+            @test !occursin("not downloaded", out)
+
+            # Negative control: the `→` mechanism is live — removing the source tree
+            # (with the same Overrides.toml still in place) DOES flag it.
+            Base.rm(srcpath; recursive = true, force = true)
+            @test VibePkg.Display.entry_downloaded(env, EXAMPLE_UUID, entry, depots) == false
+            out2 = sprint(io -> VibePkg.Display.print_status(io, env; depots))
+            @test occursin("→", out2)
+            @test occursin("not downloaded", out2)
+        end
+    end
+end
+
+@testset "Pkg.jl#2590 artifact download failure is reported" begin
+    local AO = VibePkg.ArtifactOps
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        hash = "0000000000000000000000000000000000000001"
+        # a package root declaring one non-lazy artifact whose only download
+        # source is unreachable (isolate!'s dead proxy blocks it)
+        pkg = mkpath(joinpath(dir, "BlockedPkg"))
+        write(
+            joinpath(pkg, "Artifacts.toml"), """
+            [foo]
+            git-tree-sha1 = "$hash"
+
+                [[foo.download]]
+                url = "https://blocked.invalid/foo.tar.gz"
+                sha256 = "$("0"^64)"
+            """
+        )
+        # a non-lazy artifact is collected for install
+        installs = AO.collect_artifact_installs(depots, pkg)
+        @test length(installs) == 1
+        name, meta = installs[1]
+        @test name == "foo"
+
+        # the download failure must be REPORTED, not silently swallowed: with a
+        # pkg server configured the install throws PkgError naming *both* the
+        # failed server endpoint and the download URL (rather than proceeding
+        # as though the artifact were absent)
+        err = @test_throws PkgError AO.ensure_artifact_installed!(
+            depots, name, meta; server = "https://pkgserver.invalid", io = devnull,
+        )
+        msg = sprint(showerror, err.value)
+        @test occursin("failed to install artifact", msg)
+        @test occursin("https://blocked.invalid/foo.tar.gz", msg)
+        @test occursin("https://pkgserver.invalid", msg)
+
+        # and with no pkg server, the sole download URL is still surfaced
+        err2 = @test_throws PkgError AO.ensure_artifact_installed!(
+            depots, name, meta; server = nothing, io = devnull,
+        )
+        msg2 = sprint(showerror, err2.value)
+        @test occursin("failed to install artifact", msg2)
+        @test occursin("https://blocked.invalid/foo.tar.gz", msg2)
+    end
+end
+
+@testset "Pkg.jl#2584 interrupted/corrupt registry update leaves registry intact" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        # a private copy of the fixture files so we can republish a bogus index
+        files = joinpath(dir, "files")
+        cp(joinpath(ENV["VIBEPKG_TEST_FIXTURES"], "files"), files)
+        srv = LocalPkgServer.start_server(files)
+        try
+            depot = mkpath(joinpath(dir, "depot"))
+            depots = depot_stack([depot])
+            reg_dir = joinpath(depot, "registries")
+
+            # bootstrap a real, usable General registry from the local server
+            withenv("JULIA_PKG_SERVER" => srv.url) do
+                added = VibePkg.Registries.add_default_registries!(depots; io = devnull)
+                @test !isempty(added)
+            end
+
+            # snapshot the installed registries dir byte-for-byte
+            snapshot = root -> begin
+                d = Dict{String, Vector{UInt8}}()
+                for (r, _, fs) in walkdir(root), f in fs
+                    p = joinpath(r, f)
+                    d[relpath(p, root)] = read(p)
+                end
+                d
+            end
+            before = snapshot(reg_dir)
+            @test !isempty(before)
+
+            # republish the index: advertise a fabricated NEW tree hash whose
+            # tarball body is corrupt (not a tarball at all). This models the
+            # torn state a ctrl-C mid-download / bad transfer produces.
+            bogus_hash = "0123456789abcdef0123456789abcdef01234567"
+            corrupt = joinpath(files, "registry", LocalPkgServer.GENERAL_UUID, bogus_hash)
+            mkpath(dirname(corrupt))
+            write(corrupt, "this is not a gzip tarball\n")
+            write(joinpath(files, "registries"), "/registry/$(LocalPkgServer.GENERAL_UUID)/$bogus_hash\n")
+
+            # force an update (cooldown 0 so it actually attempts the download);
+            # the fixed code downloads to a temp path outside the registries dir,
+            # verifies the decompressed tree hash, and refuses to swap on failure
+            updated = withenv("JULIA_PKG_SERVER" => srv.url) do
+                VibePkg.Registries.update_registries!(
+                    depots;
+                    update_cooldown = VibePkg.Registries.Dates.Second(0),
+                    io = devnull,
+                )
+            end
+
+            # FIXED behavior: General was NOT reported updated, and the on-disk
+            # registry is byte-for-byte unchanged (no partial/corrupt swap)
+            @test !("General" in updated)
+            @test snapshot(reg_dir) == before
+
+            # ...and the registry is still fully usable afterwards
+            regs = reachable_registries(depots)
+            @test any(r -> VibePkg.Registries.registry_name(r) == "General", regs)
+            mktempdir() do envdir
+                env = load_environment(envdir; depots)
+                planned = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+                @test entry_version(planned.manifest[EXAMPLE_UUID]) >= v"0.5.5"
+            end
+        finally
+            close(srv.server)
+        end
+    end
+end
+
+@testset "Pkg.jl#2451 pin preserves unrelated manifest versions" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            # synthetic path package depending on the registered Example
+            root_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            rootdir = mkpath(joinpath(dir, "Root"))
+            write(
+                joinpath(rootdir, "Project.toml"), """
+                name = "Root"
+                uuid = "$root_uuid"
+
+                [deps]
+                Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+                """
+            )
+            ROOT = UUID(root_uuid)
+
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+
+            # force unrelated Example DOWN to the older 0.5.0 (registry also
+            # has 0.5.1, which a naive resolve would prefer)
+            env = plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.0")])
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.0"
+
+            # develop the synthetic package; Example stays preserved at 0.5.0
+            env = plan_develop(env, regs, cfg, rootdir)
+            @test is_path_tracked(env.manifest[ROOT])
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.0"
+
+            # THE FIX (Pkg.jl#2451): pinning Root must not resolve/bump the
+            # unrelated Example from 0.5.0 up to 0.5.1
+            env = plan_pin(env, regs, cfg, [PackageRequest("Root", nothing, nothing)])
+            @test env.manifest[ROOT].pinned
+            @test is_path_tracked(env.manifest[ROOT])
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.0"
+        end
+    end
+end
+
+@testset "Pkg.jl#2433 registry update is independent of the active project" begin
+    local Registries = VibePkg.Registries
+    fx = LocalPkgServer.ensure!()  # starts the local server, sets JULIA_PKG_SERVER
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        # fresh-depot bootstrap: install General as a packed server registry
+        Registries.add_default_registries!(depots; io = devnull)
+        stub = joinpath(depot, "registries", "General.toml")
+        @test isfile(stub)
+        # the freshly installed stub records the server's current tree hash
+        current = Registries.TOML.parsefile(stub)["git-tree-sha1"]::String
+        @test current == fx.registry_hash
+
+        # an activated project (a real Project.toml on disk) to point at
+        projdir = mkpath(joinpath(dir, "proj"))
+        proj = joinpath(projdir, "Project.toml")
+        write(proj, "")
+
+        # force update_registries! to actually re-fetch: rewrite the stub's
+        # git-tree-sha1 to a stale value and clear the per-registry cooldown
+        stale = "0000000000000000000000000000000000000000"
+        function force_refetch()
+            s = Registries.TOML.parsefile(stub)
+            s["git-tree-sha1"] = stale
+            open(io -> Registries.TOML.print(io, s), stub, "w")
+            Base.rm(Registries.registry_update_log_file(depot); force = true)
+            return
+        end
+
+        # run the very path `up` uses (op_context with :force) once from an
+        # activated project and once from the default (no active project);
+        # both must refetch and restore the stub to the correct tree hash
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            function run_from(active)
+                force_refetch()
+                @test Registries.TOML.parsefile(stub)["git-tree-sha1"] == stale
+                Base.ACTIVE_PROJECT[] = active
+                VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+                VibePkg.API.op_context(; io = devnull, update_registry = :force)
+                return Registries.TOML.parsefile(stub)["git-tree-sha1"]::String
+            end
+
+            from_project = run_from(proj)      # bug #2433: this used to fail to fetch
+            from_default = run_from(nothing)
+
+            @test from_project == fx.registry_hash
+            @test from_default == fx.registry_hash
+            @test from_project == from_default
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+    end
+end
+
+@testset "Pkg.jl#2381 add does not blame the dependency for a broken project package" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        # the ACTIVE project package `Foo` is syntactically broken and will
+        # never precompile; the bug was that adding a dependency blamed the
+        # dependency ("1 dependency errored" / "✗ Foo") for Foo's failure.
+        write(
+            joinpath(envdir, "Project.toml"), """
+            name = "Foo"
+            uuid = "f00df00d-1111-2222-3333-444444444444"
+            version = "0.1.0"
+            """
+        )
+        mkpath(joinpath(envdir, "src"))
+        write(joinpath(envdir, "src", "Foo.jl"), "module Foo\nf(\nend\n")
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = true
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            out = IOBuffer()
+            # opt back into auto-precompile (isolate! disabled it globally)
+            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+                @test VibePkg.add("Example"; io = out) === nothing
+            end
+            text = String(take!(out))
+            # add narrows auto-precompile to the added package's closure, so
+            # the dependency precompiles cleanly and the broken project
+            # package Foo is never touched / never blamed.
+            @test occursin("✓ Example", text)
+            @test !occursin("✗ Foo", text)
+            @test !occursin("dependency errored", text)
+            reloaded = load_environment(joinpath(envdir, "Project.toml"); depots = depot_stack(copy(Base.DEPOT_PATH)))
+            @test entry_version(reloaded.manifest[UUID("7876af07-990d-54b4-ab0e-23690620f79a")]) >= v"0.5.0"
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+    end
+end
+
+@testset "Pkg.jl#2368 archive format from magic bytes not URL extension" begin
+    local Fetch = VibePkg.Fetch
+    local Tar = VibePkg.Fetch.Tar
+    local Zstd = VibePkg.Fetch.Zstd_jll
+
+    # Build source content and a plain tar of it.
+    mktempdir() do work
+        src = mkpath(joinpath(work, "src"))
+        write(joinpath(src, "hello.txt"), "hello 2368\n")
+        mkpath(joinpath(src, "sub"))
+        write(joinpath(src, "sub", "b.txt"), "nested\n")
+
+        tarpath = joinpath(work, "content.tar")
+        open(tarpath, "w") do io
+            Tar.create(src, io)
+        end
+
+        # A zstd tarball, but named with a WRONG (.gz) extension — as if a
+        # random-id URL / Content-Disposition mismatch handed us this name.
+        zst_wrongext = joinpath(work, "download.gz")
+        run(pipeline(`$(Zstd.zstd()) -q -c $tarpath`, stdout = zst_wrongext))
+
+        # A gzip tarball, but named with a WRONG (.zst) extension and with no
+        # extension at all (the reported Google-Drive/Dropbox scenario).
+        gz_wrongext = joinpath(work, "download.zst")
+        gz_noext = joinpath(work, "uc_export_download_id_RANDOM")
+        run(`$(Fetch.p7zip_jll.p7zip()) a -tgzip -bso0 -bsp0 $gz_wrongext $tarpath`)
+        cp(gz_wrongext, gz_noext)
+
+        # Format must be decided by magic bytes, never by the filename.
+        @test occursin("zstd", string(Fetch.get_extract_cmd(zst_wrongext)))
+        @test occursin("7z", string(Fetch.get_extract_cmd(gz_wrongext)))
+        @test occursin("7z", string(Fetch.get_extract_cmd(gz_noext)))
+
+        # And unpack must extract the original tree regardless of the name.
+        for f in (zst_wrongext, gz_wrongext, gz_noext)
+            dest = mktempdir(work)
+            Fetch.unpack(f, dest)
+            @test read(joinpath(dest, "hello.txt"), String) == "hello 2368\n"
+            @test read(joinpath(dest, "sub", "b.txt"), String) == "nested\n"
+        end
+    end
+end
+
+@testset "Pkg.jl#1654 relative dev resolves without mangled/duplicated path" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            dir = realpath(dir)
+            local entry_path = VibePkg.EnvFiles.entry_path
+            app = mkpath(joinpath(dir, "App"))
+            pkga_uuid = "aaaaaaaa-1111-2222-3333-444444444444"
+            pkgb_uuid = "bbbbbbbb-1111-2222-3333-444444444444"
+            # App/PkgA — the package to be dev'd
+            pkga = mkpath(joinpath(app, "PkgA"))
+            write(
+                joinpath(pkga, "Project.toml"), """
+                name = "PkgA"
+                uuid = "$pkga_uuid"
+                version = "0.1.0"
+                """
+            )
+            # App/PkgB — the active project, dev happens from here
+            pkgb = mkpath(joinpath(app, "PkgB"))
+            write(
+                joinpath(pkgb, "Project.toml"), """
+                name = "PkgB"
+                uuid = "$pkgb_uuid"
+                version = "0.1.0"
+                """
+            )
+
+            env = load_environment(pkgb; depots)
+            # develop a RELATIVE path "../PkgA" (relative to the active project PkgB)
+            planned = plan_develop(env, regs, Config(depots), joinpath("..", "PkgA"))
+
+            uuida = UUID(pkga_uuid)
+            expected = joinpath("..", "PkgA")
+            # [sources] keeps the given relative path — no absolute/duplicated mangling
+            @test planned.project.sources["PkgA"].path == expected
+            @test is_path_tracked(planned.manifest[uuida])
+            @test entry_path(planned.manifest[uuida]) == expected
+            # explicitly assert the mangled duplicate path from the bug is NOT produced
+            @test !occursin("~", planned.project.sources["PkgA"].path)
+            @test !occursin(app, planned.project.sources["PkgA"].path)
+
+            # persist + reload: PkgB's Project.toml is updated in place with the clean path
+            @test write_environment(env, planned)
+            reloaded = load_environment(pkgb; depots)
+            @test reloaded.project.sources["PkgA"].path == expected
+            @test entry_path(reloaded.manifest[uuida]) == expected
+
+            # no literal '~' directory (nor mangled duplicate tree) created anywhere
+            offenders = String[]
+            for (root, dirs, _) in walkdir(dir)
+                for d in dirs
+                    d == "~" && push!(offenders, joinpath(root, d))
+                end
+            end
+            @test isempty(offenders)
+
+            # a non-resolvable relative path must error CLEANLY, not silently mangle
+            @test_throws PkgError plan_develop(env, regs, Config(depots), joinpath(".", "PkgA"))
+        end
+    end
+end
+
+@testset "Pkg.jl#1155 multi-range compat serializes as a string, not a TOML array" begin
+    local Compat = VibePkg.EnvFiles.Compat
+    local semver_spec = VibePkg.Versions.semver_spec
+    local TOML = VibePkg.EnvFiles.TOML
+
+    # The bug (Pkg.jl#1155): a VersionSpec with multiple ranges could be printed as
+    # an invalid bare TOML array like `julia = [0.1, 0.8-1]`. VibePkg serializes the
+    # original compat string instead, and never hands a VersionSpec to TOML.print.
+    compat_str = "0.1, 0.8 - 1"
+    spec = semver_spec(compat_str)
+    @test length(spec.ranges) > 1   # genuinely multi-range, the trigger condition
+
+    proj = VibePkg.EnvFiles.Project()
+    proj.compat["julia"] = Compat(spec, compat_str)
+
+    io = IOBuffer()
+    VibePkg.EnvFiles.write_project(io, proj)
+    out = String(take!(io))
+
+    # Fixed behavior: emitted as a quoted string, not a bracketed array.
+    @test occursin("julia = \"0.1, 0.8 - 1\"", out)
+    @test !occursin("julia = [", out)   # NOT the invalid bare-array form
+
+    # And it round-trips back to a String (not a Vector) through TOML.
+    parsed = TOML.parse(out)
+    @test parsed["compat"]["julia"] isa AbstractString
+    @test !(parsed["compat"]["julia"] isa AbstractVector)
+    @test parsed["compat"]["julia"] == compat_str
+
+    # The reported invalid path — passing a raw VersionSpec straight to TOML.print —
+    # does NOT silently emit an invalid array; VibePkg's writer rejects unknown types.
+    @test_throws PkgError VibePkg.EnvFiles.write_project(IOBuffer(), Dict("julia" => spec))
+end
+
+
+@testset "Pkg.jl#3012 outdated ⌃ marker agrees with update" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            # Seed the manifest at the OLDER installable version 0.5.0; the
+            # registry has 0.5.1 (installable) plus a yanked 1.0.0.
+            envdir = mkpath(joinpath(dir, "env"))
+            env0 = load_environment(envdir; depots)
+            seeded = plan_add(env0, regs, cfg, [PackageRequest("Example", nothing, "0.5.0")])
+            @test entry_version(seeded.manifest[EXAMPLE_UUID]) == v"0.5.0"
+            write_environment(env0, seeded)
+            env = load_environment(envdir; depots)
+
+            # The reported bug: `status` paints the ⌃ "may be upgradable"
+            # marker, yet `up` reports No Changes and never moves the package.
+            # Assert the marker is present AND that it is *accurate* — nothing
+            # holds the upgrade back, so it renders ⌃ (not the ⌅ "blocked"
+            # glyph) and shows the "may be upgradable" footer.
+            s = sprint(io -> VibePkg.Display.print_status(io, env; registries = regs))
+            @test occursin("⌃", s)
+            @test occursin("may be upgradable", s)
+            @test !occursin("⌅", s)
+
+            # `up` must ACTUALLY move 0.5.0 -> 0.5.1, both for the whole
+            # environment and for a targeted `up Example`. Marker and update
+            # agree: the ⌃ is only shown because a real upgrade is installable.
+            up_all = plan_up(env, regs, cfg)
+            @test entry_version(up_all.manifest[EXAMPLE_UUID]) == v"0.5.1"
+            up_tgt = plan_up(env, regs, cfg, [PackageRequest("Example", nothing, nothing)])
+            @test entry_version(up_tgt.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # After the upgrade the ⌃ marker must clear: 0.5.1 is the newest
+            # non-yanked version, so `status` shows no upgradable glyph/footer.
+            after = sprint(io -> VibePkg.Display.print_status(io, up_all; registries = regs))
+            @test !occursin("⌃", after)
+            @test !occursin("may be upgradable", after)
+        end
+    end
+end
+
+@testset "Pkg.jl#2935 name-add resolves registry url over stale fork" begin
+    LibGit2 = VibePkg.Git.LibGit2
+    TOML = VibePkg.EnvFiles.TOML
+    entry_repo_url = VibePkg.EnvFiles.entry_repo_url
+    is_repo_tracked = VibePkg.EnvFiles.is_repo_tracked
+    read_manifest = VibePkg.EnvFiles.read_manifest
+    uuid = UUID("dddddddd-2935-2935-2935-dddddddddddd")
+
+    mktempdir() do dir
+        dir = realpath(dir)
+
+        # canonical upstream repo — the url the registry points at
+        canonical = joinpath(dir, "Canonical")
+        mkpath(joinpath(canonical, "src"))
+        write(
+            joinpath(canonical, "Project.toml"), """
+            name = "ForkPkg"
+            uuid = "$uuid"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(canonical, "src", "ForkPkg.jl"), "module ForkPkg end\n")
+        repo = LibGit2.init(canonical)
+        LibGit2.add!(repo, ".")
+        sig = LibGit2.Signature("tester", "tester@example.com")
+        commit = string(LibGit2.commit(repo, "initial"; author = sig, committer = sig))
+        # tree sha1 for the registry Versions.toml
+        obj = LibGit2.GitObject(repo, commit)
+        tree = LibGit2.peel(LibGit2.GitTree, obj)
+        tree_sha = string(LibGit2.GitHash(tree))
+        LibGit2.close(tree); LibGit2.close(obj); LibGit2.close(repo)
+
+        # a fork at a DIFFERENT url (full copy, so it carries `commit` too)
+        fork = joinpath(dir, "Fork")
+        cp(canonical, fork)
+        @test fork != canonical
+
+        # registry declaring ForkPkg with repo == canonical url
+        depot = mkpath(joinpath(dir, "depot"))
+        reg = joinpath(depot, "registries", "ForkTestRegistry")
+        pkgdir = mkpath(joinpath(reg, "F", "ForkPkg"))
+        write(
+            joinpath(reg, "Registry.toml"), """
+            name = "ForkTestRegistry"
+            uuid = "77777777-2935-2935-2935-777777777777"
+            repo = "https://example.invalid/ForkTestRegistry"
+
+            [packages]
+            $uuid = { name = "ForkPkg", path = "F/ForkPkg" }
+            """
+        )
+        open(joinpath(pkgdir, "Package.toml"), "w") do io
+            TOML.print(io, Dict("name" => "ForkPkg", "uuid" => string(uuid), "repo" => canonical))
+        end
+        write(
+            joinpath(pkgdir, "Versions.toml"), """
+            ["0.1.0"]
+            git-tree-sha1 = "$tree_sha"
+            """
+        )
+
+        envdir = mkpath(joinpath(dir, "env"))
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            withenv("JULIA_PKG_SERVER" => "") do
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+
+                # STEP 1: add from the FORK url+rev — records the fork url
+                VibePkg.add(url = fork, rev = commit, io = devnull)
+                m1 = read_manifest(joinpath(envdir, "Manifest.toml"))[uuid]
+                @test is_repo_tracked(m1)
+                @test entry_repo_url(m1) == fork
+                src1 = load_environment(envdir; depots = depot_stack(copy(Base.DEPOT_PATH))).project.sources["ForkPkg"]
+                @test src1.url == fork
+
+                # STEP 2: add BY NAME + same rev — must resolve the CANONICAL
+                # registry url, overwriting the stale fork url (Pkg.jl#2935)
+                VibePkg.add(name = "ForkPkg", rev = commit, io = devnull)
+                m2 = read_manifest(joinpath(envdir, "Manifest.toml"))[uuid]
+                @test is_repo_tracked(m2)
+                @test entry_repo_url(m2) == canonical   # not the stale fork
+                @test entry_repo_url(m2) != fork
+                src2 = load_environment(envdir; depots = depot_stack(copy(Base.DEPOT_PATH))).project.sources["ForkPkg"]
+                @test src2.url == canonical
+                @test src2.url != fork
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end
