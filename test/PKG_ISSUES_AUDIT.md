@@ -23,9 +23,9 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–14 (of ~40). **In-scope bugs:** 105 → **73 FIXED, 27 PERSISTS, 5 N/A**. Non-bugs skipped: ~224.
-- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **71 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
-- **The 27 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
+- **Pages covered:** 1–17 (of ~40). **In-scope bugs:** 123 → **83 FIXED, 34 PERSISTS, 6 N/A**. Non-bugs skipped: ~292.
+- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **81 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
+- **The 34 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
 - Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
 
 ---
@@ -431,3 +431,104 @@ Test column: file + testset that pins the behavior, or `—`.
 | 1155 | VersionSpec printed incorrectly | bug | **FIXED** | Ran the faithful analog in the r1155 daemon. VibePkg.Versions.VersionSpec(["0.1","0.8-1"]) still prints as the bracketed "[0.1, 0.8 - 1]" (same as Pkg's print method), but the reported BAD serialization does not happen: (1) Handin… |
 | 961 | status has no option to show all packages across the environment stack | feature | SKIP | Feature request for a status option spanning the env stack. |
 | 11 | Feature Request: Show which versions of a package are installable give | feature | SKIP | Requests a new command to list installable versions. |
+
+## Page 15
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 2246 | Add DEPOT_PATH[2]/environments/v#.# to the LOAD_PATH by default | feature | SKIP | Proposes changing default LOAD_PATH to include a system-wide environment; enhancement, not |
+| 2244 | Strange behavior with existing manifest and missing project | bug | **FIXED** | Reproduced the exact setup at plan level (Level 1) in the r2244 daemon: built envdir with a real Manifest.toml (Example 0.5.1 + injected orphan path-package Foo uuid 1111...), then deleted Project.toml so manifest exists / project… |
+| 2217 | bypass registry sync when handling stdlib packages | feature | SKIP | Requests skipping registry update when adding an stdlib; optimization/behavior change, not |
+| 2215 | prevent package downgrade when pkg server is out-of-date | feature | SKIP | Requests failing (or a new flag) instead of downgrading against an out-of-date registry mi |
+| 2211 | Resolve failure with odd error message | bug | **PERSISTS** | Ran a Level 1 plan-level repro offline (daemon r2211) with the Example fixture. Synthetic dev pkg TmpPkg (uuid 1111...) depends on Example; compat Example="=0.5.0", plan_develop+plan_resolve → manifest Example 0.5.0. Then changed… |
+| 2206 | Include restricted package versions on log lines | feature | SKIP | Enhancement to add restricted version info to resolver log lines. |
+| 2205 | internal assertion error if a local copy of a package exists | bug | **FIXED** | Ran an offline repro in the r2205 daemon (LocalPkgServer.isolate!, make_test_registry). Two probes of Planning.is_package_downloaded / source_path via entry_to_node: (1) a synthetic LOCAL dev package (plan_develop of a local Local… |
+| 2177 | [FR] Terse names for unregistered packages | feature | SKIP | Feature request for github:/shorthand expansion of unregistered package URLs. |
+| 2168 | Packages with special characters like ∂ (U+2202) cannot be removed but | bug | **FIXED** | Ran in the r2168 --test daemon. (1) Base.isidentifier("∂Components"/"∂xxxxx"/"Δfoo") all true; VibePkg.REPLMode.parse_package_word returns the ∂-name with no error. (2) REPL statement parser: "rm ∂xxxxx", "rm ∂Components", "add ∂C… |
+| 2165 | Can `Resolve.Fixed` be removed? | rfc | SKIP | Internal design/refactoring question about the resolver's Fixed type. |
+| 2164 | Can the function `Resolve.sanity_check` be moved to be a test utility? | rfc | SKIP | Internal refactoring question about relocating a test-only function. |
+| 2131 | missing docstrings in artifacts API reference | docs | SKIP | Documenter reports missing docstrings in the artifacts API reference; documentation issue. |
+| 2092 | remove unfinished artifact when there's an exception | bug | **FIXED** | Ran an offline repro in an isolated jld --test daemon exercising src/ArtifactOps.jl `try_install_from`/`ensure_artifact_installed!`. Built a real artifact tree + zstd tarball, overrode Fetch.download to serve it locally (dead netw… |
+| 2060 | With global depot, still automatically clone General | feature | SKIP | Requests cloning General into a writable depot when the global one is stale and richer `re |
+| 2056 | Feature request: `dev` for a repository containing multiple packages | feature | SKIP | Explicit feature request for recursive/glob dev of monorepo subdirs. |
+| 2055 | dev'ing several subdirs of a single git repository cause the repo to b | feature | SKIP | Redundant re-clone when dev'ing a second subdir; final state is correct (one copy), so thi |
+| 2044 | Stop using the raw manifest `Dict' inside Pkg operations | rfc | SKIP | Internal refactoring proposal to type the manifest to reduce invalidations. |
+| 2028 | Should `Pkg.Types.semver_spec("0")` throw an error? | bug | **PERSISTS** | Ran in the r2028 test daemon: `using VibePkg.Versions: semver_spec` then parsed "0", "0.0", "0.0.0". Observed exactly the reported inconsistency:   "0"     => VersionSpec prints "0"   (accepted)   "0.0"   => VersionSpec prints "0.… |
+| 2023 | Project file validation | bug | **PERSISTS** | Ran two offline Level-1 repros in the r2023 daemon with a synthetic local dev package (BadPkg) + the Example fixture registry. (1) plan_develop(env, regs, cfg, badpkg) where BadPkg/Project.toml has `[targets] test = ["Test"]` with… |
+| 2016 | pkg update document defaults | docs | SKIP | Requests documenting the update command's optional pkg arg and option defaults; documentat |
+| 2013 | REPL package mode completion for path with spaces | bug | **FIXED** | Ran VibePkg.REPLMode.completions_for in the jld --test daemon against a real cwd containing a package dir named "dir with spaces". Results: completions_for("dev dir") -> word="dir", cands=String[]; completions_for("develop dir") -… |
+| 2007 | Symbolic linked julia home make `dev` outside `.julia/dev` fail | bug | **PERSISTS** | Ran scratchpad/r2007c.jl in the r2007 --test daemon. Setup: real depot at /base/real/julia, symlink /base/jl -> that (depth-changing, like ~/.julia -> /data/julia); dev package out-of-tree at /base/real/pkg_test/TestPackage11; act… |
+| 1995 | The "Using Artifacts" example in the docs is incompatible with "immuta | docs | SKIP | Documentation clarity issue: the artifacts tutorial example conflicts with the read-only/i |
+| 1975 | Add a Pkg.audit command to check dependencies against reported vulnera | feature | SKIP | Feature request (with speculative/security labels) for a new npm-audit-like command. |
+| 1965 | Compatibility with rusty environment chains | feature | SKIP | Requests that Pkg check compat across the whole LOAD_PATH environment stack; stacked-env d |
+| 1873 | Partial Artifacts | feature | SKIP | Design/feature proposal for partial artifacts. |
+| 1855 | Improve appearance of Conflict messsages | feature | SKIP | Proposal to redesign/format unsatisfiable-requirements conflict messages; presentation enh |
+| 1829 | `update Package` sometimes doesn't update Package even though it could | bug | **PERSISTS** | Ran a Level-1 (plan-level) repro in the r1829 --test daemon with a synthetic offline 2-package registry: Porcelain (direct dep) depends on Cutlery (indirect dep); Porcelain 1.0.0 requires Cutlery "1", Porcelain 2.0.0 requires Cutl… |
+| 411 | Is the package manager ready for moving out stdlibs in their own repos | rfc | SKIP | Discussion label; design question about recording stdlib state in manifests. |
+
+## Page 16
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 1921 | Support for non-tarball dependencies in Pkg.Artifacts | feature | SKIP | Feature request to allow single-file (non-tarball) artifact dependencies. |
+| 1856 | curation & trust (registries are not the answer) | rfc | SKIP | Design discussion about a package trust/curation layer. |
+| 1854 | Package groups | feature | SKIP | Proposal for curated environments / package groups. |
+| 1849 | depot where package is compiled is dependent on filesystem state. | feature | SKIP | Requests creating ~/.julia or warning when first DEPOT_PATH slot is missing; a behavior/UX |
+| 1836 | Feature request: first-class support for "namespaces" in registries | feature | SKIP | Proposal for first-class registry namespaces. |
+| 1747 | Problem  with "try `Pkg.resolve()`" | bug | SKIP | Request to reword a misleading error suggestion (resolve vs update registry); error-messag |
+| 1731 | support resuming downloads | feature | SKIP | Feature request for resumable downloads via HTTP range requests. |
+| 1689 | Ability to pass `test_args` when using `] test MyPackage` in the REPL  | feature | SKIP | Feature request to pass test_args from REPL test mode. |
+| 1687 | Feature Request: add flag build = true(default) /verbose/false) to ins | feature | SKIP | Requests flags to control/skip build during instantiate/add. |
+| 1676 | Change `up --patch` to never update anything that is pre-1.0 | feature | SKIP | Proposes changing up --patch semantics for pre-1.0 packages. |
+| 1665 | docs: add artifacts to the glossary | docs | SKIP | Documentation update request for the glossary. |
+| 1657 | Error on instantiate with invalid artifact | bug | **PERSISTS** | Reproduced offline in VibePkg. Wrote a synthetic package with an Artifacts.toml holding a platform-specific entry missing the `arch` key (`[[MyArtifact]]` with `os = "windows"` only). Exercised the artifact-install path three ways… |
+| 1634 | Feature Request Registry: Refer to master branch if no version is defi | feature | SKIP | Proposes installing master branch when a registered package has no version. |
+| 1598 | Use @test_logs to test for hash errors | other | SKIP | About Pkg's own test suite hiding hash-error log output; internal testing, not package beh |
+| 1593 | Pkg API issues | rfc | SKIP | Design discussion proposing breaking API changes to free/unpin/add/dev/activate. |
+| 1574 | error logging | feature | SKIP | Enhancement proposal to log state on Pkg errors. |
+| 1542 | Add `update --all` flag to also update lower stacked environments | feature | SKIP | Requests an up --all flag to update stacked environments. |
+| 1527 | Do not offer to autocomplete `] add` with _jll packages | feature | SKIP | Enhancement to exclude _jll packages from add tab-completion. |
+| 1467 | Document automatic unpacking of artifacts | docs | SKIP | Documentation request about artifact unpacking behavior. |
+| 1465 | Better error message when failing to find an artifact due to missmatch | feature | SKIP | Requests improved error message when artifact platform/libc mismatch; message-wording enha |
+| 1464 | artifact string macro in the REPL | bug | N/A | The `artifact"..."` / `@artifact_str` macro is defined solely in the Julia `Artifacts` stdlib (.../stdlib/v1.12/Artifacts/src/Artifacts.jl:689), not in Pkg or VibePkg. Real Pkg (src/Artifacts.jl:20) only imports+re-exports it from… |
+| 1439 | Vendoring Python Wheels as Artifacts | rfc | SKIP | Speculative design proposal for Python virtualenvs via artifacts. |
+| 1436 | Restrict OS? / Add to docs | question | SKIP | Question about whether OS restriction is possible plus docs request. |
+| 1430 | Instantiating with dirty registry can get bad error message | bug | **FIXED** | Ran instantiate via the jld --test daemon against the offline Example fixture (isolate!()). Case A: Manifest.toml pinning Example to version 0.4.0 (a version absent from the dirty/out-of-date registry) with no git-tree-sha1, then… |
+| 1071 | allow package to be disambiguated by `@user/package` | feature | SKIP | Enhancement to disambiguate same-named packages via @user/package syntax. |
+| 973 | Add post-add hook? | feature | SKIP | Requests a generic Pkg.afteradd callback hook mechanism. |
+| 837 | dev should also check for "MyPackage.jl" directory (and not just "MyPa | feature | SKIP | Requests dev to also detect a MyPackage.jl directory name. |
+| 687 | Better error message for`Pkg.add()` when url is wrong. | feature | SKIP | Requests a friendlier error message for invalid URLs; outdated Pkg.clone API, message-word |
+
+## Page 17
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 1395 | document `instantiate --project` | docs | SKIP | Documentation request; no bug behavior. |
+| 1308 | Idea: automatic artifact & package deduplication | feature | SKIP | Design idea for shared-depot dedup. |
+| 1288 | Feature request: full semver support(pre-release version and build met | feature | SKIP | Requests extended semver support. |
+| 1280 | Documentation: What to do in case of version downgrades | docs | SKIP | Documentation content proposal. |
+| 1268 | Official docs on package registration process | docs | SKIP | Documentation request. |
+| 1263 | Method to print valid range of a version specifier | feature | SKIP | Requests new exported helper method. |
+| 1254 | Getting user's working dir from Pkg.build | feature | SKIP | Enhancement to expose PWD to build scripts. |
+| 1253 | Feature request: testing and building a non-package project | feature | SKIP | Requests test/build for non-package projects. |
+| 1246 | Should compat `~0.y.z` be the same as `=0.y.z`? | rfc | SKIP | Proposal to change ~ semantics for 0.y.z; design discussion. |
+| 1245 | Feature request: activate environment on top of current stack | feature | SKIP | Requests --stack style activate. |
+| 1239 | document pin | docs | SKIP | Documentation improvement for pin. |
+| 1236 | If add fails due to resolve error, a subsequent add will complete with | bug | **PERSISTS** | Reproduced at runtime in VibePkg (Level 2 API), then isolated the mechanism.  Exact #1236 scenario (fixture "General" registry served by LocalPkgServer): project has Example pinned `=0.5.0`; a local git repo `BuildDep#main` depend… |
+| 1231 | Name of dependency does not get updated in Project.toml if it changes  | bug | **FIXED** | Level 1 plan-level repro in an isolated --test daemon: built a synthetic offline registry with package Foo (UUID aaaaaaaa-…) at v1.0.0, plan_add'd it (Project.toml + Manifest both -> "Foo"), then renamed the package in the registr… |
+| 1218 | Pkg.build errors when depot is read-only | bug | **FIXED** | Ran a runtime repro (scratchpad/repro1218.jl) in the r1218 daemon: two-depot stack [depot1(writable primary), depot2], installed a synthetic registered package Foo (with deps/build.jl) INTO depot2, chmod -R ugo-w on depot2, then c… |
+| 1212 | `instantiate` does not update registry sometimes? | bug | **FIXED** | Ran an end-to-end instantiate repro in the --test daemon (script /private/tmp/.../scratchpad/r1212b.jl). Setup mirrors the report: a Project.toml listing dep Example with NO Manifest.toml, in a fresh depot whose registry lists Exa… |
+| 1208 | [docs] clarify meaning of "project" earlier | docs | SKIP | Documentation clarity request. |
+| 1089 | Blacklist compat specifier | feature | SKIP | Requests new compat syntax; not a bug. |
+| 1072 | allow registries to depend on other registries | feature | SKIP | Design/feature discussion. |
+| 1001 | Verify permissions before modifying filesystem | feature | SKIP | Enhancement to improve error message on permission failure. |
+| 928 | support for PSA through Pkg client? | feature | SKIP | Feature idea for public service announcements. |
+| 860 | Suboptimal error message for un-instantiated package | other | SKIP | Error-message wording quality, not wrong package behavior. |
+| 744 | Feature request: `dev` time dependencies | feature | SKIP | New feature for dev-time deps. |
+| 710 | `] add` skips the `build` step | bug | **FIXED** | Reproduced the exact #710 scenario (registry `add` of a package carrying deps/build.jl) offline. I built a synthetic registry package "BuildPkg" whose deps/build.jl writes a marker file, served its tarball via LocalPkgServer.start… |
+| 677 | Support relative paths in registries | feature | SKIP | Requests relative-path support for registry repos. |
+| 562 | Should `up` also just ignore unknown packages? | rfc | SKIP | Design question about rm-vs-up consistency. |
+| 479 | warn about invalid/unexpected sections in Project.toml | feature | SKIP | Requests warning for mistyped Project.toml sections. |
+| 318 | status --tree | feature | SKIP | Requests tree display mode for status. |
+| 274 | Print diff when a tracked branch changes | feature | SKIP | Display enhancement for tracked-branch updates. |
+| 52 | levels of incompatibility | rfc | SKIP | Speculative resolver design proposal, not a bug. |
