@@ -2261,3 +2261,791 @@ end
         end
     end
 end
+
+
+@testset "Pkg.jl#3609 test subprocess crash output is surfaced" begin
+    local run_test_process = VibePkg.TestOps.run_test_process
+    local failure_reason = VibePkg.TestOps.failure_reason
+    local report_test_failures = VibePkg.TestOps.report_test_failures
+
+    mktempdir() do dir
+        # A synthetic package source whose test/runtests.jl writes its OWN
+        # output to stdout and then exits non-1 (deterministic stand-in for the
+        # reported segfault: exercises the exact surfacing path in
+        # run_test_process without needing a real crash).
+        source = mkpath(joinpath(dir, "Crasher"))
+        mkpath(joinpath(source, "test"))
+        runtests = joinpath(source, "test", "runtests.jl")
+        sentinel = "TEST-PROCESS-OWN-OUTPUT-3609"
+        write(
+            runtests, """
+            println("$sentinel")
+            flush(stdout)
+            exit(42)
+            """
+        )
+        # a bare sandbox project dir (the tests import nothing)
+        project_dir = mkpath(joinpath(dir, "sandbox"))
+        write(joinpath(project_dir, "Project.toml"), "")
+
+        # Drive the subprocess runner directly (autoprecompile=false, no
+        # install harness). It pipes the child's stdout/stderr through the op io.
+        io = IOBuffer()
+        result = run_test_process(
+            "Crasher", project_dir, runtests, source;
+            coverage = false, julia_args = String[], test_args = String[],
+            autoprecompile = false, io,
+        )
+
+        # A failing subprocess returns (name, process) rather than nothing.
+        @test result !== nothing
+        name, p = result
+        @test name == "Crasher"
+
+        # FIXED behavior (a): the test process's OWN stdout is surfaced through
+        # the op io — not swallowed in favor of a Pkg-internal stacktrace.
+        captured = String(take!(io))
+        @test occursin(sentinel, captured)
+
+        # FIXED behavior (b): the non-1 exit code is reported verbatim, so the
+        # failure annotation names it rather than hiding it.
+        @test Base.process_exited(p)
+        @test p.exitcode == 42
+        @test failure_reason(p) == " (exit code: 42)"
+
+        # And the collected-failure report throws a typed PkgError that carries
+        # that exit-code annotation (no internal Pkg/Operations stacktrace).
+        err = try
+            report_test_failures([(name, p)])
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test occursin("(exit code: 42)", sprint(showerror, err))
+        @test occursin("Crasher", sprint(showerror, err))
+    end
+end
+
+@testset "Pkg.jl#3588 rm removes developed external stdlib" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            # A synthetic dev package that impersonates a bundled stdlib
+            # (Random's name+UUID) at a bogus high external version — the
+            # offline analog of `add <url to a shipped stdlib>`.
+            random_uuid = UUID("9a3f8284-a2c9-5f02-9a11-845980a1fd5c")
+            devpkg = joinpath(dir, "Random")
+            mkpath(joinpath(devpkg, "src"))
+            write(
+                joinpath(devpkg, "Project.toml"), """
+                name = "Random"
+                uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+                version = "99.9.0"
+                """
+            )
+            write(joinpath(devpkg, "src", "Random.jl"), "module Random end\n")
+
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+
+            # develop records a valid path-tracked direct dep, not a broken orphan
+            developed = plan_develop(env, regs, Config(depots), devpkg)
+            @test haskey(developed.manifest, random_uuid)
+            @test is_path_tracked(developed.manifest[random_uuid])
+            @test developed.project.deps["Random"] == random_uuid
+
+            # persist and reload — entry survives a round-trip
+            write_environment(env, developed)
+            reloaded = load_environment(envdir; depots)
+            @test haskey(reloaded.manifest, random_uuid)
+            @test is_path_tracked(reloaded.manifest[random_uuid])
+
+            # rm actually removes it (the bug: rm printed "No Changes" and
+            # left a broken leftover entry). Both project dep and manifest
+            # entry must be gone.
+            removed = plan_rm(reloaded, [PackageRequest("Random")]; mode = :project)
+            @test !haskey(removed.project.deps, "Random")
+            @test !haskey(removed.manifest, random_uuid)
+
+            # and the removal survives a write + reload
+            write_environment(reloaded, removed)
+            final = load_environment(envdir; depots)
+            @test !haskey(final.project.deps, "Random")
+            @test !haskey(final.manifest, random_uuid)
+        end
+    end
+end
+
+@testset "Pkg.jl#3562 compat completion never emits a version string" begin
+    local REPLMode = VibePkg.REPLMode
+    mktempdir() do dir
+        # An active project whose [compat] carries a comma-separated version
+        # range string — the exact shape #3562's completion wrongly spliced
+        # onto the command line unquoted.
+        proj = joinpath(dir, "Project.toml")
+        write(
+            proj, """
+            name = "Root"
+            uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+            [deps]
+            Example = "$(EXAMPLE_UUID)"
+
+            [compat]
+            Example = "0.5, 0.5.1, 1.0"
+            """
+        )
+        oldp = Base.ACTIVE_PROJECT[]
+        VibePkg.Queries.reset_completion_cache!()
+        try
+            Base.ACTIVE_PROJECT[] = proj
+
+            # `compat <TAB>` offers dependency NAMES, not versions.
+            cands, _ = REPLMode.completions_for("compat ")
+            @test "Example" in cands
+
+            # `compat Example <TAB>` re-offers dependency names and must NOT
+            # emit a version-like candidate (would splice an unquoted, comma-
+            # bearing string that then fails to parse — the #3562 regression).
+            cands, _ = REPLMode.completions_for("compat Example ")
+            @test cands == VibePkg.Queries.environment_dependency_names()
+            @test "Example" in cands
+            @test all(c -> !occursin(',', c) && !occursin(r"^\d", c), cands)
+
+            # Nothing is completed for a version-position prefix either.
+            cands, _ = REPLMode.completions_for("compat Example 0")
+            @test isempty(cands)
+        finally
+            Base.ACTIVE_PROJECT[] = oldp
+            VibePkg.Queries.reset_completion_cache!()
+        end
+    end
+end
+
+@testset "Pkg.jl#3551 develop path keeps weakdeps/extensions out of deps" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+
+        # A synthetic local package with [weakdeps] + [extensions]. Example is a
+        # weak-only dep (registered but never force-required, so no fetch), the
+        # exact shape of the report's NDTensors/CUDA case.
+        foouuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        foodir = mkpath(joinpath(dir, "Foo"))
+        write(
+            joinpath(foodir, "Project.toml"),
+            """
+            name = "Foo"
+            uuid = "$foouuid"
+            version = "0.1.0"
+
+            [weakdeps]
+            Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+
+            [extensions]
+            FooExt = "Example"
+            """,
+        )
+        mkpath(joinpath(foodir, "src"))
+        write(joinpath(foodir, "src", "Foo.jl"), "module Foo\nend\n")
+
+        projfile = joinpath(mkpath(joinpath(dir, "proj")), "Project.toml")
+
+        old = copy(Base.DEPOT_PATH)
+        oldp = Base.ACTIVE_PROJECT[]
+        oldg = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            copy!(Base.DEPOT_PATH, [depot])
+            Base.ACTIVE_PROJECT[] = projfile
+
+            # develop by PATH into a fresh env with no prior manifest entry.
+            # The report's bug moved the weakdep into [deps] and raised a
+            # ResolverError; the fix reads weakdeps/exts from Foo's own
+            # Project.toml after install.
+            @test VibePkg.develop(; path = foodir, io = devnull) === nothing
+
+            env = load_environment(; depots = depot_stack([depot]))
+            entry = env.manifest[UUID(foouuid)]
+
+            @test is_path_tracked(entry)
+            # weakdep stays weak, is NOT promoted into deps
+            @test EXAMPLE_UUID in values(entry.weakdeps)
+            @test !(EXAMPLE_UUID in values(entry.deps))
+            # extension section is preserved
+            @test entry.exts["FooExt"] == "Example"
+        finally
+            copy!(Base.DEPOT_PATH, old)
+            Base.ACTIVE_PROJECT[] = oldp
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = oldg
+        end
+    end
+end
+
+@testset "Pkg.jl#3550 free recovers from dev'd dep whose upstream compat exceeds bound" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            dir = realpath(dir)
+
+            # A synthetic local `Example` package to `develop` into, at a
+            # version (0.5.1) that satisfies the project's `[compat] 0.5`.
+            devex = joinpath(dir, "Example")
+            mkpath(joinpath(devex, "src"))
+            write(
+                joinpath(devex, "Project.toml"), """
+                name = "Example"
+                uuid = "$EXAMPLE_UUID"
+                version = "0.5.1"
+                """
+            )
+            write(joinpath(devex, "src", "Example.jl"), "module Example end\n")
+
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+
+            # (1) add registry Example @0.5.1 and pin project compat to "0.5"
+            env = plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
+            env = plan_compat_entry(env, "Example", "0.5")
+            write_environment(load_environment(envdir; depots), env)
+            env = load_environment(envdir; depots)
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # (2) develop the local Example (still 0.5.1, satisfies compat)
+            env = plan_develop(env, regs, cfg, devex)
+            write_environment(load_environment(envdir; depots), env)
+            env = load_environment(envdir; depots)
+            @test is_path_tracked(env.manifest[EXAMPLE_UUID])
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # (3) simulate an "upstream fetch": the on-disk dev Project bumps
+            # its version above the project's 0.5 compat bound.
+            write(
+                joinpath(devex, "Project.toml"), """
+                name = "Example"
+                uuid = "$EXAMPLE_UUID"
+                version = "1.0.0"
+                """
+            )
+
+            # The bug (#3550): the environment is now wedged — resolve/up can
+            # only see the dev'd 1.0.0, which has an empty intersection with the
+            # project's 0.5 compat, and there is no recovery through resolve.
+            @test_throws VibePkg.Resolve.ResolverError plan_resolve(env, regs, cfg)
+            @test_throws VibePkg.Resolve.ResolverError plan_up(env, regs, cfg)
+
+            # The fix: `free` breaks the deadlock — it must NOT get stuck on the
+            # "empty intersection" compat error. It drops the dev source and
+            # re-resolves the freed package to a registry version within compat.
+            freed = plan_free(env, regs, cfg, [PackageRequest("Example", nothing, nothing)])
+            entry = freed.manifest[EXAMPLE_UUID]
+            @test is_registry_tracked(entry)
+            @test !is_path_tracked(entry)
+            @test entry_version(entry) == v"0.5.1"
+
+            # …and the environment resolves cleanly again after freeing.
+            write_environment(env, freed)
+            env = load_environment(envdir; depots)
+            resolved = plan_resolve(env, regs, cfg)
+            @test entry_version(resolved.manifest[EXAMPLE_UUID]) == v"0.5.1"
+        end
+    end
+end
+
+@testset "Pkg.jl#3545 dev pkg with weakdep into shared env" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            # Synthetic local package Foo mirroring HiddenMarkovModels.jl's shape:
+            # a [weakdeps] on the registered Example (stand-in for HMMBase) backing
+            # an extension. This is the package being `pkg> dev .`'d.
+            foo_uuid = UUID("11111111-1111-1111-1111-111111111111")
+            foodir = joinpath(dir, "Foo")
+            mkpath(joinpath(foodir, "src"))
+            write(
+                joinpath(foodir, "Project.toml"), """
+                name = "Foo"
+                uuid = "$foo_uuid"
+                version = "0.1.0"
+
+                [weakdeps]
+                Example = "$EXAMPLE_UUID"
+
+                [extensions]
+                FooExt = "Example"
+                """
+            )
+            write(joinpath(foodir, "src", "Foo.jl"), "module Foo end\n")
+
+            # --- Case 1: shared/named env with a PRE-EXISTING manifest that
+            # already has the weakdep (Example) added. This is the exact MWE:
+            # `]activate @myenv; dev .` where the env is persistent (non-temp).
+            # The reported bug crashed here with "Foo depends on <weakdep>, but no
+            # such entry exists in the manifest".
+            envdir = mkpath(joinpath(dir, "shared"))
+            env0 = load_environment(envdir; depots)
+            env1 = plan_add(env0, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
+            write_environment(env0, env1)
+            envA = load_environment(envdir; depots)
+            @test is_registry_tracked(envA.manifest[EXAMPLE_UUID])
+
+            # dev Foo into that persistent env: must succeed, no PkgError.
+            local plannedA
+            @test (plannedA = plan_develop(envA, regs, cfg, foodir)) isa
+                VibePkg.Environments.Environment
+            @test is_path_tracked(plannedA.manifest[foo_uuid])
+            @test entry_version(plannedA.manifest[foo_uuid]) == v"0.1.0"
+            # the pre-existing weakdep entry is untouched (still registry-tracked)
+            @test is_registry_tracked(plannedA.manifest[EXAMPLE_UUID])
+            write_environment(envA, plannedA)
+            reA = load_environment(envdir; depots)
+            @test is_path_tracked(reA.manifest[foo_uuid])
+
+            # --- Case 2: EMPTY persistent named env (weakdep NOT present). dev .
+            # must still succeed and must NOT drag the unrelated weakdep Example
+            # into the manifest.
+            emptydir = mkpath(joinpath(dir, "empty"))
+            env0b = load_environment(emptydir; depots)
+            local plannedB
+            @test (plannedB = plan_develop(env0b, regs, cfg, foodir)) isa
+                VibePkg.Environments.Environment
+            @test is_path_tracked(plannedB.manifest[foo_uuid])
+            # weakdep is not force-added when absent
+            @test !haskey(plannedB.manifest, EXAMPLE_UUID)
+        end
+    end
+end
+
+@testset "Pkg.jl#3541 add promotes weakdep to hard dep and resolve keeps it" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            # Project with Example ONLY in [weakdeps], empty [deps]
+            write(
+                joinpath(envdir, "Project.toml"), """
+                name = "MyPkg"
+                uuid = "11111111-1111-1111-1111-111111111111"
+
+                [deps]
+
+                [weakdeps]
+                Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+                """
+            )
+            env0 = load_environment(envdir; depots)
+            @test !haskey(env0.project.deps, "Example")
+            @test haskey(env0.project.weakdeps, "Example")
+
+            # add Example (currently a weakdep) -> should PROMOTE to a hard dep
+            added = plan_add(env0, regs, cfg, [PackageRequest("Example", nothing, nothing)])
+            @test added.project.deps["Example"] == EXAMPLE_UUID          # in [deps]
+            @test !haskey(added.project.weakdeps, "Example")             # left [weakdeps]
+            @test haskey(added.manifest, EXAMPLE_UUID)                   # in manifest
+            @test entry_version(added.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # persist and reload: promotion is durable on disk
+            @test write_environment(env0, added)
+            reloaded = load_environment(envdir; depots)
+            @test reloaded.project.deps["Example"] == EXAMPLE_UUID
+            @test !haskey(reloaded.project.weakdeps, "Example")
+            @test haskey(reloaded.manifest, EXAMPLE_UUID)
+
+            # a subsequent resolve must NOT drop Example (the reported bug)
+            resolved = plan_resolve(reloaded, regs, cfg)
+            @test resolved.project.deps["Example"] == EXAMPLE_UUID
+            @test !haskey(resolved.project.weakdeps, "Example")
+            @test haskey(resolved.manifest, EXAMPLE_UUID)
+            @test entry_version(resolved.manifest[EXAMPLE_UUID]) == v"0.5.1"
+        end
+    end
+end
+
+@testset "Pkg.jl#3527 add --preserve=all won't upgrade a dep to a julia-incompatible version" begin
+    using VibePkg.Configs: PRESERVE_ALL, PRESERVE_NONE
+
+    APP_UUID = UUID("a0000000-0000-0000-0000-0000000000a1")
+    LIB_UUID = UUID("b0000000-0000-0000-0000-0000000000b2")
+
+    # A synthetic 2-package registry mirroring #3527: App depends on Lib in the
+    # range 1-2. Lib@1.0.0 supports the running julia; Lib@2.0.0 requires a
+    # far-future julia (the CompilerSupportLibraries_jll analogue that needed a
+    # newer julia than the host). A correct `add --preserve=all` must never move
+    # an already-resolved Lib@1.0.0 up to the julia-incompatible Lib@2.0.0.
+    make_fixture_registry = function (depot)
+        reg = joinpath(depot, "registries", "Fixture3527")
+        appdir = joinpath(reg, "A", "App")
+        libdir = joinpath(reg, "L", "Lib")
+        mkpath(appdir)
+        mkpath(libdir)
+        write(
+            joinpath(reg, "Registry.toml"), """
+            name = "Fixture3527"
+            uuid = "c0000000-0000-0000-0000-0000000000c3"
+            repo = "https://example.com/Fixture3527.git"
+
+            [packages]
+            $APP_UUID = { name = "App", path = "A/App" }
+            $LIB_UUID = { name = "Lib", path = "L/Lib" }
+            """
+        )
+
+        write(
+            joinpath(appdir, "Package.toml"), """
+            name = "App"
+            uuid = "$APP_UUID"
+            repo = "https://example.com/App.jl.git"
+            """
+        )
+        write(
+            joinpath(appdir, "Versions.toml"), """
+            ["1.0.0"]
+            git-tree-sha1 = "1111111111111111111111111111111111111111"
+            """
+        )
+        write(
+            joinpath(appdir, "Deps.toml"), """
+            ["1"]
+            Lib = "$LIB_UUID"
+            """
+        )
+        write(
+            joinpath(appdir, "Compat.toml"), """
+            ["1"]
+            Lib = "1-2"
+            julia = "1.6.0-999"
+            """
+        )
+
+        write(
+            joinpath(libdir, "Package.toml"), """
+            name = "Lib"
+            uuid = "$LIB_UUID"
+            repo = "https://example.com/Lib.jl.git"
+            """
+        )
+        write(
+            joinpath(libdir, "Versions.toml"), """
+            ["1.0.0"]
+            git-tree-sha1 = "2222222222222222222222222222222222222222"
+
+            ["2.0.0"]
+            git-tree-sha1 = "3333333333333333333333333333333333333333"
+            """
+        )
+        # Lib@1.0.0 fits the running julia; Lib@2.0.0 demands a far-future julia
+        # (excludes any real host), so it must never be selected.
+        write(
+            joinpath(libdir, "Compat.toml"), """
+            ["1.0.0"]
+            julia = "1.6.0-999"
+
+            ["2.0.0"]
+            julia = "999.0.0-999"
+            """
+        )
+        return reg
+    end
+
+    mktempdir() do depot
+        make_fixture_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+
+            # Seed the env: resolve App -> Lib. The resolver must land on Lib@1.0.0
+            # because Lib@2.0.0's julia compat excludes the running host.
+            seeded = plan_add(env, regs, cfg, [PackageRequest("App", nothing, "1.0.0")])
+            @test entry_version(seeded.manifest[APP_UUID]) == v"1.0.0"
+            @test entry_version(seeded.manifest[LIB_UUID]) == v"1.0.0"
+
+            # Persist and reload so we start from a real, already-resolved manifest
+            # (the shape of the reporter's "env already resolved" state).
+            write_environment(env, seeded)
+            resolved_env = load_environment(envdir; depots)
+            @test entry_version(resolved_env.manifest[LIB_UUID]) == v"1.0.0"
+
+            # The #3527 core: `add --preserve=all App@1.0.0` must HOLD every existing
+            # manifest entry. Before the fix, the transitive Lib was free to upgrade
+            # to Lib@2.0.0 — a version whose julia compat excludes the host. FIXED:
+            # Lib stays pinned at 1.0.0 and no julia-incompatible version is chosen.
+            plan = plan_add(
+                resolved_env, regs, cfg, [PackageRequest("App", nothing, "1.0.0")];
+                preserve = PRESERVE_ALL,
+            )
+            @test entry_version(plan.manifest[APP_UUID]) == v"1.0.0"
+            @test entry_version(plan.manifest[LIB_UUID]) == v"1.0.0"
+
+            # Control: even with preserve=none the resolver still refuses the
+            # julia-incompatible Lib@2.0.0 and holds Lib@1.0.0 — confirming the
+            # fixture's julia gate is what rules out the bad upgrade, not luck.
+            plan_none = plan_add(
+                resolved_env, regs, cfg, [PackageRequest("App", nothing, "1.0.0")];
+                preserve = PRESERVE_NONE,
+            )
+            @test entry_version(plan_none.manifest[LIB_UUID]) == v"1.0.0"
+        end
+    end
+end
+
+@testset "Pkg.jl#3518 resolve works when deps are not instantiated" begin
+    # Report: in an environment whose registry-tracked deps are NOT installed
+    # on disk, `resolve` errored with "Expected package Foo to exist at path
+    # ...". resolve must instead recompute the manifest from project+registry
+    # without requiring the dependency to be present on disk. The disk-existence
+    # error lives in collect_fixed, which resolve_with_preserve only feeds
+    # path/repo-tracked nodes, so a registry-tracked dep must resolve fine with
+    # nothing installed.
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            projdir = mkpath(joinpath(dir, "proj"))
+            write(joinpath(projdir, "Project.toml"), "")
+
+            # Build a manifest that pins Example 0.5.1 (registry-tracked), then
+            # persist and reload it — WITHOUT ever installing anything.
+            env0 = load_environment(projdir; depots)
+            env1 = plan_add(env0, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
+            write_environment(env0, env1)
+
+            env = load_environment(projdir; depots)
+            @test is_registry_tracked(env.manifest[EXAMPLE_UUID])
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # Nothing is installed on disk: the depot has no populated package
+            # tree for Example.
+            pkgdir = joinpath(depot, "packages")
+            @test !isdir(pkgdir) || isempty(readdir(pkgdir))
+
+            # resolve on the un-instantiated env must NOT throw the disk-existence
+            # error; it recomputes the manifest from project + registry.
+            local resolved
+            @test (resolved = plan_resolve(env, regs, cfg)) isa VibePkg.Environments.Environment
+            @test haskey(resolved.manifest, EXAMPLE_UUID)
+            @test is_registry_tracked(resolved.manifest[EXAMPLE_UUID])
+            @test entry_version(resolved.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # still nothing installed — resolve did not require instantiation.
+            @test !isdir(pkgdir) || isempty(readdir(pkgdir))
+        end
+    end
+end
+
+@testset "Pkg.jl#3463 registry status lists same-named registries in every depot" begin
+    mktempdir() do dir
+        d1 = mkpath(joinpath(dir, "d1"))
+        d2 = mkpath(joinpath(dir, "d2"))
+        make_test_registry(d1)
+        make_test_registry(d2)
+        # discovery layer already sees both (same name+uuid, one per depot)
+        @test length(reachable_registries(depot_stack([d1, d2]))) == 2
+
+        # status layer reads Base.DEPOT_PATH; drive it with both depots and
+        # capture output. Offline avoids any package-server query.
+        old = copy(Base.DEPOT_PATH)
+        oldoff = VibePkg.API.OFFLINE_MODE[]
+        try
+            VibePkg.API.OFFLINE_MODE[] = true
+            copy!(Base.DEPOT_PATH, [d1, d2])
+            buf = IOBuffer()
+            VibePkg.Registry.status(; io = buf)
+            out = String(take!(buf))
+            # both instances of the same-named registry printed, one header
+            # (`[23338594] TestRegistry`) per depot. The bug would print only one.
+            @test count("[23338594] TestRegistry", out) == 2
+        finally
+            copy!(Base.DEPOT_PATH, old)
+            VibePkg.API.OFFLINE_MODE[] = oldoff
+        end
+    end
+end
+
+@testset "Pkg.jl#3434 rev resolves against actual default branch (not hardcoded master)" begin
+    Git = VibePkg.Git
+    mktempdir() do dir
+        # Build a git repo whose ONLY branch is `main` (no master anywhere),
+        # plus a tag. `git init -b main` forces the default branch regardless
+        # of the host's init.defaultBranch config.
+        src = joinpath(dir, "MainPkg")
+        mkpath(joinpath(src, "src"))
+        write(
+            joinpath(src, "Project.toml"), """
+            name = "MainPkg"
+            uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(src, "src", "MainPkg.jl"), "module MainPkg end\n")
+        git(a...) = run(
+            setenv(
+                `git -C $src $a`,
+                "GIT_AUTHOR_NAME" => "t", "GIT_AUTHOR_EMAIL" => "t@e.x",
+                "GIT_COMMITTER_NAME" => "t", "GIT_COMMITTER_EMAIL" => "t@e.x"
+            )
+        )
+        git("init", "-q", "-b", "main")
+        git("add", ".")
+        git("commit", "-q", "-m", "initial")
+        git("tag", "v0.1.0")
+
+        # Guard the premise: the repo really has `main` and no `master`.
+        branches = readchomp(`git -C $src branch --list`)
+        @test occursin("main", branches)
+        @test !occursin("master", branches)
+
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # rev = nothing must read the repository's actual default branch
+        # (`main`) rather than assuming `master`. The pre-fix bug raised
+        # "invalid git HEAD (reference 'refs/heads/master' not found)".
+        rp = Git.materialize_repo_package!(depots, src; io = devnull)
+        @test rp.name == "MainPkg"
+        @test rp.rev == "main"
+
+        # an explicit rev = "main" resolves through the fetch/lookup path
+        rp_main = Git.materialize_repo_package!(depots, src; rev = "main", io = devnull)
+        @test rp_main.rev == "main"
+        @test rp_main.tree_hash == rp.tree_hash
+
+        # a tag on that same branch resolves too
+        rp_tag = Git.materialize_repo_package!(depots, src; rev = "v0.1.0", io = devnull)
+        @test rp_tag.rev == "v0.1.0"
+        @test rp_tag.tree_hash == rp.tree_hash
+    end
+end
+
+@testset "Pkg.jl#3412 up does not re-download an up-to-date registry" begin
+    # server-backed "General" installed from the local pkg server; an update
+    # against the same server must be a no-op (Pkg.jl#3412: `up` used to
+    # unconditionally re-download the registry no matter the options).
+    LocalPkgServer.ensure!()
+    server = VibePkg.Configs.pkg_server()
+    @test server !== nothing
+    Dates = VibePkg.Registries.Dates
+    mktempdir() do depot
+        depots = depot_stack([depot])
+        added = VibePkg.Registries.add_default_registries!(depots; io = devnull)
+        @test "General" in added
+
+        reg_dir = joinpath(depot, "registries")
+        snapshot() = Dict(
+            f => (mtime(joinpath(reg_dir, f)), stat(joinpath(reg_dir, f)).inode)
+                for f in readdir(reg_dir)
+        )
+        before = snapshot()
+
+        # cooldown ~0 defeats the persisted-log cooldown skip, so the skip is
+        # forced through the tree-hash comparison (installed == server) — the
+        # actual fix — rather than a trivial time gate.
+        buf = IOBuffer()
+        updated = VibePkg.Registries.update_registries!(
+            depots; server, io = buf, update_cooldown = Dates.Millisecond(0),
+        )
+        @test isempty(updated)                                   # nothing re-downloaded
+        @test !occursin("Updating registry", String(take!(buf))) # no unconditional print
+        @test snapshot() == before                               # installed files untouched
+
+        # a second, immediate update in the same session is likewise a no-op:
+        # the literal MWE (session already updated) must not re-download either
+        buf2 = IOBuffer()
+        @test isempty(
+            VibePkg.Registries.update_registries!(
+                depots; server, io = buf2, update_cooldown = Dates.Millisecond(0),
+            )
+        )
+        @test isempty(String(take!(buf2)))
+        @test snapshot() == before
+    end
+end
+
+@testset "Pkg.jl#3411 add by url with explicit uuid" begin
+    # Reproduces the MWE `Pkg.add(PackageSpec(url=..., uuid=...))`. On the
+    # url path the spec's name is `nothing` — the bug's precondition. Old Pkg
+    # crashed in the sysimage check with
+    # `MethodError: no method matching Base.PkgId(::UUID, ::Nothing)`.
+    fx = LocalPkgServer.ensure!()
+    git_repo = fx.git_repo
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        projfile = joinpath(mkpath(joinpath(dir, "proj")), "Project.toml")
+
+        old = copy(Base.DEPOT_PATH)
+        oldp = Base.ACTIVE_PROJECT[]
+        oldg = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        olda = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        try
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            copy!(Base.DEPOT_PATH, [depot])
+            Base.ACTIVE_PROJECT[] = projfile
+
+            spec = VibePkg.API.PackageSpec(url = git_repo, uuid = EXAMPLE_UUID)
+            @test spec.name === nothing        # the bug's precondition
+            @test spec.uuid == UUID(EXAMPLE_UUID)
+
+            # The fixed behavior: add succeeds (no MethodError PkgId(::UUID,::Nothing)).
+            @test VibePkg.add([spec]; io = devnull) === nothing
+
+            env = load_environment(; depots = depot_stack([depot]))
+            entry = env.manifest[UUID(EXAMPLE_UUID)]
+            @test entry.name == "Example"
+            # url-tracked, and the source url is recorded in the project
+            @test VibePkg.EnvFiles.is_repo_tracked(entry)
+            @test haskey(env.project.sources, "Example")
+        finally
+            copy!(Base.DEPOT_PATH, old)
+            Base.ACTIVE_PROJECT[] = oldp
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = oldg
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = olda
+        end
+    end
+end
+
+@testset "Pkg.jl#3335 pin version with build metadata rejected cleanly" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            cfg = Config(depots)
+
+            # Install Example first so the pin has something to act on.
+            planned = plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
+            write_environment(env, planned)
+            env = load_environment(envdir; depots)
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+            # The reported symptom (#3335) was a raw `ArgumentError: invalid
+            # base 10 digit '+'` leaking out of `pin FakePkg@0.1.2+3`. The
+            # guard in request_version_spec must convert that into a clean
+            # PkgError before it reaches the user on the pin path too.
+            err = try
+                plan_pin(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1+3")])
+                nothing
+            catch e
+                e
+            end
+            @test err isa PkgError
+            @test !(err isa ArgumentError)
+            @test occursin("invalid version specifier", sprint(showerror, err))
+        end
+    end
+end

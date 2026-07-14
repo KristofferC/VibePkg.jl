@@ -23,9 +23,9 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–8 (of ~40). **In-scope bugs:** 59 → **43 FIXED, 15 PERSISTS, 1 N/A**. Non-bugs skipped: ~112.
-- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **41 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
-- **The 15 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
+- **Pages covered:** 1–11 (of ~40). **In-scope bugs:** 82 → **57 FIXED, 22 PERSISTS, 3 N/A**. Non-bugs skipped: ~165.
+- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **55 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
+- **The 22 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
 - Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
 
 ---
@@ -243,3 +243,94 @@ Test column: file + testset that pins the behavior, or `—`.
 | 2549 | Unable to install JLL package from private repo | bug | SKIP | Private-repo/auth-specific artifact download failure; requires private credentials, not pl |
 | 1967 | proposal for package tags and descriptions in registry | feature | SKIP | Feature proposal to add tags/description fields to registry and Project.toml. |
 | 1062 | Introduce `down` as opposite of `up` | feature | SKIP | Feature request for a downgrade-to-oldest-compatible command. |
+
+## Page 9
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 3726 | Edit links broken for files in the main Julia repo | docs | SKIP | Documentation edit links point to the wrong repo location. |
+| 3717 | Allow passing a list of root manifests to Pkg.gc() | feature | SKIP | Feature request to gc against a supplied set of manifests and mark artifacts as used. |
+| 3713 | Resolve should notice when you are being version bound to require some | feature | SKIP | Request to improve the unsatisfiable-requirements error message to suggest updating the re |
+| 3686 | Allow comments in `[compat]` entries | feature | SKIP | Feature request for inline comment syntax in compat bounds. |
+| 3682 | Suggestion: Allow for SubString{String} to be passed to `RegistrySpec` | feature | SKIP | API enhancement to accept AbstractString in the RegistrySpec constructor. |
+| 3675 | Include system image packages in Pkg.status output | feature | SKIP | Feature request to show sysimage-provided packages in status. |
+| 3629 | "Warning: The call to compilecache failed to create a usable precompil | bug | N/A | The reported warning ("The call to compilecache failed to create a usable precompiled cache file...") is emitted by Julia Base's loading/compilecache machinery, not by VibePkg. Grepping src/ for compilecache / "usable precompiled"… |
+| 3628 | Standard libraries tagged in package conflict reports | feature | SKIP | Request that stdlibs (fixed to 0.0.0) be presented more clearly in resolver conflict repor |
+| 3622 | precompile verbose output | feature | SKIP | Feature request for a verbose/debug mode for precompile. |
+| 3612 | Feature request: different dependencies on different operating systems | feature | SKIP | Feature request for OS-specific dependency declarations. |
+| 3611 | GitHub actions Pkg checkout of private dep hangs on Windows | bug | N/A | Read /Users/kc/JuliaPkgs/Pkg.jl/VibePkg/src/Git.jl: clone() (L107-160) and fetch() (L176-222) set credentials=LibGit2.CachedCredentials() and call LibGit2.clone/LibGit2.fetch with default callbacks. VibePkg never builds a LibGit2.… |
+| 3609 | If a test segfaults, we don't print the test process's stacktrace | bug | **FIXED** | Ran a live repro with the VibePkg daemon (Level 2 API). Created a synthetic local dev package "Segfaulter" whose test/runtests.jl does `unsafe_load(Ptr{Int}(10))` (the exact MWE from the report), `VibePkg.develop(; path=...)`'d it… |
+| 3608 | No easy way to see all package versions resolved in environment stack | feature | SKIP | Feature request for an effective/combined manifest across an environment stack. |
+| 3607 | `--code-coverage` path in `Base.julia_cmd()` is shadowed if `coverage= | docs | SKIP | Labeled documentation; primary ask is clarifying that coverage may be a String/path, cover |
+| 3588 | User can acidentially add external version of stdlib to Manifest | bug | **FIXED** | Level-1 offline repro (repro3588.jl, --name=r3588): built a synthetic local package claiming bundled stdlib Random's UUID+name at external version 99.9.0 (offline analog of `add <url to Statistics.jl>`), then plan_develop -> write… |
+| 3569 | Move the "Creating Packages" section of the documentation to the Julia | docs | SKIP | Documentation reorganization request. |
+| 3545 | Cannot `pkg> dev .` a package with extensions inside a shared environm | bug | **FIXED** | Reproduced offline via the r3545 --test daemon (Level 1 plan_develop). Built a synthetic local package Foo with [weakdeps] Example + [extensions] FooExt="Example" and ran plan_develop into three environment shapes, matching `pkg>… |
+| 3518 | `resolve` complains if a dependency is not instantiated | bug | **FIXED** | Ran a Level-1 offline repro in the VibePkg daemon: built a manifest containing Example 0.5.1 via plan_add + write_environment, reloaded the env with NOTHING installed on disk (depot packages dir empty), then called plan_resolve. O… |
+| 3412 | `]update` always downloads registries, no matter the options | bug | **FIXED** | Ran two offline repros in the --test daemon against a server-backed packed "General" registry (General.toml stub + General.tar.gz) installed from the local pkg server, mirroring ~/.julia/registries/General. (1) Direct: update_regi… |
+| 3347 | Ability to easily repeatedly add a fixed group of packages | feature | SKIP | Feature request to add all packages from a named environment at once. |
+| 3339 | `status --outdated` did not tell me why I couldn't update my package | feature | SKIP | Request for better diagnostics; `--outdated` output is technically accurate (newer version |
+| 621 | Introduce `env` command to manage environments | feature | SKIP | Feature request for an env-listing command and activate autocompletion. |
+
+## Page 10
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 3562 | `compat` tab completion should return a string of existing versions | bug | **FIXED** | Ran completions_for in VibePkg's --test daemon against an active project with compat `Example = "0.5, 0.5.1, 1.0"`. Results: completions_for("compat ")=["Example"], completions_for("compat Example ")=["Example"] (re-offers depende… |
+| 3555 | `instantiate` on a Project without a `Manifest.toml` insists on reupda | bug | **PERSISTS** | Ran an offline Level-2 repro in the --test daemon (synthetic local dev package; no network). Set VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]=true, developed a local path package (creates Project+Manifest), then spied on VibePkg.Re… |
+| 3551 | Develop can create an incorrect Manifest; moves `weakdeps` to `deps` | bug | **FIXED** | Ran VibePkg.develop(path=foodir) on a synthetic local dev package Foo declaring [weakdeps] Example + [extensions] FooExt="Example", in an isolated offline env (Level 2 full API). Develop succeeded with NO resolve error. Written Ma… |
+| 3550 | Deadlock in freeing `dev`ed packages after fetching upstream | bug | **FIXED** | Reproduced the exact scenario at plan-level in the VibePkg test daemon using the offline `Example` fixture. Setup: project with dep `Example` @0.5.1 and project `[compat] Example = "0.5"`; dev'd `Example` to a synthetic local path… |
+| 3546 | `free` should call `registry up` if needed | feature | SKIP | Enhancement request to have free auto-run registry up when compat is unsatisfiable. |
+| 3541 | Unclear `resolve` behavior when upgrading a `weakdep` to hard `dep` | bug | **FIXED** | Ran a Level 1 plan-level repro in the r3541 test daemon. Built a synthetic project "MyPkg" with Example ONLY in [weakdeps] (deps empty), against the offline make_test_registry (Example 0.5.0/0.5.1). Then `plan_add(env0, regs, cfg,… |
+| 3532 | Contextual test dependencies | feature | SKIP | Labeled feature request for conditionally-required test dependencies. |
+| 3527 | Flag --preserve=all still allows upgrading a dependency of a package t | bug | **FIXED** | Ran a plan-level repro in VibePkg (jld --test, synthetic 2-package fixture registry, offline). Scenario mirroring #3527: App@1.0.0 depends on Lib (1-2); Lib@1.0.0 julia="1.6-999", Lib@2.0.0 julia="1.99-999" (requires a julia newer… |
+| 3512 | Support multiple APIs and version numbers per package | rfc | SKIP | Labeled feature request / design proposal for multiple version numbers per package. |
+| 3508 | Store project hash for dev'd deps | feature | SKIP | Enhancement request to detect stale dev'd dependency projects via stored hashes. |
+| 3505 | Test-only artifacts | feature | SKIP | Feature request for artifacts installed by Pkg.test but not instantiate; current error is  |
+| 3499 | Improving the docs for extensions | docs | SKIP | Documentation-clarification request for extensions. |
+| 3497 | Feature request: `activate --cd Foo` to activate Foo and change workin | feature | SKIP | Labeled feature request for a new activate flag. |
+| 3496 | ]up Foo downloads registry even if Foo is not registered | bug | **PERSISTS** | Ran an API-level repro in the --test daemon (isolated depot, dead proxy, no pkg server). Setup: make_test_registry converted into a git-backed registry with a dead remote (http://127.0.0.1:9/TestRegistry.git); an env whose ONLY de… |
+| 3494 | Сompat does not include DEV version | bug | **PERSISTS** | Ran in the r3494 --test daemon calling VibePkg.Versions.semver_spec directly (the [compat] parser; confirmed as the compat load path at src/Planning.jl:1720-1721, which throws pkgerror("invalid version specifier ...") when semver_… |
+| 3482 | Remove stacktrace pointing to Pkg when a Pkg.test fails | feature | SKIP | Output/UX request to suppress an internal backtrace when a tested package errors; not wron |
+| 3471 | Clarify `up` documentation | docs | SKIP | Labeled documentation issue; help text says up updates registries but it also updates pack |
+| 3463 | Registries with the same name in non-primary depots not being reported | bug | **FIXED** | Ran a repro via the r3463 --test daemon: wrote an identical make_test_registry (name "TestRegistry", uuid 23338594-aafe-5451-b93e-139f81909106) into two separate depots d1 and d2, then queried both the discovery layer and the stat… |
+| 3458 | Disallow certain Pkg operations during precompilation | feature | SKIP | Hardening/enhancement request to guard against recursive precompilation (fork bomb). |
+| 3434 | Bug in Pkg.PackageSpec: breaks when default branch of a repo changes | bug | **FIXED** | Ran materialize_repo_package! against a synthetic local git repo whose ONLY branch is `main` (created via `git init -b main`; `git branch` output confirmed "* main", no master). Results: rev=nothing (default branch) => OK name=MyP… |
+| 3420 | Pkg.Registry.rm ERROR: MethodError: no method matching rm(::SubString{ | bug | **PERSISTS** | Ran in the r3420 --test daemon: `VibePkg.Registry.rm(SubString("General", 1))` throws `MethodError: no method matching rm(::SubString{String})` — identical to the report. `methods(VibePkg.Registry.rm)` shows only `rm(specs::String… |
+| 3417 | Official API for `resolve()` | feature | SKIP | Labeled speculative feature request for a public resolve() endpoint. |
+| 3411 | `PkgId` method error when adding by URL and specifying the UUID | bug | **FIXED** | Ran the exact MWE shape offline via the daemon using LocalPkgServer.ensure!()'s local Example git repo: VibePkg.add([PackageSpec(url=<local Example.jl git repo>, uuid="7876af07-990d-54b4-ab0e-23690620f79a")]). The spec had name=no… |
+| 3225 | Feature request: loading dependencies and/or artifacts from package ho | feature | SKIP | Feature request to allow package hooks to load deps/lazy artifacts. |
+| 3030 | Cannot dev private repos: libgit2 uses protocol phased out by Github t | bug | SKIP | Root cause is libgit2/SSH RSA-SHA1 deprecation external to Pkg; not reproducible in packag |
+| 2764 | Lazy artifact without unpacking (non-tarball) | feature | SKIP | Feature request for an `unpack` keyword / non-tarball lazy artifacts. |
+| 2393 | Dependency confusion between internal registries and General | rfc | SKIP | Security design discussion about shadowing across registries; proposal, not a concrete cod |
+| 1860 | Tree Hash mismatch Error on Pkg installation | bug | SKIP | git-tree-sha1 mismatch only manifests on NFS depots; a filesystem-timing race not plausibl |
+
+## Page 11
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 3405 | Feature request: `]test --quiet` | feature | SKIP | Explicit feature request for a quiet test flag; no wrong behavior. |
+| 3380 | Autoname extensions | feature | SKIP | Requests automatic extension naming to reduce boilerplate. |
+| 3377 | Specifying override artifacts using a relative path | feature | SKIP | Requests support for relative paths in overrides.toml. |
+| 3367 | Potential feature: recommend project environment on unsatisfiable requ | feature | SKIP | Requests an added nudge message on conflicts; enhancement. |
+| 3365 | tree_hash does not handle devices | bug | **PERSISTS** | Ran the exact MWE in the VibePkg r3365 daemon (LocalPkgServer not needed; tree_hash is pure). VibePkg.TreeHash.tree_hash("/dev/null") throws: `Base.IOError :: IOError: readdir("/dev/null"): not a directory (ENOTDIR)` — the same ba… |
+| 3354 | Add feature to run specific test files. | feature | SKIP | Requests ability to run specific test files or name patterns. |
+| 3348 | [docs] document indirect conditional loading | docs | SKIP | Asks for documentation of indirect extension triggering. |
+| 3345 | Command to copy/fork environment | feature | SKIP | Requests a new command to fork an environment. |
+| 3337 | Auto-Install with wrong package name does not hit the Suggestion Error | feature | SKIP | Requests the loading auto-install message to include name suggestions; enhancement. |
+| 3335 | `ArgumentError: invalid base 10 digit` when fixing package with exotic | bug | **FIXED** | Ran a Level-1 pin repro in the --test daemon (isolate!, offline Example fixture at 0.5.0/0.5.1). Added Example, then called plan_pin(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1+3")]) — the exact user-facing pin path… |
+| 3326 | Projects with symlinked `Project.toml`s are broken | bug | **PERSISTS** | VibePkg's find_project_file (src/Environments.jl:100) resolves a symlinked Project.toml via safe_realpath before anything else — identical to real Pkg (src/Types.jl:236) — so it writes/reads the Manifest next to the symlink TARGET… |
+| 3316 | JET.jl gets lots of error using `Pkg.activate`, `Pkg.instantiate` and  | other | SKIP | JET static-analysis possible-error report (type instabilities), not observable runtime mis |
+| 3305 | [Feature Request] Add an Option to Copy an Existing `Project.toml` to  | feature | SKIP | Requests option to seed a new/temp env from an existing Project.toml. |
+| 3300 | `instantiate` triggers `build` on deps but not the active package | question | SKIP | Asks whether the build-on-deps-not-active-package behavior is intentional design. |
+| 3292 | Registry updates from package server does not do incremental updates | feature | SKIP | Performance enhancement request for incremental registry downloads. |
+| 3279 | `IOError: FDWatcher: bad file descriptor` running `Pkg.update()` | other | SKIP | Network/VPN-specific download failure; reporter attributes it to their own network. |
+| 3270 | Prioritize full upgrade of direct dependencies over indirect dependenc | rfc | SKIP | Design proposal to change resolver upgrade priority/stability policy. |
+| 3268 | Add `pkg> bump patch/minor/major` to bump the active env version | feature | SKIP | Requests a new bump command/API. |
+| 3267 | Experimental status of Pkg.dependencies(), Pkg.project() | question | SKIP | Asks for clarification on API stability status. |
+| 3259 | Feature request: add search function to search for available packages. | feature | SKIP | Requests a package search feature. |
+| 3240 | Pkg can confusingly load env in secondary DEPOT_PATH by default | feature | SKIP | Enhancement request (auto-create/warn); reporter unsure of specific change, behavior follo |
+| 3233 | Trying to fix broken manifests is really frustrating | rfc | SKIP | UX/design request for atomic or lenient operations on already-broken manifests. |
+| 3175 | Suggest how to resolve conflict | feature | SKIP | Requests resolver heuristics that suggest packages to remove. |
+| 3074 | Allow testing projects without a UUID | feature | SKIP | Asks to relax the UUID requirement for testing; an enhancement, not wrong behavior. |
+| 2741 | Installation of Julia packages for fully offline environments | feature | SKIP | Requests offline installation workflow support. |
+| 1568 | Feature request: support version numbers with build metadata | bug | **PERSISTS** | Ran a Level-1 plan repro in the r1568 daemon (LocalPkgServer.isolate!, Example fixture). Adapting the MWE to the offline Example package, `plan_add(env0, regs, Config(depots), [PackageRequest("Example", nothing, "2.23.0+1")])` thr… |
