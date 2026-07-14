@@ -1170,3 +1170,82 @@ end
         end
     end
 end
+
+# Pkg.jl#4686 — `free`ing a develop'd package must succeed and re-track the
+# registry version. (Pkg 1.13-rc1 regressed: `free` (and `add`) of a dev'd
+# package errored "could not find source path for package ... based on manifest".)
+@testset "free re-tracks a develop'd package (#4686)" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            devex = joinpath(dir, "Example")
+            mkpath(joinpath(devex, "src"))
+            write(
+                joinpath(devex, "Project.toml"), """
+                name = "Example"
+                uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+                version = "0.5.1"
+                """
+            )
+            write(joinpath(devex, "src", "Example.jl"), "module Example end\n")
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            env = plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.1")])
+            env = plan_develop(env, regs, Config(depots), devex)
+            @test is_path_tracked(env.manifest[EXAMPLE_UUID])
+
+            freed = plan_free(env, regs, Config(depots), [PackageRequest("Example")])
+            entry = freed.manifest[EXAMPLE_UUID]
+            @test is_registry_tracked(entry)
+            @test !is_path_tracked(entry)
+            @test entry_version(entry) == v"0.5.1"
+        end
+    end
+end
+
+# Pkg.jl#4691 — unknown/custom top-level tables in Project.toml (written by
+# external tooling, e.g. `[reuse_licensing]`) must survive Pkg operations; they
+# are ignored semantically but preserved verbatim (via `project.raw`).
+@testset "operations preserve custom Project.toml tables (#4691)" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            proj = joinpath(envdir, "Project.toml")
+            write(
+                proj, """
+                name = "MyEnv"
+                uuid = "00000000-0000-0000-0000-0000000000aa"
+
+                [reuse_licensing]
+                reuse_specification_version = "3.3"
+                package_license_expression = "EUPL-1.2+"
+
+                [tool.mytool]
+                foo = 42
+                """
+            )
+            env = load_environment(envdir; depots)
+            @test haskey(env.project.raw, "reuse_licensing")
+
+            # add: custom tables (and their values) survive
+            write_environment(env, plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.1")]))
+            txt = read(proj, String)
+            @test occursin("[reuse_licensing]", txt)
+            @test occursin("EUPL-1.2+", txt)
+            @test occursin("[tool.mytool]", txt)
+
+            # rm: still survive
+            env = load_environment(envdir; depots)
+            write_environment(env, plan_rm(env, [PackageRequest("Example")]))
+            txt2 = read(proj, String)
+            @test occursin("[reuse_licensing]", txt2)
+            @test occursin("EUPL-1.2+", txt2)
+            @test occursin("[tool.mytool]", txt2)
+        end
+    end
+end
