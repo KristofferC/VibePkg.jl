@@ -1,6 +1,14 @@
 using VibePkg
 using Testosterone: set_history_file, history_file, find_tests, runtests
 
+# HistoricalStdlibVersions provides the cross-julia-version stdlib tables that
+# test/historical_stdlib_version.jl bridges into VibePkg.Stdlibs. It (and its
+# Pkg dep) live in the user depot, so — like REPL below — it must be loaded on
+# the loose boot stack, before ensure!()/isolate!() drops the user depot. Its
+# auto-register writes into Pkg.Types (unused here), so turn it off.
+ENV["HISTORICAL_STDLIB_VERSIONS_AUTO_REGISTER"] = "false"
+using HistoricalStdlibVersions
+
 # Test duration history lives in a scratch space resolved against the depot
 # stack at load/save time; pin it to the real depot now, before ensure!()
 # swaps in the per-run temp depot, or every run starts unscheduled.
@@ -29,5 +37,6 @@ filter!(tc -> tc.name ∉ NOT_TESTS, testsuite)
 # place — isolate!() is process-wide, so a later `using REPL` inside a
 # worker that already ran an isolated test file would precompile against
 # the strict stack and fail to find VibePkg's dependency sources.
+# HistoricalStdlibVersions loads at boot for the same reason (see above).
 ENV["JULIA_DEPOT_PATH"] = LocalPkgServer.worker_depot_path()
-runtests(VibePkg, ARGS; testsuite, init_worker_code = :(using VibePkg, REPL))
+runtests(VibePkg, ARGS; testsuite, init_worker_code = :(using VibePkg, REPL, HistoricalStdlibVersions))
