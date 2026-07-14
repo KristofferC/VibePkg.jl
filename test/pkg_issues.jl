@@ -2515,7 +2515,6 @@ end
             """
         )
         oldp = Base.ACTIVE_PROJECT[]
-        VibePkg.Queries.reset_completion_cache!()
         try
             Base.ACTIVE_PROJECT[] = proj
 
@@ -2527,7 +2526,7 @@ end
             # emit a version-like candidate (would splice an unquoted, comma-
             # bearing string that then fails to parse — the #3562 regression).
             cands, _ = REPLMode.completions_for("compat Example ")
-            @test cands == VibePkg.Queries.environment_dependency_names()
+            @test cands == VibePkg.REPLMode.environment_dependency_names()
             @test "Example" in cands
             @test all(c -> !occursin(',', c) && !occursin(r"^\d", c), cands)
 
@@ -2536,7 +2535,6 @@ end
             @test isempty(cands)
         finally
             Base.ACTIVE_PROJECT[] = oldp
-            VibePkg.Queries.reset_completion_cache!()
         end
     end
 end

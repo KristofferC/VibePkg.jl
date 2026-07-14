@@ -296,7 +296,6 @@ using PrecompileTools: @setup_workload, @compile_workload
     API.AUTO_PRECOMPILE_ENABLED[] = __saved_auto_precompile
     API.UPDATED_REGISTRY_THIS_SESSION[] = false
     empty!(Registries.REGISTRY_CACHE)
-    Queries.reset_completion_cache!()
     Stdlibs.STDLIB[] = nothing
     empty!(Stdlibs.UPGRADABLE_STDLIBS_UUIDS)
     empty!(API.UNDO_STACKS)

@@ -344,7 +344,6 @@ using VibePkg.Errors: PkgError
                 """
             )
             old_depots = copy(Base.DEPOT_PATH)
-            VibePkg.Queries.reset_completion_cache!()
             try
                 append!(empty!(Base.DEPOT_PATH), [depot])
                 withenv("JULIA_PKG_SERVER" => "") do
@@ -354,7 +353,6 @@ using VibePkg.Errors: PkgError
                 end
             finally
                 append!(empty!(Base.DEPOT_PATH), old_depots)
-                VibePkg.Queries.reset_completion_cache!()
             end
         end
 
@@ -386,7 +384,6 @@ using VibePkg.Errors: PkgError
                 """
             )
             old_depots = copy(Base.DEPOT_PATH)
-            VibePkg.Queries.reset_completion_cache!()
             try
                 append!(empty!(Base.DEPOT_PATH), [depot])
                 withenv("JULIA_PKG_SERVER" => "") do
@@ -395,7 +392,6 @@ using VibePkg.Errors: PkgError
                 end
             finally
                 append!(empty!(Base.DEPOT_PATH), old_depots)
-                VibePkg.Queries.reset_completion_cache!()
             end
         end
 
