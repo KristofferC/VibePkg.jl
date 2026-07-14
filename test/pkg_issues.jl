@@ -4857,3 +4857,405 @@ end
         end
     end
 end
+
+@testset "Pkg.jl#4553 uncompress_registry resolves `..` path segments" begin
+    Tar = VibePkg.Fetch.Tar
+    p7zip_jll = VibePkg.Fetch.p7zip_jll
+
+    root = mktempdir()
+    dir1 = mkpath(joinpath(root, "dir1"))
+    dir2 = mkpath(joinpath(root, "dir2"))
+    dir2sub = mkpath(joinpath(dir2, "sub"))
+
+    # Build a minimal gzip-compressed registry tarball containing Registry.toml
+    src = mkpath(joinpath(root, "regsrc"))
+    write(joinpath(src, "Registry.toml"), "name = \"General\"\n")
+    plain = joinpath(root, "General.tar")
+    Tar.create(src, plain)
+    real_tarball = joinpath(dir2, "General.tar.gz")
+    run(pipeline(`$(p7zip_jll.p7zip()) a -tgzip $real_tarball $plain`; stdout = devnull))
+
+    # symlink dir1/mylink -> dir2/sub, so that a `..`-containing path resolves
+    # (via the kernel) to the real tarball, but collapses lexically to a file
+    # that does not exist.
+    symlink(dir2sub, joinpath(dir1, "mylink"))
+    path = joinpath(dir1, "mylink", "..", "General.tar.gz")
+
+    # Preconditions establishing the buggy state (these hold today):
+    @test isfile(path)                                    # kernel-resolved: exists
+    @test realpath(path) == realpath(real_tarball)        # realpath -> dir2/General.tar.gz
+    @test !isfile(joinpath(dir1, "General.tar.gz"))       # lexical collapse target: missing
+
+    # Correct behavior: uncompress_registry should realpath the argument (like
+    # upstream Pkg.jl get_extract_cmd) so 7z opens the real tarball. Today it
+    # passes the raw `..` path to 7z, which collapses it lexically to a
+    # nonexistent file and throws "Cannot open the file as archive".
+    @test haskey(VibePkg.Fetch.uncompress_registry(path), "Registry.toml")
+end
+
+@testset "Pkg.jl#3644 test_subprocess_flags forces --warn-overwrite=yes" begin
+    # `test_subprocess_flags` should mirror the parent's `--warn-overwrite`
+    # setting (like it does for depwarn/inline/startup-file), not hardcode
+    # `yes`. Build the flags the test subprocess would be launched with.
+    flags = collect(
+        VibePkg.TestOps.test_subprocess_flags(
+            "/x"; coverage = false, julia_args = ``
+        )
+    )
+
+    # Precondition (holds today): exactly one --warn-overwrite token is emitted.
+    wo = filter(startswith("--warn-overwrite="), flags)
+    @test length(wo) == 1
+
+    # The parent's own warn_overwrite setting (0 = no, 1 = yes). In this
+    # process it is 0 (no), so the mirrored flag *should* be `no`.
+    parent = Base.JLOptions().warn_overwrite == 1 ? "yes" : "no"
+    @test parent == "no"   # precondition: parent has warnings off
+
+    # CRUX (desired behavior, currently violated): the emitted token mirrors
+    # the parent instead of being a constant `yes`. Today it is `yes` -> false
+    # -> records Broken; once fixed to mirror, it flips to Unexpected Pass.
+    @test only(wo) == "--warn-overwrite=$(parent)"
+end
+
+@testset "Pkg.jl#4103 is_manifest_current misses deved dep Project change" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            # synthetic local dev package, initially NO deps
+            devdir = joinpath(dir, "DevPkg"); mkpath(joinpath(devdir, "src"))
+            devuuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            projpath = joinpath(devdir, "Project.toml")
+            write(projpath, "name = \"DevPkg\"\nuuid = \"$devuuid\"\nversion = \"0.1.0\"\n")
+            write(joinpath(devdir, "src", "DevPkg.jl"), "module DevPkg\nend\n")
+
+            envdir = joinpath(dir, "myproj"); mkpath(envdir)
+            env0 = load_environment(envdir; depots)
+
+            # develop DevPkg into myproj, then resolve to record project_hash
+            planned = plan_resolve(plan_develop(env0, regs, cfg, devdir), regs, cfg)
+            write_environment(env0, planned)
+            env1 = load_environment(envdir; depots)
+
+            # precondition: right after resolve the manifest IS current
+            @test VibePkg.Environments.is_manifest_current(env1) === true
+            @test !any(e -> e.name == "Example", values(env1.manifest.deps))
+
+            # now the DEVED package gains a dep on Example — manifest is now stale
+            write(projpath, "name = \"DevPkg\"\nuuid = \"$devuuid\"\nversion = \"0.1.0\"\n\n[deps]\nExample = \"7876af07-990d-54b4-ab0e-23690620f79a\"\n")
+
+            # reactivate myproj from disk
+            env2 = load_environment(envdir; depots)
+
+            # manifest still lacks Example (setup sanity — this holds today)
+            @test !any(e -> e.name == "Example", values(env2.manifest.deps))
+
+            # CORRECT behavior: staleness should be detected -> false.
+            # BUG #4103: is_manifest_current still returns true. -> Broken.
+            @test VibePkg.Environments.is_manifest_current(env2) === false
+        end
+    end
+end
+
+@testset "Pkg.jl#4351 nested [sources] rev change not picked up on resolve" begin
+    # resolve must propagate a hand-edited `[sources]` rev change that lives
+    # inside a path-tracked dep's OWN Project.toml (a nested source), the same
+    # way it already does for the active project's top-level [sources].
+    LibGit2 = VibePkg.Git.LibGit2
+    Git = VibePkg.Git
+    entry_repo_rev = VibePkg.EnvFiles.entry_repo_rev
+    entry_tree_hash = VibePkg.EnvFiles.entry_tree_hash
+    is_repo_tracked = VibePkg.EnvFiles.is_repo_tracked
+    no_regs = VibePkg.Registries.RegistryInstance[]
+
+    git_tree_hash = function (repo_path, rev)
+        repo = LibGit2.GitRepo(repo_path)
+        obj = LibGit2.GitObject(repo, rev)
+        tree = LibGit2.peel(LibGit2.GitTree, obj)
+        h = Base.SHA1(string(LibGit2.GitHash(tree)))
+        close(tree); close(obj); close(repo)
+        return h
+    end
+    quiet = f -> Base.ScopedValues.with(f, VibePkg.Utils.DEFAULT_IO => devnull)
+
+    PKGA_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    PKGB_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+
+    mktempdir() do dir
+        dir = realpath(dir)
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # PkgB: a real local git repo with two commits (different trees)
+        pkgB = joinpath(dir, "PkgB")
+        mkpath(joinpath(pkgB, "src"))
+        write(
+            joinpath(pkgB, "Project.toml"), """
+            name = "PkgB"
+            uuid = "$PKGB_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkgB, "src", "PkgB.jl"), "module PkgB end\n")
+        repo = LibGit2.init(pkgB)
+        LibGit2.add!(repo, ".")
+        sig = LibGit2.Signature("t", "t@e.com")
+        c1 = string(LibGit2.commit(repo, "first"; author = sig, committer = sig))
+        LibGit2.close(repo)
+        write(joinpath(pkgB, "src", "PkgB.jl"), "module PkgB\nf() = 2\nend\n")
+        repo = LibGit2.GitRepo(pkgB)
+        LibGit2.add!(repo, ".")
+        c2 = string(LibGit2.commit(repo, "second"; author = sig, committer = sig))
+        LibGit2.close(repo)
+
+        # PkgA: a path-tracked package whose OWN [sources] pins PkgB to c1
+        pkgA = joinpath(dir, "PkgA")
+        mkpath(pkgA)
+        write(
+            joinpath(pkgA, "Project.toml"), """
+            name = "PkgA"
+            uuid = "$PKGA_UUID"
+            version = "0.1.0"
+
+            [deps]
+            PkgB = "$PKGB_UUID"
+
+            [sources]
+            PkgB = {url = "$pkgB", rev = "$c1"}
+            """
+        )
+
+        # root project deps PkgA via a path [sources]
+        projdir = joinpath(dir, "proj")
+        mkpath(projdir)
+        write(
+            joinpath(projdir, "Project.toml"), """
+            [deps]
+            PkgA = "$PKGA_UUID"
+
+            [sources]
+            PkgA = {path = "../PkgA"}
+            """
+        )
+
+        fetcher = Git.source_fetcher(depots; io = devnull)
+
+        # resolve #1: manifest records PkgB @ c1
+        env = load_environment(projdir; depots)
+        plan1 = quiet(() -> plan_resolve(env, no_regs, Config(depots); fetcher))
+        write_environment(env, plan1)
+        e1 = plan1.manifest[PKGB_UUID]
+        @test is_repo_tracked(e1)                                   # precondition
+        @test entry_repo_rev(e1) == c1                              # precondition
+        @test entry_tree_hash(e1) == git_tree_hash(pkgB, c1)        # precondition
+        @test c1 != c2 && git_tree_hash(pkgB, c1) != git_tree_hash(pkgB, c2)
+
+        # edit the NESTED [sources] rev c1 -> c2 inside PkgA's Project.toml
+        paf = joinpath(pkgA, "Project.toml")
+        write(paf, replace(read(paf, String), c1 => c2))
+
+        # resolve #2 on the already-resolved env
+        env2 = load_environment(projdir; depots)
+        plan2 = quiet(() -> plan_resolve(env2, no_regs, Config(depots); fetcher))
+        e2 = plan2.manifest[PKGB_UUID]
+
+        # CORRECT behavior: the nested rev change reaches the manifest.
+        # Today it does not (PkgB stays pinned at c1) -> Broken.
+        @test entry_repo_rev(e2) == c2
+        @test entry_tree_hash(e2) == git_tree_hash(pkgB, c2)
+    end
+end
+
+@testset "Pkg.jl#3795 build-metadata dep added but version not bumped" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        foo_uuid = UUID("f0000000-0000-0000-0000-000000000000")
+        bar_uuid = UUID("ba000000-0000-0000-0000-000000000000")
+        regroot = mkpath(joinpath(depot, "registries", "JllRegistry"))
+        write(
+            joinpath(regroot, "Registry.toml"), """
+            name = "JllRegistry"
+            uuid = "33338594-aafe-5451-b93e-139f81909106"
+
+            [packages]
+            $foo_uuid = { name = "Foo_jll", path = "F/Foo_jll" }
+            $bar_uuid = { name = "Bar_jll", path = "B/Bar_jll" }
+            """
+        )
+
+        # Foo_jll: two versions differing ONLY in build metadata (+0, +1).
+        foo = mkpath(joinpath(regroot, "F", "Foo_jll"))
+        write(
+            joinpath(foo, "Package.toml"), """
+            name = "Foo_jll"
+            uuid = "$foo_uuid"
+            repo = "https://example.com/Foo_jll.git"
+            """
+        )
+        write(
+            joinpath(foo, "Versions.toml"), """
+            ["1.21.0+0"]
+            git-tree-sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+            ["1.21.0+1"]
+            git-tree-sha1 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            """
+        )
+        # Deps.toml keys on major.minor.patch, so the ["1.21.0"] range
+        # unavoidably covers BOTH builds — build metadata cannot be expressed
+        # in a VersionRange (see src/Versions.jl:43-45).
+        write(
+            joinpath(foo, "Deps.toml"), """
+            ["1.21.0"]
+            Bar_jll = "$bar_uuid"
+            """
+        )
+
+        # Bar_jll: a plain resolvable jll.
+        bar = mkpath(joinpath(regroot, "B", "Bar_jll"))
+        write(
+            joinpath(bar, "Package.toml"), """
+            name = "Bar_jll"
+            uuid = "$bar_uuid"
+            repo = "https://example.com/Bar_jll.git"
+            """
+        )
+        write(
+            joinpath(bar, "Versions.toml"), """
+            ["1.0.0+0"]
+            git-tree-sha1 = "cccccccccccccccccccccccccccccccccccccccc"
+            """
+        )
+
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+
+        # Environment: project depends on Foo_jll; manifest pins Foo_jll at the
+        # +0 build with NO deps (as an older registry, lacking the +1 build,
+        # would have produced it).
+        envdir = mkpath(joinpath(dir, "env"))
+        write(
+            joinpath(envdir, "Project.toml"), """
+            [deps]
+            Foo_jll = "$foo_uuid"
+            """
+        )
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.Foo_jll]]
+            git-tree-sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            uuid = "$foo_uuid"
+            version = "1.21.0+0"
+            """
+        )
+
+        env = load_environment(envdir; depots)
+
+        # Precondition (holds today): the pinned entry is +0 with empty deps.
+        @test entry_version(env.manifest[foo_uuid]) == v"1.21.0+0"
+        @test !haskey(env.manifest[foo_uuid].deps, "Bar_jll")
+
+        plan = plan_resolve(env, regs, Config(depots))
+        foo_entry = plan.manifest[foo_uuid]
+
+        # CORRECT behavior: the resolved manifest must be self-consistent. Since
+        # jll_fix keeps Foo_jll pinned at the +0 build (its git-tree-sha1), the
+        # dep list must stay consistent with that build — i.e. either the
+        # version bumps to +1 (the build that gained the Bar_jll dep) OR the
+        # dep list stays empty. Today resolve leaves the version at +0 while
+        # ALSO adding Bar_jll (from the ["1.21.0"] range) -> an invalid manifest
+        # (both branches false) -> Broken. Flips to Unexpected Pass once fixed.
+        version_bumped = entry_version(foo_entry) == v"1.21.0+1"
+        deps_kept_empty = !haskey(foo_entry.deps, "Bar_jll")
+        @test (version_bumped || deps_kept_empty)
+    end
+end
+
+@testset "Pkg.jl#3496 up of unregistered pkg forces registry update" begin
+    LibGit2 = VibePkg.Git.LibGit2
+    mktempdir() do dir
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot_path = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        old_offline = VibePkg.API.OFFLINE_MODE[]
+        try
+            # Reset globals a prior test may have left dirty: offline mode would
+            # make `up` skip the registry fetch entirely (masking the bug), and
+            # the process-wide registry cache must not shadow our git-backed reg.
+            VibePkg.API.OFFLINE_MODE[] = false
+            empty!(VibePkg.Registries.REGISTRY_CACHE)
+            depot = mkpath(joinpath(dir, "depot"))
+            reg = make_test_registry(depot)
+
+            # Turn the offline TestRegistry into a git-backed registry whose
+            # `origin` points at a dead remote. A *forced* registry update then
+            # takes the git branch of update_registries!, which prints
+            # "Updating git-repo `<url>`" before failing to fetch.
+            deadurl = "http://127.0.0.1:9/TestRegistry.git"
+            let repo = LibGit2.init(reg)
+                LibGit2.add!(repo, ".")
+                sig = LibGit2.Signature("t", "t@e.com")
+                LibGit2.commit(repo, "reg"; author = sig, committer = sig)
+                LibGit2.set_remote_url(repo, "origin", deadurl)
+                LibGit2.close(repo)
+            end
+
+            # Isolate global process state to this depot/project (public_api's
+            # with_api_env pattern) and disable the package server so only the
+            # git-backed registry path can run.
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            copy!(Base.DEPOT_PATH, [depot])
+            proj = mkpath(joinpath(dir, "proj"))
+            Base.ACTIVE_PROJECT[] = joinpath(proj, "Project.toml")
+
+            withenv("JULIA_PKG_SERVER" => "") do
+                # An unregistered, path-tracked package: `Foo` is NOT in any
+                # registry (only Example is), added via develop.
+                foo = joinpath(dir, "Foo")
+                mkpath(joinpath(foo, "src"))
+                write(
+                    joinpath(foo, "Project.toml"), """
+                    name = "Foo"
+                    uuid = "f0000000-0000-0000-0000-000000000001"
+                    version = "0.1.0"
+                    """
+                )
+                write(joinpath(foo, "src", "Foo.jl"), "module Foo end\n")
+                VibePkg.develop(VibePkg.PackageSpec(path = foo); io = devnull)
+
+                env = load_environment(proj; depots = depot_stack([depot]))
+                @test is_path_tracked(env.manifest[UUID("f0000000-0000-0000-0000-000000000001")])
+
+                # CORRECT behavior: `up Foo` on an unregistered (path-tracked)
+                # package must NOT force a registry update, so the git-backed
+                # registry is never fetched and no "Updating git-repo" line is
+                # emitted. Today `_up_requests` unconditionally passes
+                # update_registry=:force, so the registry IS fetched -> the
+                # output contains "git-repo" -> Broken (flips to Unexpected
+                # Pass once `up` skips the forced update for unregistered pkgs).
+                buf = IOBuffer()
+                @test begin
+                    VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+                    # Drop the per-depot registry update log so the `:force`
+                    # update's 1-second cooldown can never skip the fetch —
+                    # otherwise the `develop` above (which warms the log) makes
+                    # this timing-dependent.
+                    Base.rm(VibePkg.Registries.registry_update_log_file(depot); force = true)
+                    VibePkg.up("Foo"; io = buf)
+                    !occursin("git-repo", String(take!(buf)))
+                end
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot_path)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+            VibePkg.API.OFFLINE_MODE[] = old_offline
+        end
+    end
+end

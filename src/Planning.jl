@@ -417,6 +417,14 @@ function collect_fixed(env::Environment, nodes::Vector{Node}, request_uuids::Set
     end
     new_fixed = Node[]
     seen = Set(keys(pkg_by_uuid))
+    # names governed by the active project or a workspace member's own
+    # `[sources]`: those take precedence over any nested source, so they must
+    # not be overwritten when refreshing an already-seen dep below
+    env_sourced = Set{String}()
+    for (_, project) in vcat([env.project_file => env.project], env.workspace)
+        union!(env_sourced, keys(project.sources))
+    end
+    refreshed = Set{UUID}()
     while !isempty(pkg_queue)
         n = popfirst!(pkg_queue)
         n.uuid === nothing && continue
@@ -478,6 +486,21 @@ function collect_fixed(env::Environment, nodes::Vector{Node}, request_uuids::Set
                 end
             elseif dep_uuid !== nothing && !haskey(pkg_by_uuid, dep_uuid)
                 pkg_by_uuid[dep_uuid] = dep
+            elseif !is_tracking_registry(dep) && dep_uuid !== nothing &&
+                    haskey(pkg_by_uuid, dep_uuid) && !(dep_uuid in refreshed) &&
+                    !(something(dep.name, "") in env_sourced)
+                # A path-tracked package's own `[sources]` pins this already-seen
+                # dep (a nested source). Refresh the recorded tracking so a
+                # hand-edited rev/url reaches the manifest, the same way a
+                # top-level `[sources]` change does — unless a top-level source
+                # (which wins) already governs it.
+                existing = pkg_by_uuid[dep_uuid]
+                merge_node_source!(existing, SourceSpec(dep.path, dep.repo_url, dep.repo_rev, dep.repo_subdir))
+                push!(refreshed, dep_uuid)
+                if existing.tree_hash === nothing && is_tracking_repo(existing)
+                    # the recorded tree belonged to the old rev; re-materialize
+                    push!(pkg_queue, existing)
+                end
             end
         end
     end
@@ -812,9 +835,16 @@ function resolve_versions(
 
     # fix up jlls that had their build numbers stripped by the resolver
     vers_fix = copy(vers)
+    # jlls whose build metadata we reverted to the manifest's build: their
+    # deps must come from the manifest, not the registry (Pkg.jl#3795). The
+    # compressed Deps.toml keys on major.minor.patch, so `version in vrange`
+    # can't tell build-metadata variants apart (src/Versions.jl); re-querying
+    # would graft the resolver-picked build's deps onto the pinned build.
+    jll_build_pinned = Set{UUID}()
     for (uuid, ver) in vers
         old_v = get(jll_fix, uuid, nothing)
         if old_v !== nothing && Base.thispatch(old_v) == Base.thispatch(vers_fix[uuid])
+            old_v == vers_fix[uuid] || push!(jll_build_pinned, uuid)
             vers_fix[uuid] = old_v
             versions_for_pkg = get!(pkg_versions_map, uuid, VersionNumber[])
             if !(old_v in versions_for_pkg)
@@ -851,6 +881,14 @@ function resolve_versions(
                     deps_fixed[names[dep]] = dep
                 end
                 deps_fixed
+            elseif n.uuid in jll_build_pinned && haskey(env.manifest, n.uuid)
+                # keep the pinned build's recorded deps (Pkg.jl#3795)
+                d = Dict{String, UUID}()
+                for (dep_name, dep_uuid) in env.manifest[n.uuid].deps
+                    dep_uuid in pkgs_uuids || continue
+                    d[dep_name] = dep_uuid
+                end
+                d
             else
                 d = Dict{String, UUID}()
                 available_versions = get(Vector{VersionNumber}, pkg_versions_map, n.uuid)

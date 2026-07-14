@@ -28,20 +28,23 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **124 → 91 FIXED, 27 PERSISTS, 6 N/A**. The other 302 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
-- **Every FIXED issue has a passing regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **89 FIXED** → **`test/pkg_issues.jl`** (89 self-contained `@testset`s, all green, auto-discovered by `runtests.jl`).
-- **Every remaining PERSISTS bug has a `@test_broken` test** in **`test/pkg_issues_broken.jl`** (27 testsets, each asserting the *correct* behavior so it records **Broken** today and flips to an *Unexpected Pass* the moment the bug is fixed — at which point it moves into `test/pkg_issues.jl` as a passing `@test`).
-- **Fixing progress:** wave 1 fixed **8** PERSISTS (worktree-isolated agent per bug, file-partitioned to avoid conflicts): #4705 (dev'd-dep `[sources]` absent-path leak → `Planning.jl`), #4006 (ResolverError color in `showerror` → `Resolve.jl`), #3420 (`Registry.rm(SubString)` → `compat/Registry.jl`), #3365 (`tree_hash` on non-dir → `TreeHash.jl`), #3150 (pinned pkg mis-marked `⌃` → `Display.jl`), #2894 (SSH port dropped → `Git.jl`), #1657 (malformed-artifact `TypeError` → `ArtifactOps.jl`), #1236 (`add` skips `deps/build.jl` for repo pkgs → `API.jl`).
-- Method: `Workflow` fan-out — triage, reproduce, write `@test`/`@test_broken`, and fix (worktree-isolated, one src file each, diffs integrated serially).
+- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **124 → 97 FIXED, 21 PERSISTS, 6 N/A**. The other 302 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
+- **Every FIXED issue has a passing regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **95 FIXED** → **`test/pkg_issues.jl`** (95 self-contained `@testset`s, all green, auto-discovered by `runtests.jl`).
+- **Every remaining PERSISTS bug has a `@test_broken` test** in **`test/pkg_issues_broken.jl`** (21 testsets, each asserting the *correct* behavior so it records **Broken** today and flips to an *Unexpected Pass* the moment the bug is fixed — at which point it moves into `test/pkg_issues.jl` as a passing `@test`).
+- **Fixing progress (worktree-isolated agent per bug, file-partitioned):**
+  - **Wave 1 — 8 fixed:** #4705 (`Planning.jl`), #4006 (`Resolve.jl`), #3420 (`compat/Registry.jl`), #3365 (`TreeHash.jl`), #3150 (`Display.jl`), #2894 (`Git.jl`), #1657 (`ArtifactOps.jl`), #1236 (`API.jl`).
+  - **Wave 2 — 6 fixed:** #4553 (registry extract `..`/symlink path → `Fetch.jl`), #3644 (`Pkg.test` mirrors `--warn-overwrite` → `TestOps.jl`), #4103 (`is_manifest_current` detects deved-pkg dep changes → `Environments.jl`), #4351 (`resolve` picks up nested-`[sources]` rev changes → `Planning.jl`), #3795 (JLL build-metadata deps kept consistent → `Planning.jl`), #3496 (`up <unregistered>` doesn't force a registry update → `API.jl`).
+  - **Excluded (features / design-calls, left as `@test_broken`):** #1568 (build-metadata version support), #3269 (raw-artifact file modes), #708 (git submodules), #4579/#4580 (offline-mode), #2028 (`semver_spec` consistency).
+- Method: `Workflow` fan-out — triage, reproduce, write `@test`/`@test_broken`, and fix (worktree-isolated, one src file each, diffs integrated serially; test migration done centrally).
 
-### The 27 remaining PERSISTS (each covered by a `@test_broken`)
+### The 21 remaining PERSISTS (each covered by a `@test_broken`)
 
-Pages 1–6: #4580, #4579, #4553, #4351, #4131, #4103, #4082, #3644, #3269.
-Pages 7–8: #4068, #3901, #3853, #3795, #2303.
-Pages 9–11: #3555, #3496, #3494, #3326, #1568.
+Pages 1–6: #4580, #4579, #4131, #4082, #3269.
+Pages 7–8: #4068, #3901, #3853, #2303.
+Pages 9–11: #3555, #3494, #3326, #1568.
 Pages 12–14: #2922, #2525, #708.
 Pages 15–17: #2211, #2028, #2023, #2007, #1829.
-(Fixed in wave 1 and moved to the passing suite: #4705, #4006, #3420, #3365, #3150, #2894, #1657, #1236.)
+(Fixed & moved to the passing suite — wave 1: #4705, #4006, #3420, #3365, #3150, #2894, #1657, #1236; wave 2: #4553, #3644, #4103, #4351, #3795, #3496.)
 
 Themes: resolver/`up` edge cases (build-metadata JLL deps, targeted-`up` no-ops, stale
 explicit-requirement / dropped-build-number messages, name↔UUID mismatch), `JULIA_PKG_OFFLINE`

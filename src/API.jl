@@ -702,14 +702,19 @@ function _up_requests(
         mode::Union{Symbol, PackageMode} = :project, workspace::Bool = false,
     )
     mode = Configs.mode_symbol(mode)
-    # fully-pinned environments short-circuit before any registry work
+    # fully-pinned environments short-circuit before any registry work;
+    # otherwise decide whether the requested packages need a registry fetch
+    # (`up Foo` on an unregistered path/repo-tracked package must not force
+    # one — Pkg.jl#3496)
+    update_registry = :force
     let env = load_environment(; depots = depot_stack())
         if !isempty(env.manifest.deps) && all(kv -> kv.second.pinned, env.manifest.deps)
             printpkgstyle(io, :Update, "All dependencies are pinned - nothing to update.", color = Base.info_color())
             return nothing
         end
+        update_registry = _up_needs_registry(env, reqs) ? :force : :none
     end
-    ctx = op_context(; io, update_registry = :force)
+    ctx = op_context(; io, update_registry)
     env = load_environment(; depots = ctx.config.depots)
     repos = refresh_repo_packages(ctx, env, reqs; mode, workspace, io)
     printpkgstyle(io, :Resolving, "package versions...")
@@ -719,6 +724,26 @@ function _up_requests(
     return nothing
 end
 const update = up
+
+# `up` forces a registry update, but only when it could matter: an empty
+# request set (`up` everything) or a target that is registry-tracked — or
+# unresolvable without a registry, and thus possibly registered. When every
+# requested package resolves to a path/repo-tracked manifest entry the
+# registry is irrelevant and must not be fetched (Pkg.jl#3496).
+function _up_needs_registry(env::Environment, reqs::Vector{PackageRequest})
+    isempty(reqs) && return true
+    for r in reqs
+        uuid = try
+            Planning.resolve_request(env, RegistryInstance[], r)[2]
+        catch err
+            err isa PkgError || rethrow()
+            return true
+        end
+        entry = get(env.manifest, uuid, nothing)
+        (entry === nothing || EnvFiles.is_registry_tracked(entry)) && return true
+    end
+    return false
+end
 
 # Branch-tracked git packages update by pulling their tracked branch: `up`
 # re-materializes the recorded repo/rev (fetch-first) so a moved branch

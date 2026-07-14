@@ -182,7 +182,7 @@ function test_subprocess_flags(
     return ```
         --code-coverage=$(coverage_arg)
         --color=$(Base.have_color === nothing ? "auto" : Base.have_color ? "yes" : "no")
-        --warn-overwrite=yes
+        --warn-overwrite=$(Base.JLOptions().warn_overwrite == 1 ? "yes" : "no")
         --depwarn=$(Base.JLOptions().depwarn == 2 ? "error" : "yes")
         --inline=$(Bool(Base.JLOptions().can_inline) ? "yes" : "no")
         --startup-file=$(Base.JLOptions().startupfile == 1 ? "yes" : "no")

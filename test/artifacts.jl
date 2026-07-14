@@ -647,13 +647,15 @@ end
         write(zst, UInt8[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x00, 0x00])
         cmd = VibePkg.Fetch.get_extract_cmd(zst)
         @test occursin("zstd", basename(cmd.exec[1]))
-        @test cmd.exec[end] == zst
+        # get_extract_cmd canonicalizes the path (realpath) so `..`/symlink
+        # segments resolve before 7z/zstd see it (Pkg.jl#4553).
+        @test cmd.exec[end] == realpath(zst)
 
         gz = joinpath(dir, "data.tar.gz")
         write(gz, UInt8[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00])
         cmd = VibePkg.Fetch.get_extract_cmd(gz)
         @test occursin("7z", basename(cmd.exec[1]))
-        @test cmd.exec[end] == gz
+        @test cmd.exec[end] == realpath(gz)
 
         # a file shorter than the 4-byte magic takes the 7z path too
         tiny = joinpath(dir, "tiny")

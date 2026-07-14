@@ -311,6 +311,9 @@ end
 ###############
 
 function get_extract_cmd(file::AbstractString)
+    # p7zip normalizes `..` path segments internally, mis-resolving them when
+    # symlinks are present, so pass it a fully resolved path.
+    file = realpath(file)
     magic = open(io -> read(io, 4), file)
     if length(magic) == 4 && magic == UInt8[0x28, 0xb5, 0x2f, 0xfd]
         return `$(Zstd_jll.zstd()) -d -q -c $file`
