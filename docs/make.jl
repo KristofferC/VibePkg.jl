@@ -28,6 +28,7 @@ makedocs(
         "environment-variables.md",
         "Developer Documentation" => [
             "devdocs/architecture.md",
+            "devdocs/pkg_translation.md",
             "devdocs/timing.md",
         ],
     ],
