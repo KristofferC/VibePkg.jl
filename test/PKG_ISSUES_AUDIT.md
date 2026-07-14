@@ -1,8 +1,13 @@
 # Pkg.jl open-issue audit vs VibePkg
 
-Running audit of **open** Pkg.jl issues
+Audit of **all open** Pkg.jl issues
 (<https://github.com/JuliaLang/Pkg.jl/issues?q=sort:updated-desc+is:issue+state:open>),
-newest-updated first, one page (~30 API items ≈ 10 real issues) at a time.
+newest-updated first, one page at a time.
+
+> ✅ **COMPLETE — all 426 open issues triaged** (verified by diffing every
+> triaged issue number against the GitHub search API: 0 missing). The
+> `/issues` API endpoint interleaves issues with PRs and runs out at page 18,
+> so pages 1–18 span the entire open-issue set.
 
 Goal: for each issue that is a **bug / deficiency / correctness** report (not a
 feature request, RFC, or question), determine whether it **still reproduces in
@@ -23,9 +28,20 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–17 (of ~40). **In-scope bugs:** 123 → **83 FIXED, 34 PERSISTS, 6 N/A**. Non-bugs skipped: ~292.
-- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **81 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
-- **The 34 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
+- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **123 → 83 FIXED, 34 PERSISTS, 6 N/A**. The other 303 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
+- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **81 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each — 81 testsets, all green, auto-discovered by `runtests.jl`).
+- **The 34 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); the notable page-1 one is #4705.
+- Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
+
+### The 34 PERSISTS (VibePkg gaps to consider fixing)
+
+#4705, #3269, #3644, #4082, #4103, #4131, #4351, #4553, #4579, #4580 (pages 1–6);
+#3901, #3853, #3795, #4068, #4351, #2303, #4006, #2525, #708, #3150, #2922, #2894 (pages 7–14);
+#1236, #1657, #1829, #2007, #2023, #2028, #2211 (pages 15–17). Themes: resolver/`up`
+edge cases (build-metadata deps, targeted-`up` no-ops, stale explicit-requirement
+messages), `JULIA_PKG_OFFLINE` not honored on registry-update/instantiate, `Pkg.test`
+subprocess interrupt/flags, artifact file-mode & missing-`arch`, symlinked-depot dev
+paths, and `semver_spec("0.0.0")`/SubString-arg quirks. See per-page tables for evidence.
 - Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
 
 ---
@@ -532,3 +548,19 @@ Test column: file + testset that pins the behavior, or `—`.
 | 318 | status --tree | feature | SKIP | Requests tree display mode for status. |
 | 274 | Print diff when a tracked branch changes | feature | SKIP | Display enhancement for tracked-branch updates. |
 | 52 | levels of incompatibility | rfc | SKIP | Speculative resolver design proposal, not a bug. |
+
+## Page 18 (tail — all remaining open issues are non-bugs)
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 878 | Project package not isolated | question | SKIP | User unsure if bug; describes code-loading/stacked-env confusion, asks if expected. |
+| 811 | A workflow for convieniently starting (unstacked) projects | other | SKIP | User sharing a workflow tip for possible documentation, not a bug. |
+| 727 | Feature request: build dependencies | feature | SKIP | Explicit feature request for build-only dependencies. |
+| 623 | request more extensive docs on how to develop application projects | docs | SKIP | Documentation expansion request. |
+| 533 | Improve behavior when multiple overlapping registry entries exist? | feature | SKIP | Requests opt-in layered-registry/ordering behavior; a design/enhancement request. |
+| 511 | Improve "Please specify by known `name=uuid`" error message | feature | SKIP | Request to improve error message wording; behavior is correct, not observably wrong. |
+| 461 | Packages removed from the Project (but are still left in the Manifest) | rfc | SKIP | Open-ended design question about manifest freeing behavior. |
+| 286 | Introduce flag to run tests in virgin environment | feature | SKIP | Enhancement proposing a new test flag, not a bug. |
+| 127 | allow registries to specify per-julia-version branches | feature | SKIP | Enhancement proposing a new registry.toml [branches] feature. |
+
+_Pages 19+ are empty. The `/issues` API endpoint (issues interleaved with PRs) ends at page 18; pages 1–18 span **all 426 open issues** — audit complete._
