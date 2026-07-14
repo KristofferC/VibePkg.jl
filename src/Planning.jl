@@ -644,13 +644,18 @@ function deps_graph(
                             n = Node(; name = pkg.name, uuid = pkg.uuid, version = v, tree_hash = Registries.treehash(info, v))
                             is_package_downloaded(env.manifest_file, n, depots) || continue
                         end
-                        # skip versions that differ from packages baked into the sysimage
+                        # skip versions that differ from packages baked into the sysimage,
+                        # but never drop the version already recorded in the manifest: a JLL
+                        # whose sysimaged build differs from the registered one would otherwise
+                        # be spuriously downgraded on update (#4131).
                         if PKGORIGIN_HAVE_VERSION && config.respect_sysimage_versions && julia_version == VERSION
                             pkgid = Base.PkgId(uuid, pkg.name)
                             if Base.in_sysimage(pkgid)
                                 pkgorigin = get(Base.pkgorigins, pkgid, nothing)
                                 if pkgorigin !== nothing && pkgorigin.version !== nothing
-                                    if v != pkgorigin.version
+                                    manifest_entry = get(env.manifest, uuid, nothing)
+                                    manifest_version = manifest_entry === nothing ? nothing : entry_version(manifest_entry)
+                                    if v != pkgorigin.version && v != manifest_version
                                         continue
                                     end
                                 end

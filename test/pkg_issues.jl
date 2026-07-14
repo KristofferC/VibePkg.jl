@@ -26,7 +26,6 @@ if !@isdefined(make_test_registry)
     include("testhelpers.jl")
 end
 
-
 @testset "Pkg.jl#4688 precompile/instantiate after [sources] path->url switch" begin
     mktempdir() do dir
         depot = mkpath(joinpath(dir, "depot"))
@@ -1678,7 +1677,6 @@ end
     end
 end
 
-
 @testset "Pkg.jl#4063 version with build number rejected cleanly" begin
     mktempdir() do depot
         make_test_registry(depot)
@@ -2261,7 +2259,6 @@ end
         end
     end
 end
-
 
 @testset "Pkg.jl#3609 test subprocess crash output is surfaced" begin
     local run_test_process = VibePkg.TestOps.run_test_process
@@ -3050,7 +3047,6 @@ end
     end
 end
 
-
 @testset "Pkg.jl#3138 add REPL vs API path#rev parity" begin
     import LibGit2
     using VibePkg.REPLMode: parse_package_word
@@ -3751,7 +3747,6 @@ end
     @test_throws PkgError VibePkg.EnvFiles.write_project(IOBuffer(), Dict("julia" => spec))
 end
 
-
 @testset "Pkg.jl#3012 outdated ⌃ marker agrees with update" begin
     mktempdir() do depot
         make_test_registry(depot)
@@ -3896,7 +3891,6 @@ end
         end
     end
 end
-
 
 @testset "Pkg.jl#2244 add with orphan manifest and missing project" begin
     mktempdir() do depot
@@ -5256,6 +5250,165 @@ end
             copy!(Base.DEPOT_PATH, old_depot_path)
             VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
             VibePkg.API.OFFLINE_MODE[] = old_offline
+        end
+    end
+end
+
+@testset "Pkg.jl#4131 sysimage build-number mismatch downgrades JLL on update" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+
+        mktempdir() do dir
+            # 1. add Example: the registry resolves the latest non-yanked 0.5.1
+            env = load_environment(dir; depots)
+            added = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+            @test entry_version(added.manifest[EXAMPLE_UUID]) == v"0.5.1"
+            write_environment(env, added)
+
+            # 2. fake a sysimage-baked Example whose recorded (Project.toml)
+            #    version is an OLDER build (0.5.0) than what the registry ships
+            #    (0.5.1) — mirroring a JLL whose sysimaged build number differs
+            #    from the registered one (#4131). Restore global state after.
+            pkgid = Base.PkgId(EXAMPLE_UUID, "Example")
+            in_sys_before = pkgid in Base._sysimage_modules
+            had_origin = haskey(Base.pkgorigins, pkgid)
+            saved_origin = get(Base.pkgorigins, pkgid, nothing)
+            try
+                in_sys_before || push!(Base._sysimage_modules, pkgid)
+                Base.pkgorigins[pkgid] = Base.PkgOrigin(nothing, nothing, v"0.5.0")
+
+                # 3. update the pinned-to-0.5.1 environment
+                env2 = load_environment(dir; depots)
+                updated = plan_up(env2, regs, Config(depots))
+
+                # CORRECT behavior: `update` must not spuriously downgrade a
+                # package to the sysimaged build; 0.5.1 should be kept. Today the
+                # candidate filter drops every version != pkgorigin.version with
+                # no build-number normalization, so it downgrades to 0.5.0.
+                @test entry_version(updated.manifest[EXAMPLE_UUID]) == v"0.5.1"
+            finally
+                in_sys_before || filter!(!=(pkgid), Base._sysimage_modules)
+                if had_origin
+                    Base.pkgorigins[pkgid] = saved_origin
+                else
+                    delete!(Base.pkgorigins, pkgid)
+                end
+            end
+        end
+    end
+end
+
+@testset "Pkg.jl#3555 instantiate without a Manifest forces a redundant registry update" begin
+    # Sockets is a stdlib dep of VibePkg; bind it locally (no top-level using).
+    Sockets = Base.require(Base.PkgId(UUID("6462fe0b-24de-5631-8697-dd941f90decc"), "Sockets"))
+
+    # A tiny server that tallies hits on the /registries endpoint — the request
+    # a server-backed registry update issues against the package server. This
+    # lets us observe whether an operation forced a registry update WITHOUT any
+    # monkeypatch: we just count real network requests to a local socket.
+    function count_registries_hits(hits)
+        port, server = Sockets.listenany(Sockets.localhost, 43127)
+        @async while isopen(server)
+            sock = try
+                Sockets.accept(server)
+            catch
+                break
+            end
+            @async try
+                req = readline(sock)
+                while !isempty(readline(sock))
+                end
+                parts = split(req)
+                target = length(parts) >= 2 ? String(parts[2]) : ""
+                target == "/registries" && (hits[] += 1)
+                # empty 200 so Fetch.download succeeds (no matching hashes)
+                write(sock, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            catch
+            finally
+                close(sock)
+            end
+        end
+        return "http://127.0.0.1:$(Int(port))", server
+    end
+
+    mktempdir() do dir
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot_path = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        old_offline = VibePkg.API.OFFLINE_MODE[]
+        old_ap = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        depot = mkpath(joinpath(dir, "depot"))
+        # An unpacked, server-installed registry: Registry.toml + .tree_info.toml
+        # (a resolvable uuid + a recorded tree hash) is exactly the shape a
+        # forced registry update queries the package server's /registries
+        # endpoint about — so a redundant update shows up as a socket hit.
+        reg = make_test_registry(depot)
+        write(
+            joinpath(reg, ".tree_info.toml"),
+            "git-tree-sha1 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        )
+
+        hits = Ref(0)
+        url, server = count_registries_hits(hits)
+        try
+            # Reset process-wide state a prior test may have left dirty, so the
+            # forced update genuinely runs (not short-circuited) and re-reads
+            # this depot's registry rather than a cached instance.
+            empty!(VibePkg.Registries.REGISTRY_CACHE)
+            # the session has ALREADY updated the registry, and we are online:
+            # exactly the MWE's precondition (a second update is redundant).
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            VibePkg.API.OFFLINE_MODE[] = false
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            # ONLY this fresh depot on the stack — including the persistent warm
+            # depots would let their registry update-logs put them on cooldown
+            # on a re-run, making hits[] flaky.
+            copy!(Base.DEPOT_PATH, [depot])
+
+            # A project depending on Example with NO Manifest.toml.
+            proj = mkpath(joinpath(dir, "proj"))
+            write(
+                joinpath(proj, "Project.toml"), """
+                [deps]
+                Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+                """
+            )
+            Base.ACTIVE_PROJECT[] = joinpath(proj, "Project.toml")
+            @test !isfile(joinpath(proj, "Manifest.toml"))   # precondition: no manifest
+
+            # Drop the per-depot registry update log so the forced update's
+            # 1-second cooldown can never skip the /registries fetch — otherwise
+            # the measurement would be timing-dependent.
+            Base.rm(VibePkg.Registries.registry_update_log_file(depot); force = true)
+            hits[] = 0
+            withenv("JULIA_PKG_SERVER" => url) do
+                # instantiate of a manifest-less project routes to `up()`, which
+                # forces a registry update. That redundant /registries fetch is
+                # issued in `op_context` BEFORE any resolve/install, so we still
+                # observe it even though the sourceless Example install then
+                # fails; the failure is irrelevant to what we measure.
+                try
+                    VibePkg.instantiate(io = devnull)
+                catch
+                end
+            end
+
+            # CORRECT behavior: a manifest-less instantiate, with the registry
+            # already updated this session, must NOT force yet another registry
+            # re-download -> zero /registries hits. Today instantiate() -> up()
+            # -> op_context(update_registry = :force) fetches unconditionally
+            # despite UPDATED_REGISTRY_THIS_SESSION[] -> hits[] >= 1 -> Broken
+            # (flips to Unexpected Pass once the redundant update is dropped).
+            @test hits[] == 0
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot_path)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+            VibePkg.API.OFFLINE_MODE[] = old_offline
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_ap
+            close(server)
         end
     end
 end

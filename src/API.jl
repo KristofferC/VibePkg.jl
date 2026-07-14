@@ -700,21 +700,23 @@ function _up_requests(
         io::IO = stderr_f(), level::UpgradeLevel = UPLEVEL_MAJOR,
         preserve::Union{Nothing, PreserveLevel} = nothing,
         mode::Union{Symbol, PackageMode} = :project, workspace::Bool = false,
+        update_registry::Union{Nothing, Symbol} = nothing,
     )
     mode = Configs.mode_symbol(mode)
-    # fully-pinned environments short-circuit before any registry work;
-    # otherwise decide whether the requested packages need a registry fetch
-    # (`up Foo` on an unregistered path/repo-tracked package must not force
-    # one — Pkg.jl#3496)
-    update_registry = :force
+    # fully-pinned environments short-circuit before any registry work.
+    # `update_registry` policy: a caller may force one (e.g. `instantiate`
+    # delegates with `:auto` so a session that already updated does not
+    # re-fetch — Pkg.jl#3555); otherwise decide from the requests, so `up Foo`
+    # on an unregistered path/repo-tracked package forces no fetch (Pkg.jl#3496).
+    reg = update_registry
     let env = load_environment(; depots = depot_stack())
         if !isempty(env.manifest.deps) && all(kv -> kv.second.pinned, env.manifest.deps)
             printpkgstyle(io, :Update, "All dependencies are pinned - nothing to update.", color = Base.info_color())
             return nothing
         end
-        update_registry = _up_needs_registry(env, reqs) ? :force : :none
+        reg === nothing && (reg = _up_needs_registry(env, reqs) ? :force : :none)
     end
-    ctx = op_context(; io, update_registry)
+    ctx = op_context(; io, update_registry = reg)
     env = load_environment(; depots = ctx.config.depots)
     repos = refresh_repo_packages(ctx, env, reqs; mode, workspace, io)
     printpkgstyle(io, :Resolving, "package versions...")
@@ -858,13 +860,16 @@ function instantiate(;
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     # decision tree: no manifest (or `manifest = false`) ⇒
-    # full `up()`; a mismatched manifest under `update_on_mismatch` too
+    # full `up()`; a mismatched manifest under `update_on_mismatch` too.
+    # `instantiate` delegates to `up` with `update_registry = :auto` so it
+    # respects the once-per-session / daily cooldown instead of forcing a
+    # redundant registry re-download (Pkg.jl#3555).
     if manifest === false || (manifest === nothing && isempty(env.manifest.deps) && !isfile(env.manifest_file))
-        return up(; io)
+        return up(; io, update_registry = :auto)
     end
     if update_on_mismatch && !Execution.manifest_matches_project(env)
         printpkgstyle(io, :Info, "The manifest does not match the project, updating...", color = Base.info_color())
-        return up(; io)
+        return up(; io, update_registry = :auto)
     end
     installed = Execution.instantiate!(env, ctx.registries, ctx.config; julia_version_strict, workspace, io)
     isempty(installed) || BuildOps.build!(env, ctx.config.depots, [i.uuid for i in installed]; verbose, io)

@@ -158,52 +158,6 @@ end
     end
 end
 
-@testset "Pkg.jl#4131 sysimage build-number mismatch downgrades JLL on update [broken]" begin
-    mktempdir() do depot
-        make_test_registry(depot)
-        depots = depot_stack([depot])
-        regs = reachable_registries(depots)
-
-        mktempdir() do dir
-            # 1. add Example: the registry resolves the latest non-yanked 0.5.1
-            env = load_environment(dir; depots)
-            added = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
-            @test entry_version(added.manifest[EXAMPLE_UUID]) == v"0.5.1"
-            write_environment(env, added)
-
-            # 2. fake a sysimage-baked Example whose recorded (Project.toml)
-            #    version is an OLDER build (0.5.0) than what the registry ships
-            #    (0.5.1) — mirroring a JLL whose sysimaged build number differs
-            #    from the registered one (#4131). Restore global state after.
-            pkgid = Base.PkgId(EXAMPLE_UUID, "Example")
-            in_sys_before = pkgid in Base._sysimage_modules
-            had_origin = haskey(Base.pkgorigins, pkgid)
-            saved_origin = get(Base.pkgorigins, pkgid, nothing)
-            try
-                in_sys_before || push!(Base._sysimage_modules, pkgid)
-                Base.pkgorigins[pkgid] = Base.PkgOrigin(nothing, nothing, v"0.5.0")
-
-                # 3. update the pinned-to-0.5.1 environment
-                env2 = load_environment(dir; depots)
-                updated = plan_up(env2, regs, Config(depots))
-
-                # CORRECT behavior: `update` must not spuriously downgrade a
-                # package to the sysimaged build; 0.5.1 should be kept. Today the
-                # candidate filter drops every version != pkgorigin.version with
-                # no build-number normalization, so it downgrades to 0.5.0.
-                @test_broken entry_version(updated.manifest[EXAMPLE_UUID]) == v"0.5.1"
-            finally
-                in_sys_before || filter!(!=(pkgid), Base._sysimage_modules)
-                if had_origin
-                    Base.pkgorigins[pkgid] = saved_origin
-                else
-                    delete!(Base.pkgorigins, pkgid)
-                end
-            end
-        end
-    end
-end
-
 @testset "Pkg.jl#4082 dependencies() must not write manifest_usage.toml [broken]" begin
     mktempdir() do dir
         old_active = Base.ACTIVE_PROJECT[]
@@ -363,119 +317,6 @@ end
     end
 end
 
-@testset "Pkg.jl#3555 instantiate without a Manifest forces a redundant registry update [broken]" begin
-    # Sockets is a stdlib dep of VibePkg; bind it locally (no top-level using).
-    Sockets = Base.require(Base.PkgId(UUID("6462fe0b-24de-5631-8697-dd941f90decc"), "Sockets"))
-
-    # A tiny server that tallies hits on the /registries endpoint — the request
-    # a server-backed registry update issues against the package server. This
-    # lets us observe whether an operation forced a registry update WITHOUT any
-    # monkeypatch: we just count real network requests to a local socket.
-    function count_registries_hits(hits)
-        port, server = Sockets.listenany(Sockets.localhost, 43127)
-        @async while isopen(server)
-            sock = try
-                Sockets.accept(server)
-            catch
-                break
-            end
-            @async try
-                req = readline(sock)
-                while !isempty(readline(sock))
-                end
-                parts = split(req)
-                target = length(parts) >= 2 ? String(parts[2]) : ""
-                target == "/registries" && (hits[] += 1)
-                # empty 200 so Fetch.download succeeds (no matching hashes)
-                write(sock, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            catch
-            finally
-                close(sock)
-            end
-        end
-        return "http://127.0.0.1:$(Int(port))", server
-    end
-
-    mktempdir() do dir
-        old_active = Base.ACTIVE_PROJECT[]
-        old_depot_path = copy(Base.DEPOT_PATH)
-        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
-        old_offline = VibePkg.API.OFFLINE_MODE[]
-        old_ap = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
-        depot = mkpath(joinpath(dir, "depot"))
-        # An unpacked, server-installed registry: Registry.toml + .tree_info.toml
-        # (a resolvable uuid + a recorded tree hash) is exactly the shape a
-        # forced registry update queries the package server's /registries
-        # endpoint about — so a redundant update shows up as a socket hit.
-        reg = make_test_registry(depot)
-        write(
-            joinpath(reg, ".tree_info.toml"),
-            "git-tree-sha1 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
-        )
-
-        hits = Ref(0)
-        url, server = count_registries_hits(hits)
-        try
-            # Reset process-wide state a prior test may have left dirty, so the
-            # forced update genuinely runs (not short-circuited) and re-reads
-            # this depot's registry rather than a cached instance.
-            empty!(VibePkg.Registries.REGISTRY_CACHE)
-            # the session has ALREADY updated the registry, and we are online:
-            # exactly the MWE's precondition (a second update is redundant).
-            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
-            VibePkg.API.OFFLINE_MODE[] = false
-            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
-            # ONLY this fresh depot on the stack — including the persistent warm
-            # depots would let their registry update-logs put them on cooldown
-            # on a re-run, making hits[] flaky.
-            copy!(Base.DEPOT_PATH, [depot])
-
-            # A project depending on Example with NO Manifest.toml.
-            proj = mkpath(joinpath(dir, "proj"))
-            write(
-                joinpath(proj, "Project.toml"), """
-                [deps]
-                Example = "7876af07-990d-54b4-ab0e-23690620f79a"
-                """
-            )
-            Base.ACTIVE_PROJECT[] = joinpath(proj, "Project.toml")
-            @test !isfile(joinpath(proj, "Manifest.toml"))   # precondition: no manifest
-
-            # Drop the per-depot registry update log so the forced update's
-            # 1-second cooldown can never skip the /registries fetch — otherwise
-            # the measurement would be timing-dependent.
-            Base.rm(VibePkg.Registries.registry_update_log_file(depot); force = true)
-            hits[] = 0
-            withenv("JULIA_PKG_SERVER" => url) do
-                # instantiate of a manifest-less project routes to `up()`, which
-                # forces a registry update. That redundant /registries fetch is
-                # issued in `op_context` BEFORE any resolve/install, so we still
-                # observe it even though the sourceless Example install then
-                # fails; the failure is irrelevant to what we measure.
-                try
-                    VibePkg.instantiate(io = devnull)
-                catch
-                end
-            end
-
-            # CORRECT behavior: a manifest-less instantiate, with the registry
-            # already updated this session, must NOT force yet another registry
-            # re-download -> zero /registries hits. Today instantiate() -> up()
-            # -> op_context(update_registry = :force) fetches unconditionally
-            # despite UPDATED_REGISTRY_THIS_SESSION[] -> hits[] >= 1 -> Broken
-            # (flips to Unexpected Pass once the redundant update is dropped).
-            @test_broken hits[] == 0
-        finally
-            Base.ACTIVE_PROJECT[] = old_active
-            copy!(Base.DEPOT_PATH, old_depot_path)
-            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
-            VibePkg.API.OFFLINE_MODE[] = old_offline
-            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_ap
-            close(server)
-        end
-    end
-end
-
 @testset "Pkg.jl#3494 compat does not include DEV version [broken]" begin
     semver_spec = VibePkg.Versions.semver_spec
 
@@ -494,61 +335,6 @@ end
     # VersionBound equality ignores prerelease tags, so v"0.5.0-dev" wrongly
     # falls inside `=0.5.0`. Assert the correct exclusion (currently false).
     @test_broken !(v"0.5.0-dev" in semver_spec("=0.5.0"))
-end
-
-@testset "Pkg.jl#3326 symlinked Project.toml Manifest unreachable by loader [broken]" begin
-    if Sys.iswindows()
-        # symlinks require privileges on Windows; skip there
-        @test_skip true
-    else
-        mktempdir() do depot
-            make_test_registry(depot)
-            depots = depot_stack([depot])
-            regs = reachable_registries(depots)
-            mktempdir() do dir
-                dir = realpath(dir)
-                # the REAL project lives in realdir/Project.toml
-                realdir = joinpath(dir, "myproj")
-                mkpath(realdir)
-                write(
-                    joinpath(realdir, "Project.toml"), """
-                    [deps]
-                    Example = "$EXAMPLE_UUID"
-                    """
-                )
-
-                # linkdir/Project.toml is a SYMLINK to ../myproj/Project.toml —
-                # the scenario from the report (activate the symlinked project).
-                linkdir = joinpath(dir, "myprojlink")
-                mkpath(linkdir)
-                link_project = joinpath(linkdir, "Project.toml")
-                symlink(joinpath("..", "myproj", "Project.toml"), link_project)
-                @test islink(link_project)
-
-                # activate + instantiate the symlinked project: plan_add(Example)
-                # and persist the resulting Manifest.
-                env = load_environment(link_project; depots)
-                planned = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
-                write_environment(env, planned)
-
-                # PRECONDITIONS (buggy state; hold today): VibePkg follows the
-                # symlink via safe_realpath, so the Manifest lands next to the
-                # symlink TARGET (realdir), and NOT beside the symlink (linkdir).
-                @test env.manifest_file == joinpath(realdir, "Manifest.toml")
-                @test isfile(joinpath(realdir, "Manifest.toml"))
-                @test !isfile(joinpath(linkdir, "Manifest.toml"))
-
-                # CORRECT behavior: when Julia's own loader activates the
-                # symlinked project (linkdir/Project.toml — the path the user
-                # activated), it must be able to locate the Manifest so that
-                # `using Example` works. Base.project_file_manifest_path uses
-                # abspath(dirname(project_file)) with NO realpath, so it looks
-                # only in linkdir, finds nothing, and returns `nothing` — the
-                # dep "required but does not seem to be installed". -> Broken.
-                @test_broken Base.project_file_manifest_path(link_project) !== nothing
-            end
-        end
-    end
 end
 
 @testset "Pkg.jl#3269 artifact extraction does not preserve tarball file permissions [broken]" begin
@@ -1214,6 +1000,61 @@ end
         @test_broken begin
             rp = Git.materialize_repo_package!(depots, src; io = devnull)
             rp.name == "SubModPkg" && rp.uuid == SUBMOD_UUID && isdir(rp.path)
+        end
+    end
+end
+
+@testset "Pkg.jl#3326 symlinked Project.toml Manifest unreachable by loader [broken]" begin
+    if Sys.iswindows()
+        # symlinks require privileges on Windows; skip there
+        @test_skip true
+    else
+        mktempdir() do depot
+            make_test_registry(depot)
+            depots = depot_stack([depot])
+            regs = reachable_registries(depots)
+            mktempdir() do dir
+                dir = realpath(dir)
+                # the REAL project lives in realdir/Project.toml
+                realdir = joinpath(dir, "myproj")
+                mkpath(realdir)
+                write(
+                    joinpath(realdir, "Project.toml"), """
+                    [deps]
+                    Example = "$EXAMPLE_UUID"
+                    """
+                )
+
+                # linkdir/Project.toml is a SYMLINK to ../myproj/Project.toml —
+                # the scenario from the report (activate the symlinked project).
+                linkdir = joinpath(dir, "myprojlink")
+                mkpath(linkdir)
+                link_project = joinpath(linkdir, "Project.toml")
+                symlink(joinpath("..", "myproj", "Project.toml"), link_project)
+                @test islink(link_project)
+
+                # activate + instantiate the symlinked project: plan_add(Example)
+                # and persist the resulting Manifest.
+                env = load_environment(link_project; depots)
+                planned = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+                write_environment(env, planned)
+
+                # PRECONDITIONS (buggy state; hold today): VibePkg follows the
+                # symlink via safe_realpath, so the Manifest lands next to the
+                # symlink TARGET (realdir), and NOT beside the symlink (linkdir).
+                @test env.manifest_file == joinpath(realdir, "Manifest.toml")
+                @test isfile(joinpath(realdir, "Manifest.toml"))
+                @test !isfile(joinpath(linkdir, "Manifest.toml"))
+
+                # CORRECT behavior: when Julia's own loader activates the
+                # symlinked project (linkdir/Project.toml — the path the user
+                # activated), it must be able to locate the Manifest so that
+                # `using Example` works. Base.project_file_manifest_path uses
+                # abspath(dirname(project_file)) with NO realpath, so it looks
+                # only in linkdir, finds nothing, and returns `nothing` — the
+                # dep "required but does not seem to be installed". -> Broken.
+                @test_broken Base.project_file_manifest_path(link_project) !== nothing
+            end
         end
     end
 end
