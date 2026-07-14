@@ -27,7 +27,10 @@ one module of the same name.)
 **Application:** a project that provides standalone functionality rather than a
 reusable module — something you run, not something you depend on. Applications
 that declare an `[apps]` table can be installed as command-line executables;
-see [Apps](@ref).
+see [Apps](@ref). An application may choose global configuration for its
+dependencies because it owns the process. A reusable package should not do so:
+the application embedding it owns that policy, and sibling packages may need a
+different setting.
 
 **Environment:** what determines the meaning of `using`/`import` in a session:
 a project file's dependencies together with the manifest's exact resolution.

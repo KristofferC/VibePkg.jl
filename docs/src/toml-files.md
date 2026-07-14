@@ -33,7 +33,16 @@ versioning, with the pre-1.0 rules described in [Compatibility](@ref).
 
 ### `authors`
 
-A TOML array of `"NAME"` or `"NAME <EMAIL>"` strings.
+A TOML array whose entries are either `"NAME"` / `"NAME <EMAIL>"` strings or
+tables following the Citation File Format person/entity schema. Tables are
+useful for structured names and identifiers:
+
+```toml
+authors = [
+    "Some One <someone@example.com>",
+    {given-names = "Ada", family-names = "Lovelace", orcid = "https://orcid.org/0000-0000-0000-0000"},
+]
+```
 
 ### `readonly`
 
@@ -58,13 +67,22 @@ a url with an optional revision and subdirectory.
 ```toml
 [sources]
 Example = {url = "https://github.com/JuliaLang/Example.jl", rev = "master"}
+WithinMonorepo = {url = "https://example.com/BigProject.git", subdir = "packages/WithinMonorepo"}
 SomeDependency = {path = "deps/SomeDependency.jl"}
 ```
 
-Sources are applied when this project is the *active* one (they are a
-development convenience, not something consumers of your package inherit).
-They are written automatically when you `add` a package by URL or path or
-`develop` one.
+`url` and `path` are mutually exclusive; `rev` and `subdir` refine a URL
+source. Sources override registry information for the direct dependencies of
+the active project. They are a development convenience, not metadata that
+ordinary consumers of a registered package inherit.
+
+There is one intentional exception: when a package itself is added by URL or
+path, VibePkg recursively follows that package's own `[sources]` entries. This
+allows a chain of unregistered or private packages to describe where its
+dependencies come from without a registry. See [Private dependency trees with
+`[sources]`](@ref recursive-sources) for a complete example. Sources are
+written automatically when you add a URL/local repository or `develop` a
+package.
 
 ### `[compat]`
 
@@ -142,7 +160,10 @@ A `[registries]` table records which registries provided the resolution
 ```toml
 [registries.General]
 uuid = "23338594-aafe-5451-b93e-139f81909106"
+url = "https://github.com/JuliaRegistries/General.git"
 ```
+
+The UUID is required; the optional URL records where the registry came from.
 
 ### Package entries
 
@@ -153,6 +174,7 @@ appear depends on how the package is tracked:
 # Registered package at a released version
 [[deps.Example]]
 git-tree-sha1 = "46e44e869b4d90b96bd8ed1fdcf32244fddfb6cc"
+registries = "General"
 uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
 version = "0.5.5"
 
@@ -188,6 +210,29 @@ version = "0.5.5"
 `deps` lists the entry's own dependencies by name (as a nested table with
 UUIDs in the rare case that two packages in the manifest share a name), and
 `git-tree-sha1` is the content hash the installation is verified against.
+For registry-tracked entries, `registries` names the `[registries]` records
+that supplied that version; it is an array when several registries contain it.
+
+### Packages with the same name
+
+Package identity is the UUID, not the name, so one manifest can contain two
+different packages both called `B`. In that case `[[deps.B]]` appears twice,
+and a package depending on one of them expands its dependency list to a
+name-to-UUID table:
+
+```toml
+[[deps.A]]
+uuid = "ead4f63c-334e-11e9-00e6-e7f0a5f21b60"
+
+    [deps.A.deps]
+    B = "f41f7b98-334e-11e9-1257-49272045fb24"
+
+[[deps.B]]
+uuid = "f41f7b98-334e-11e9-1257-49272045fb24"
+
+[[deps.B]]
+uuid = "edca9bc6-334e-11e9-3554-9595dbb4349c"
+```
 
 ### Versioned manifests
 

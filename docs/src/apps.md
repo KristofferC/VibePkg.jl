@@ -87,10 +87,7 @@ executable the shims use (by default, the one that installed the app).
 Apps are managed with the `app` REPL commands (or `VibePkg.Apps.*`):
 
 ```
-(@v1.12) vpkg> app add Runic                                  # from a registry
-(@v1.12) vpkg> app add Runic@1.5                              # specific version
-(@v1.12) vpkg> app add https://github.com/fredrikekre/Runic.jl # from a repo
-(@v1.12) vpkg> app add path/to/Package                        # from a local git repo
+(@v1.12) vpkg> app add Runic   # a registered package, by name
 ```
 
 `app add` builds the app's private environment under
@@ -103,13 +100,25 @@ without reinstalling:
 (@v1.12) vpkg> app develop path/to/Package
 ```
 
-`app status` lists installed app packages and their executables, and `app rm`
-removes a package with all its apps (or a single named app):
+`app update` refreshes installed registered packages to their latest resolvable
+versions and re-resolves developed apps in place. With no argument it updates
+everything; a package or app name restricts the operation:
+
+```
+(@v1.12) vpkg> app update
+(@v1.12) vpkg> app update runic
+```
+
+`app status` lists installed app packages and their executables. It accepts
+package or app names as optional filters. `app rm` removes a package with all
+its apps, or a single named app:
 
 ```
 (@v1.12) vpkg> app status
 [abc12345] MyReverseApp v0.1.0
   reverse
+
+(@v1.12) vpkg> app status reverse
 
 (@v1.12) vpkg> app rm MyReverseApp
 ```

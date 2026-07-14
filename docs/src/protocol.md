@@ -62,8 +62,9 @@ immutable — servers and clients cache those forever. Updating a registry
 means fetching `/registries` and comparing hashes against the installed
 snapshot (this is what `registry update` does with a package server).
 
-Tarballs may be zstd- or gzip-compressed; VibePkg detects the format from
-the file's magic bytes and decompresses accordingly.
+Tarballs may be zstd- or gzip-compressed. VibePkg checks the downloaded file's
+magic bytes rather than trusting its filename or response headers before
+decompressing it.
 
 Every request to the package server (and only to it) carries a set of
 identifying headers: the protocol version, the client's Julia version and
@@ -125,8 +126,9 @@ request first performs a refresh: a GET of `refresh_url` with
 `auth.toml` (at minimum an `access_token`). The new file is written back
 atomically with owner-only permissions, converting a relative `expires_in`
 into an absolute `expires_at` based on the client clock. `refresh_url` must
-be HTTPS; an expired token that cannot be refreshed is simply not sent, so
-the request proceeds anonymously.
+be HTTPS (plain HTTP is accepted only for `localhost` development); an expired
+token that cannot be refreshed is simply not sent, so the request proceeds
+anonymously.
 
 If the server answers **401 Unauthorized** anyway (a token revoked
 server-side, say), VibePkg forces one refresh and retries the request once.
@@ -161,3 +163,24 @@ token lookup once, picking up whatever the handler wrote. Handlers are tried
 most-recently-registered first. `register_auth_error_handler` returns a
 zero-argument deregistration function; the same effect is available as
 `VibePkg.Fetch.deregister_auth_error_handler(urlscheme, f)`.
+
+## Storage-service interaction
+
+For a content-addressed resource, a package server first sends `HEAD` requests
+to its configured storage services and downloads with `GET` from one that
+reports the resource. A successful `HEAD` response is itself a commitment by
+that storage service to retain the resource, even if another service supplies
+the bytes for this particular request.
+
+The changing `/registries` endpoint needs one extra rule because tree hashes
+have no natural ordering. When storage services report different current
+hashes, the package server asks each service whether it knows the others'
+hashes. A service that knows another snapshot and also reports a different one
+has the later snapshot; genuinely divergent snapshots can be broken as a tie.
+
+A storage service's hard guarantee is persistence: after successfully serving
+a registry, package, or artifact tree, it must continue to serve that exact
+tree. Completeness is best effort rather than absolute — a registry can contain
+an erroneous or already-vanished package hash — but storage services should
+eagerly fetch all newly referenced package trees and artifacts so the stored
+ecosystem is as closed and reproducible as possible.

@@ -13,6 +13,7 @@ makedocs(
         "getting-started.md",
         "managing-packages.md",
         "environments.md",
+        "workspaces.md",
         "creating-packages.md",
         "apps.md",
         "compatibility.md",

@@ -16,6 +16,29 @@ julia = "1.12"
 Compat entries apply to `[deps]`, `[weakdeps]`, and `[extras]`; `julia` may
 always be given even though it is not a listed dependency.
 
+With no compat entry, every version is allowed. That is convenient while
+exploring, but published packages should state the versions they have actually
+tested: a missing upper bound lets a future breaking release enter the
+resolution.
+
+## [Compatibility entries created by `add`](@id compat-on-add)
+
+When the active project is a package — its `Project.toml` has both a `name` and
+`uuid` — adding a direct dependency automatically creates a compat entry
+beginning at the version selected by the resolver:
+
+```
+(MyPackage) vpkg> add Example
+   Resolving package versions...
+     Compat entries added for Example
+```
+
+An existing entry is never overwritten, including when the dependency is
+re-added. Plain environments without a package name and UUID do not get an
+automatic entry. The generated constraint is a safe starting point, not a
+claim that every allowed version has been tested; package authors should still
+review their bounds before publishing.
+
 The easiest way to maintain the table is the `compat` command:
 
 ```
@@ -32,6 +55,10 @@ downgraded.
 !!! info
     Packages registered in the General registry are required to have
     upper-bounded compat entries for all their dependencies.
+
+    The syntax on this page is for a project's `Project.toml`. Registry
+    `Compat.toml` files use a different range syntax described in
+    [Registry format](@ref).
 
 ## Version specifiers
 

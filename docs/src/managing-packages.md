@@ -43,6 +43,12 @@ julia> JSON.json(Dict("foo" => [1, "bar"])) |> print
 {"foo":[1,"bar"]}
 ```
 
+Only direct dependencies in `Project.toml` are loadable by the project. A
+package such as `Parsers` may appear in `status --manifest` because JSON
+depends on it, but `using Parsers` is not allowed until you explicitly
+`add Parsers`. This keeps a project's imports honest: every package its code
+uses is recorded as one of its own dependencies.
+
 A specific version (or range — see [Compatibility](@ref)) can be requested with
 `@`:
 
@@ -54,6 +60,27 @@ If the requested version holds other packages back, `status` marks them: `⌃`
 means a newer version exists and could be installed, `⌅` means a newer version
 exists but compatibility constraints block it. `status --outdated` explains
 which constraints are responsible.
+
+In REPL mode, `add` also prefers compatible versions that are already loaded
+in the Julia session but are not yet in the manifest. This avoids resolving an
+environment to a different version from the one currently in use. Ordinary
+API calls do not consult loaded modules by default; opt into the interactive
+behavior with `prefer_loaded_versions = true`.
+
+### Adding weak and extra dependencies
+
+Package authors can add a registered package directly to `[weakdeps]` or the
+legacy `[extras]` table without resolving or installing it:
+
+```
+(@v1.12) vpkg> add --weak ChainRulesCore
+(@v1.12) vpkg> add --extra Aqua
+```
+
+The API equivalents are `VibePkg.add("ChainRulesCore"; target = :weakdeps)`
+and `target = :extras`. These targets accept registered packages only. A
+normal `add` of the same name later promotes it to `[deps]` and performs the
+usual resolution and installation.
 
 A registered package can also be tracked by a git revision instead of a
 released version:
@@ -88,12 +115,38 @@ misparsed:
 (@v1.12) vpkg> add "git@github.com:fredrikekre/ImportMacros.jl.git"
 ```
 
-If the package lives in a subdirectory of the repository, use the API and pass
-`subdir`:
+If the package lives in a subdirectory of the repository, append `:subdir` in
+the REPL or pass `subdir` to the API:
+
+```
+(@v1.12) vpkg> add https://github.com/timholy/SnoopCompile.jl:SnoopCompileCore
+```
 
 ```julia-repl
 julia> VibePkg.add(url = "https://github.com/timholy/SnoopCompile.jl", subdir = "SnoopCompileCore")
 ```
+
+### [Private dependency trees with `[sources]`](@id recursive-sources)
+
+An unregistered package can depend on other unregistered packages without
+requiring a private registry. Declare each direct dependency normally and give
+its location in the package's `[sources]` table:
+
+```toml
+[deps]
+PrivateCore = "12345678-1234-1234-1234-123456789abc"
+
+[sources]
+PrivateCore = {url = "ssh://git@example.com/PrivateCore.jl.git", rev = "main"}
+```
+
+When the outer package is added by URL or local repository path, VibePkg
+follows these source declarations recursively. `PrivateCore` may in turn have
+its own `[sources]`, allowing a complete private or unregistered dependency
+tree to resolve from one top-level `add` command. This is useful for private
+applications and related repositories that are not large enough to justify a
+registry. See the [`[sources]` file-format reference](@ref Project-and-Manifest)
+for path and repository-subdirectory forms.
 
 ### Adding a local package
 
@@ -103,13 +156,23 @@ julia> VibePkg.add(url = "https://github.com/timholy/SnoopCompile.jl", subdir = 
 (@v1.12) vpkg> add ~/code/MyPackage
 ```
 
-Note that this records the *committed* state of the repository at add time —
-uncommitted edits (and future commits) are not picked up until you `add` it
-again.
+`add` and `develop` do different things when given a local directory:
+
+|                              | `add ./MyPackage`                              | `develop ./MyPackage`                         |
+|:-----------------------------|:------------------------------------------------|:----------------------------------------------|
+| Source used                  | the repository's committed state at add time   | the working tree at that path                 |
+| Uncommitted edits            | ignored                                         | used                                          |
+| Later edits or commits       | require running `add` again                     | used the next time the package is loaded      |
+| Best for                     | recording a particular committed snapshot       | actively working on the package               |
+
+In other words, `add` does not make the environment load code directly from
+the directory. It records the repository snapshot represented by its current
+commit. Use `develop` when you expect edits in that directory to affect the
+environment.
 
 !!! warning
-    For a package you are actively working on, this is rarely what you want:
-    use `develop` instead, which uses the source at the path directly.
+    Adding a local directory is not the same as developing it. If you are
+    editing the package, use `develop ./MyPackage`.
 
 ### Developing packages
 
@@ -167,6 +230,19 @@ version:
 Note that `develop` tracks whatever is checked out at the path — it does not
 accept a `#revision`.
 
+VibePkg never edits, switches branches in, or pulls a developed source tree.
+When a clone already exists in the development directory it is reused; keeping
+that checkout current is your responsibility. Relative input paths are stored
+relative to the active project, while absolute paths stay absolute, so a
+project containing its developed dependencies can be moved as a unit when
+relative paths are used.
+
+The trade-off is that a path-tracked environment is stateful: the manifest
+records the path, not the source tree's contents, and another user cannot
+reproduce it without a matching checkout at that path. If you add or remove a
+dependency in a developed package's `Project.toml`, run `resolve` so the
+active manifest learns about the changed dependency graph.
+
 ## Removing packages
 
 `rm` removes packages from the project:
@@ -210,6 +286,32 @@ combination with updating everything else).
 
 Packages tracking a git branch are updated to the latest commit on that branch;
 pinned and developed packages are never moved by `up`.
+
+## [Inspecting an environment with `status`](@id inspecting-status)
+
+`status` is also a diagnostic command. Its views answer different questions
+without changing the environment:
+
+```
+(@v1.12) vpkg> status --manifest       # every transitive dependency
+(@v1.12) vpkg> status --outdated       # available updates and what blocks them
+(@v1.12) vpkg> status --diff           # changes since the environment in git HEAD
+(@v1.12) vpkg> status --compat         # declared compat entries
+(@v1.12) vpkg> status --extensions     # available extensions and their load state
+(@v1.12) vpkg> status --deprecated     # packages deprecated by their registry
+(@v1.12) vpkg> status --workspace      # direct dependencies of every workspace member
+```
+
+Pass one or more package names to focus a view, for example `status --outdated
+JSON`. In manifest mode, selecting a package also includes its direct
+dependencies. `status --diff` requires the environment files to be inside a
+git repository; it compares the working environment with the versions stored
+at `HEAD`.
+
+In the ordinary listing, `⌃` means a newer version is available and may be
+installable, while `⌅` means constraints currently prevent installing the
+newest version. Use `status --outdated PackageName` to see the packages or
+compatibility bounds responsible.
 
 ## Pinning a package
 
@@ -272,7 +374,11 @@ environment assembled from the package's test dependencies:
 With no arguments the active project itself is tested. `--coverage` collects
 coverage statistics while the tests run. The API form accepts a few extra
 knobs: `test_args` (forwarded to the test script's `ARGS`) and `julia_args`
-(extra flags for the test process).
+(extra flags for the test process); either may be a string vector or a `Cmd`.
+By default a sandbox that cannot retain the exact manifest versions may
+re-resolve. CI jobs that intend to verify a checked-in manifest can forbid that
+fallback with `allow_reresolve = false`. The [API Reference](@ref) describes
+the latest-compatible-version testing options.
 
 ## Building packages
 
