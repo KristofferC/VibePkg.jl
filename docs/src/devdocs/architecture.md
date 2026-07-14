@@ -45,7 +45,7 @@ The include order in `src/VibePkg.jl` is the dependency order. Grouped by role:
 ├───────────────────────────────────────────────────────────────────┤
 │ Side operations  GCOps, BuildOps, TestOps, AppsOps                │
 ├───────────────────────────────────────────────────────────────────┤
-│ Core pipeline    Environments, Queries, Planning, Execution       │
+│ Core pipeline    Environments, Planning, Execution                │
 ├───────────────────────────────────────────────────────────────────┤
 │ Resolution       Resolve (versionweights, fieldvalues,            │
 │                  graphtype, maxsum)                               │
@@ -319,11 +319,6 @@ it is stored in the manifest as `project_hash` and is how
 `is_manifest_current` / `Pkg.instantiate` detect that the project changed
 since the manifest was resolved.
 
-`Queries` is a small read-only façade over environments, registries and
-stdlibs (registered package names, current dependency names, deprecation
-checks) used by frontends — REPL completions consume these instead of reaching
-into internals.
-
 ## Planning
 
 `Planning` holds the operation semantics: every planner takes
@@ -475,7 +470,9 @@ argument shape) to exactly one `API` function. Input is tokenized
 parsed by a micro-syntax layer (`Name@version`, `#rev`, `:subdir`, URL/path
 detection, GitHub tree/commit URL unwrapping) and folded into `PackageSpec`s,
 and `ParsedCommand` dispatch calls the API function with converted options.
-Completions are served from `Queries`. A `TEST_MODE` flag makes `do_cmd`
+Completions query registries, the environment, and stdlibs directly (name
+lists are recomputed per request; registry parsing is already cached by tree
+hash). A `TEST_MODE` flag makes `do_cmd`
 return the parsed `(api, args, opts)` tuple instead of executing, which is how
 the command language is unit-tested.
 
@@ -578,7 +575,7 @@ Putting it all together:
 - **Laziness and caching.** Registries parse lazily at both the index and
   per-package level, stay range-compressed in memory, and are cached
   process-wide keyed by tree hash; TOML files are cached mtime-keyed via
-  `Base.parsed_toml`; the completion name list is cached in `Queries`.
+  `Base.parsed_toml`.
 - **Offline mode.** `offline` lives in `Config`; it skips registry updates and
   makes planners prefer installed versions (`PRESERVE_ALL_INSTALLED` tier).
   `Fetch` itself has no offline branch — with no server configured the server

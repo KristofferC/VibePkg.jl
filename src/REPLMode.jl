@@ -19,7 +19,11 @@ using ..Utils: stderr_f, unstableio
 using ..Configs: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR,
     PRESERVE_ALL_INSTALLED, PRESERVE_ALL, PRESERVE_DIRECT, PRESERVE_SEMVER,
     PRESERVE_NONE, PRESERVE_TIERED_INSTALLED, PRESERVE_TIERED
-import ..Queries
+using ..Depots: depot_stack
+import ..Environments
+import ..Fetch
+import ..Registries
+import ..Stdlibs
 import ..API
 using ..API: PackageSpec
 
@@ -689,6 +693,40 @@ pkgstr(str::AbstractString; io::IO = stderr_f()) = do_cmd(str; io)
 # Completions #
 ###############
 
+function reachable_registries()
+    return Registries.reachable_registries(
+        depot_stack(); read_from_tarball = Fetch.pkg_server() !== nothing
+    )
+end
+
+function registered_package_names()
+    names = String[]
+    for registry in reachable_registries(), (_, package) in Registries.registry_pkgs(registry)
+        push!(names, package.name)
+    end
+    return sort!(unique!(names))
+end
+
+function is_deprecated_package_name(name::String)
+    found = false
+    for registry in reachable_registries()
+        for uuid in Registries.uuids_from_name(registry, name)
+            package = get(registry, uuid, nothing)
+            package === nothing && continue
+            found = true
+            Registries.isdeprecated(Registries.registry_info(registry, package)) || return false
+        end
+    end
+    return found
+end
+
+function environment_dependency_names()
+    env = Environments.load_environment(; depots = depot_stack())
+    return sort!(collect(keys(env.project.deps)))
+end
+
+stdlib_names() = sort!([info.name for info in values(Stdlibs.stdlib_infos())])
+
 """
     completions_for(partial) -> (candidates, word)
 
@@ -716,10 +754,10 @@ function completions_for(partial::AbstractString)
             if spec === nothing
                 String[]
             elseif spec.canonical in ("remove", "update", "pin", "free", "why", "build", "test", "compat")
-                Queries.environment_dependency_names()
+                environment_dependency_names()
             elseif spec.canonical in ("add", "develop")
-                names = vcat(Queries.registered_package_names(), Queries.stdlib_names())
-                filter(n -> !startswith(n, word) || !Queries.is_deprecated_package_name(n), names)
+                names = vcat(registered_package_names(), stdlib_names())
+                filter(n -> !startswith(n, word) || !is_deprecated_package_name(n), names)
             elseif spec.canonical == "activate"
                 base = isempty(word) ? "." : (isdir(expanduser(word)) ? word : dirname(word))
                 dir = expanduser(base)
