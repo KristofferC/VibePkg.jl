@@ -8,7 +8,7 @@ LocalPkgServer.isolate!()
 using Test
 using Base: UUID, SHA1
 using TOML
-using VibePkg.Depots: depot_stack, log_usage
+using VibePkg.Depots: depot_stack, log_usage, log_scratch_usage
 using VibePkg.GCOps
 using VibePkg.EnvFiles
 using VibePkg.Configs: Config
@@ -241,5 +241,43 @@ end
         GCOps.gc(depots; io = devnull)              # must not error or delete it
         @test isfile(joinpath(reg, "Registry.toml"))
         @test isfile(joinpath(reg, "E", "Example", "Package.toml"))
+    end
+end
+
+# builds record scratch usage keyed by the scratchspace path with a
+# parent_projects list — the liveness key gc uses; a time-only entry (or one
+# keyed by the manifest file) would let gc sweep live scratchspaces
+@testset "scratch usage from builds survives gc" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        proj = joinpath(mkpath(joinpath(dir, "proj")), "Project.toml")
+        write(proj, "")
+        space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), string(FOO_HASH)))
+        write(joinpath(space, "build.log"), "built")
+        log_scratch_usage(depots, space, proj)
+
+        # the entry is keyed by the scratchspace and carries parent_projects
+        usage = TOML.parsefile(joinpath(depot, "logs", "scratch_usage.toml"))
+        @test haskey(usage, space)
+        @test usage[space][1]["parent_projects"] == [proj]
+
+        # a second parent merges into the list — never replaces it
+        proj2 = joinpath(mkpath(joinpath(dir, "proj2")), "Project.toml")
+        write(proj2, "")
+        log_scratch_usage(depots, space, proj2)
+        usage = TOML.parsefile(joinpath(depot, "logs", "scratch_usage.toml"))
+        @test sort(usage[space][1]["parent_projects"]) == sort([proj, proj2])
+
+        # a live parent project keeps the scratchspace through gc
+        GCOps.gc(depots; io = devnull)
+        @test isfile(joinpath(space, "build.log"))
+
+        # both parents gone -> the scratchspace is collected
+        Base.rm(proj)
+        Base.rm(proj2)
+        GCOps.gc(depots; io = devnull)
+        @test !isdir(space)
     end
 end

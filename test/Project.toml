@@ -15,5 +15,5 @@ VibePkg = "3f0b6c73-7bb3-486f-8fc9-2db233a17ba0"
 p7zip_jll = "3f19e933-33d8-53b3-aaab-bd5110c3b7a0"
 
 [sources]
-Testosterone = {rev = "master", url = "https://github.com/KristofferC/Testosterone.jl"}
+Testosterone = {rev = "3bbd15aa2769c8067825e3756c2bd1f7fb1ad5f1", url = "https://github.com/KristofferC/Testosterone.jl"}
 VibePkg = {path = ".."}

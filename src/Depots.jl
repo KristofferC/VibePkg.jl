@@ -15,7 +15,7 @@ using ..Errors: pkgerror
 export DepotStack, depot_stack, depots, depots1, logdir,
     packages_dir, clones_dir, registries_dir, artifacts_dir,
     scratchspaces_dir, environments_dir, servers_dir, bin_dir,
-    find_installed, log_usage, atomic_toml_write
+    find_installed, log_usage, log_scratch_usage, atomic_toml_write
 
 struct DepotStack
     paths::Vector{String}
@@ -133,6 +133,71 @@ function log_usage(d::DepotStack, source_files, usage_filename::AbstractString)
                 end
             end
             usage[k] = [Dict("time" => isempty(times) ? timestamp : maximum(times))]
+        end
+
+        try
+            atomic_toml_write(usage_file, usage, sorted = true)
+        catch err
+            @error "Failed to write valid usage file `$usage_file`" exception = err
+        end
+    end
+    return
+end
+
+"""
+    log_scratch_usage(d, scratch_dir, parent_project)
+
+Record that the scratchspace at `scratch_dir` is used by `parent_project`,
+in `logs/scratch_usage.toml` of the first depot. GC keeps a scratchspace
+only while one of its recorded `parent_projects` files still exists, so —
+unlike [`log_usage`](@ref) — entries are keyed by the scratchspace path and
+`parent_projects` must be carried (and preserved for co-resident entries)
+through compaction.
+"""
+function log_scratch_usage(d::DepotStack, scratch_dir::AbstractString, parent_project::AbstractString)
+    dir = logdir(d)
+    !ispath(dir) && mkpath(dir)
+
+    usage_file = joinpath(dir, "scratch_usage.toml")
+    timestamp = now()
+
+    mkpidlock(usage_file * ".pid", stale_age = 3) do
+        usage = if isfile(usage_file)
+            try
+                TOML.parsefile(usage_file)
+            catch err
+                @warn "Failed to parse usage file `$usage_file`, ignoring." err
+                Dict{String, Any}()
+            end
+        else
+            Dict{String, Any}()
+        end
+
+        # record new usage (append; compaction below merges)
+        prev = get(usage, scratch_dir, nothing)
+        entries = prev isa Vector ? prev : Any[]
+        push!(entries, Dict{String, Any}("time" => timestamp, "parent_projects" => [String(parent_project)]))
+        usage[String(scratch_dir)] = entries
+
+        # keep one entry per key: the latest time and the union of
+        # parent_projects — GC's liveness key, which must never be dropped
+        for k in keys(usage)
+            entries = usage[k]
+            times = Dates.DateTime[]
+            parents = String[]
+            if entries isa Vector
+                for e in entries
+                    e isa AbstractDict || continue
+                    t = get(e, "time", nothing)
+                    t isa Union{Dates.Date, Dates.DateTime} && push!(times, Dates.DateTime(t))
+                    for p in get(e, "parent_projects", String[])
+                        p isa String && push!(parents, p)
+                    end
+                end
+            end
+            keep = Dict{String, Any}("time" => isempty(times) ? timestamp : maximum(times))
+            isempty(parents) || (keep["parent_projects"] = unique!(parents))
+            usage[k] = [keep]
         end
 
         try

@@ -13,7 +13,7 @@ using ..Utils: stderr_f
 using ..Timing: @timeit, TIMER
 using ..EnvFiles
 using ..EnvFiles: ManifestEntry, entry_tree_hash, is_path_tracked, with_project
-using ..Depots: DepotStack, depots1, scratchspaces_dir, log_usage
+using ..Depots: DepotStack, depots1, scratchspaces_dir, log_scratch_usage
 using ..Environments: Environment, write_environment
 using ..Execution: entry_source_path, sandbox_manifest, sandbox_preferences,
     write_sandbox_preferences
@@ -131,8 +131,11 @@ With an empty `uuids`, builds the project's direct dependencies that need it.
         isfile(build_file(source)) || continue
         log_file = build_log_file(depots, entry, source)
         run_build(env, entry, source, log_file, depots; io, verbose)
-        # scratch-usage entry so gc keeps the build log's scratchspace
-        log_usage(depots, env.manifest_file, "scratch_usage.toml")
+        # a scratch-usage entry keyed by the log's scratchspace keeps it
+        # alive in gc while the parent project exists (path-tracked entries
+        # log into the package itself — no scratchspace involved)
+        is_path_tracked(entry) ||
+            log_scratch_usage(depots, dirname(log_file), env.project_file)
     end
     return
 end

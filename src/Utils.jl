@@ -4,7 +4,7 @@ module Utils
 export isurl, normalize_path_for_toml, denormalize_path_from_toml, stdout_f, stderr_f,
     unstableio, can_fancyprint, precompile_io, precompile_detach_kwargs,
     printpkgstyle, pkgstyle_indent, pathrepr,
-    set_readonly, create_cachedir_tag, mv_temp_dir_retries
+    set_readonly, create_cachedir_tag, mv_temp_dir_retries, atomic_write
 
 # IO indirection points. Lower layers must go through these so that
 # redirecting output stays a one-place change. The stream is wrapped in
@@ -182,6 +182,30 @@ function mv_temp_dir_retries(temp_dir::String, new_path::String; set_permissions
         end
     end
     return
+end
+
+"""
+    atomic_write(path, str)
+
+Write `str` to `path` via a temporary file in the same directory + rename,
+so an interrupted write can never leave a truncated file behind.
+"""
+function atomic_write(path::AbstractString, str::AbstractString)
+    dir = dirname(path)
+    isempty(dir) && (dir = pwd())
+    temp_path, temp_io = mktemp(dir)
+    try
+        n = write(temp_io, str)
+        close(temp_io)
+        # mktemp creates 0600 files; keep the destination's visibility instead
+        chmod(temp_path, isfile(path) ? filemode(path) : 0o644)
+        mv(temp_path, path; force = true)
+        return n
+    catch
+        close(temp_io)
+        rm(temp_path; force = true)
+        rethrow()
+    end
 end
 
 end # module

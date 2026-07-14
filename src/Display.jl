@@ -126,10 +126,11 @@ function print_diff_rows(
     )
     sort!(changes; by = change_order)
     rows = Tuple{UUID, Any, Any, Union{Nothing, String}, Bool, Union{Nothing, Dict{String, Any}}}[]
+    dependents = manifest_dependents_map(env.manifest)
     for (uuid, old, new) in changes
         (old === nothing && new === nothing) && continue
         cinfo = (new === nothing || is_stdlib(uuid) || isempty(registries)) ? nothing :
-            status_compat_info(env, uuid, new, registries)
+            status_compat_info(env, uuid, new, registries; dependents)
         glyph = if cinfo === nothing || is_repo_tracked(new) || is_path_tracked(new)
             nothing
         else
@@ -305,9 +306,12 @@ const PKGORIGIN_HAVE_VERSION = :version in fieldnames(Base.PkgOrigin)
 
 # `--outdated` detail: (packages_holding_back, max_version, max_version_in_compat)
 # or nothing when the package is current (Pkg's status_compat_info).
+# Callers looping over many packages should build `manifest_dependents_map`
+# once and pass it as `dependents` — the fallback rebuild here is per-call.
 function status_compat_info(
         env::Environment, uuid::UUID, entry::ManifestEntry,
-        registries::Vector{RegistryInstance},
+        registries::Vector{RegistryInstance};
+        dependents::Union{Nothing, Dict{UUID, Vector{UUID}}} = nothing,
     )
     current = entry_version(entry)
     current isa VersionNumber || return nothing
@@ -340,9 +344,11 @@ function status_compat_info(
     end
 
     # held back by dependents' compat on us
-    for (dep_uuid, dep_entry) in env.manifest
+    dependents === nothing && (dependents = manifest_dependents_map(env.manifest))
+    for dep_uuid in get(dependents, uuid, UUID[])
         is_stdlib(dep_uuid) && continue
-        uuid in values(dep_entry.deps) || continue
+        dep_entry = get(env.manifest, dep_uuid, nothing)
+        dep_entry === nothing && continue
         dv = entry_version(dep_entry)
         dv isa VersionNumber || continue
         for reg in registries
@@ -509,9 +515,10 @@ function print_status(
         UUID, ManifestEntry, Union{Nothing, String}, Bool, Union{Nothing, Dict{String, Any}},
         Union{Nothing, Tuple{Vector{String}, VersionNumber, VersionNumber}},
     }[]
+    dependents = manifest_dependents_map(env.manifest)
     for (uuid, e) in entries
         cinfo = (isempty(registries) || is_stdlib(uuid)) ? nothing :
-            status_compat_info(env, uuid, e, registries)
+            status_compat_info(env, uuid, e, registries; dependents)
         outdated && cinfo === nothing && continue
         glyph = if cinfo === nothing || is_repo_tracked(e) || is_path_tracked(e) || e.pinned
             nothing

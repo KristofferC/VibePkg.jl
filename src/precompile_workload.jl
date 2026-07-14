@@ -299,5 +299,6 @@ using PrecompileTools: @setup_workload, @compile_workload
     Stdlibs.STDLIB[] = nothing
     empty!(Stdlibs.UPGRADABLE_STDLIBS_UUIDS)
     empty!(API.UNDO_STACKS)
+    API.PREV_ENV_PATH[] = ""
     Base.rm(__precompile_dir; force = true, recursive = true)
 end

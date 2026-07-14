@@ -1,5 +1,6 @@
 using VibePkg
 using Testosterone: set_history_file, history_file, find_tests, runtests
+using REPL # should precompile extension if needed
 
 # HistoricalStdlibVersions provides the cross-julia-version stdlib tables that
 # test/historical_stdlib_version.jl bridges into VibePkg.Stdlibs. It (and its

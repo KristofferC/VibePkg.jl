@@ -3204,6 +3204,8 @@ end
         # End to end: adding both ways into separate envs yields identical
         # repo-tracked manifest entries (same url, same rev — no doubling).
         depot = mkpath(joinpath(dir, "depot"))
+        # a registry-less depot would bootstrap General over git (Pkg parity)
+        make_test_registry(depot)
         old_active = Base.ACTIVE_PROJECT[]
         old_depots = copy(Base.DEPOT_PATH)
         old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
@@ -5538,6 +5540,136 @@ end
             VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
             VibePkg.API.OFFLINE_MODE[] = old_offline
             VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_ap
+            close(server)
+        end
+    end
+end
+
+@testset "Pkg.jl#4580 instantiate ignores offline for artifact downloads" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            # A dev package declaring a NON-lazy, not-installed artifact whose
+            # only source is a (dead) download URL: instantiating it can only
+            # succeed by hitting the network.
+            arti = joinpath(dir, "ArtiPkg")
+            mkpath(joinpath(arti, "src"))
+            uuid = "11112222-3333-4444-5555-666677778888"
+            write(
+                joinpath(arti, "Project.toml"), """
+                name = "ArtiPkg"
+                uuid = "$uuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(arti, "src", "ArtiPkg.jl"), "module ArtiPkg end\n")
+            write(
+                joinpath(arti, "Artifacts.toml"), """
+                [myart]
+                git-tree-sha1 = "0000000000000000000000000000000000000000"
+
+                    [[myart.download]]
+                    url = "https://example.invalid/myart.tar.gz"
+                    sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+                """
+            )
+
+            envdir = mkpath(joinpath(dir, "env"))
+            env0 = load_environment(envdir; depots)
+            planned = plan_develop(env0, regs, Config(depots), arti)
+            write_environment(env0, planned)
+            env = load_environment(envdir; depots)
+
+            # Precondition: the env is set up and offline is genuinely on.
+            @test is_path_tracked(env.manifest[UUID(uuid)])
+            cfg = Config(depots; offline = true, io = devnull)
+            @test cfg.offline
+
+            # under JULIA_PKG_OFFLINE=1 instantiate must not attempt to
+            # download the artifact (and thus must not throw the "failed to
+            # install artifact" PkgError); the missing artifact is skipped
+            @test (
+                VibePkg.Execution.instantiate!(env, regs, cfg; io = devnull);
+                true
+            )
+        end
+    end
+end
+
+@testset "Pkg.jl#4579 registry update ignores JULIA_PKG_OFFLINE" begin
+    # Sockets is a stdlib dep of VibePkg; bind it locally (no top-level using).
+    Sockets = Base.require(Base.PkgId(UUID("6462fe0b-24de-5631-8697-dd941f90decc"), "Sockets"))
+
+    # A tiny server that just tallies hits on the /registries endpoint —
+    # the request every registry update issues against the package server.
+    function count_registries_hits(hits)
+        port, server = Sockets.listenany(Sockets.localhost, 43117)
+        @async while isopen(server)
+            sock = try
+                Sockets.accept(server)
+            catch
+                break
+            end
+            @async try
+                req = readline(sock)
+                while !isempty(readline(sock))
+                end
+                parts = split(req)
+                target = length(parts) >= 2 ? String(parts[2]) : ""
+                target == "/registries" && (hits[] += 1)
+                # empty 200 so Fetch.download succeeds (no matching hashes)
+                write(sock, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            catch
+            finally
+                close(sock)
+            end
+        end
+        return "http://127.0.0.1:$(Int(port))", server
+    end
+
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        # An unpacked, server-installed registry: Registry.toml + .tree_info.toml
+        # (a resolvable uuid + a recorded tree hash) is exactly the shape that
+        # `registry update` queries the server about.
+        reg = make_test_registry(depot)
+        write(
+            joinpath(reg, ".tree_info.toml"),
+            "git-tree-sha1 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+        )
+
+        hits = Ref(0)
+        url, server = count_registries_hits(hits)
+
+        old_offline = VibePkg.API.OFFLINE_MODE[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        old_depots = copy(Base.DEPOT_PATH)
+        try
+            # Reset process-wide state a prior test may have left dirty, so the
+            # registry update genuinely runs (not short-circuited) and re-reads
+            # this depot's registry rather than a cached instance.
+            empty!(VibePkg.Registries.REGISTRY_CACHE)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+            # ONLY this fresh depot on the stack — including the persistent warm
+            # depots would let their registry update-logs (written on the first
+            # run) put them on cooldown on a re-run, making hits[] flaky.
+            copy!(Base.DEPOT_PATH, [depot])
+            VibePkg.API.OFFLINE_MODE[] = true
+            @test VibePkg.API.is_offline()          # precondition: we ARE offline
+
+            withenv("JULIA_PKG_SERVER" => url) do
+                # This is exactly what `pkg> registry update` invokes.
+                VibePkg.Registry.update(; io = devnull)
+            end
+
+            # offline mode issues no network request at all: the package
+            # server sees zero /registries hits
+            @test hits[] == 0
+        finally
+            VibePkg.API.OFFLINE_MODE[] = old_offline
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+            append!(empty!(Base.DEPOT_PATH), old_depots)
             close(server)
         end
     end

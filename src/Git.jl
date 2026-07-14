@@ -364,9 +364,20 @@ function install_tree_from_git!(
         end
         tree isa LibGit2.GitTree ||
             error("$name: git object $(string(hash)) should be a tree, not $(typeof(tree))")
-        mkpath(version_path)
+        # stage the checkout in the depot's temp area (same filesystem) and
+        # move it into place atomically: checking out into `version_path`
+        # directly would leave an interrupted checkout to be accepted as a
+        # completed install by every later `isdir` check
         create_cachedir_tag(dirname(dirname(version_path)))
-        checkout_tree_to_path(repo, tree, version_path)
+        staged = tempname(mkpath(joinpath(dirname(dirname(version_path)), "temp")))
+        try
+            mkpath(staged)
+            checkout_tree_to_path(repo, tree, staged)
+            mkpath(dirname(version_path))
+            mv_temp_dir_retries(staged, version_path; set_permissions = false)
+        finally
+            Base.rm(staged; force = true, recursive = true)
+        end
         nothing
     finally
         repo !== nothing && close(repo)

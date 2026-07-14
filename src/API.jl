@@ -141,9 +141,10 @@ function op_context(; io::IO = stderr_f(), update_registry::Symbol = :none)
     registries = reachable_registries(depots; read_from_tarball = server !== nothing)
     # fresh-depot bootstrap: every operation installs the default registries
     # when none are reachable
-    if isempty(registries) && server !== nothing && !config.offline
+    if isempty(registries) && !config.offline
+        # with no server add_default_registries! bootstraps over git instead
         Registries.add_default_registries!(depots; io)
-        registries = reachable_registries(depots; read_from_tarball = true)
+        registries = reachable_registries(depots; read_from_tarball = server !== nothing)
     end
     if update_registry !== :none && !config.offline &&
             (update_registry === :force || !UPDATED_REGISTRY_THIS_SESSION[])
@@ -204,9 +205,11 @@ function run_plan(
         ctx::OpContext, env::Environment, planned::Environment;
         autoprecompile::Bool = true, precompile_pkgs::Vector{String} = String[],
         build_uuids::Vector{UUID} = UUID[],
+        skip_writing_project::Bool = false,
+        download_loadable_only::Bool = false,
     )
     io = ctx.config.io
-    result = Execution.apply!(env, planned, ctx.registries, ctx.config; io)
+    result = Execution.apply!(env, planned, ctx.registries, ctx.config; io, skip_writing_project, download_loadable_only)
     print_env_diff(io, env, result.env; registries = ctx.registries, depots = ctx.config.depots)
     record_undo!(env, result.env)
     # newly installed packages with a deps/build.jl get built; repo packages
@@ -559,22 +562,32 @@ end
         shared::Bool = true, preserve::PreserveLevel = default_preserve(), io::IO = stderr_f(),
     )
     validate_specs(specs, "develop")
+    isempty(specs) && return nothing
+    # effectful pre-phase (clones, name resolution) collects every track
+    # path first, then ONE plan + apply covers all of them: a per-spec
+    # mutation loop would leave earlier specs committed when a later one
+    # fails
+    needs_registry = any(s -> s.path === nothing && s.url === nothing, specs)
+    ctx = op_context(; io, update_registry = needs_registry ? :auto : :none)
+    env = load_environment(; depots = ctx.config.depots)
+    paths = String[]
     for s in specs
         if s.path !== nothing
-            _develop_path(s.path; preserve, io)
+            push!(paths, s.path)
         elseif s.url !== nothing
-            ctx = op_context(; io)
             name = splitext(basename(rstrip(s.url, '/')))[1]
             clone_dir, track_path = dev_clone_target(ctx.config, name; shared)
             isdir(clone_dir) || Git.ensure_clone(io, clone_dir, s.url)
-            _develop_path(track_path; preserve, io)
+            push!(paths, track_path)
         elseif s.name !== nothing
-            _develop_name(s.name; shared, preserve, io)
+            push!(paths, _develop_name_path(ctx, env, s.name; shared, io))
         else
             pkgerror("`develop` requires a name, url, or path")
         end
     end
-    return nothing
+    printpkgstyle(io, :Resolving, "package versions...")
+    planned = plan_develop(env, ctx.registries, ctx.config, paths; preserve, fetcher = source_fetcher(ctx.config))
+    return run_plan(ctx, env, planned; autoprecompile = false)   # develop never auto-precompiles
 end
 
 # Where `develop` clones a registered/url package:
@@ -592,8 +605,27 @@ rm(specs::Vector{PackageSpec}; kwargs...) = _rm_requests(to_request.(specs); kwa
 up(specs::Vector{PackageSpec}; kwargs...) = _up_requests(to_request.(specs); kwargs...)
 pin(specs::Vector{PackageSpec}; kwargs...) = pin(to_request.(specs); kwargs...)
 free(specs::Vector{PackageSpec}; kwargs...) = _free_requests(to_request.(specs); kwargs...)
-test(specs::Vector{PackageSpec}; kwargs...) = test([something(s.name, string(s.uuid)) for s in specs]; kwargs...)
-build(specs::Vector{PackageSpec}; kwargs...) = build([something(s.name, string(s.uuid)) for s in specs]; kwargs...)
+test(specs::Vector{PackageSpec}; kwargs...) = test(spec_names(specs); kwargs...)
+build(specs::Vector{PackageSpec}; kwargs...) = build(spec_names(specs); kwargs...)
+
+# name-keyed operations (build/test/precompile) accept UUID-only specs by
+# resolving the name from the active manifest — stringifying the UUID would
+# never match a manifest entry
+function spec_names(specs::Vector{PackageSpec})
+    all(s -> s.name !== nothing, specs) && return String[s.name for s in specs]
+    env = load_environment(; depots = depot_stack())
+    return String[
+        if s.name !== nothing
+                s.name
+        else
+                s.uuid === nothing && pkgerror("`name` or `uuid` is required in a `PackageSpec`")
+                entry = get(env.manifest, s.uuid, nothing)
+                entry === nothing && pkgerror("could not find package with uuid `$(s.uuid)` in the manifest")
+                entry.name
+        end
+            for s in specs
+    ]
+end
 
 # the six shapes: String and Vector{String} exist above; PackageSpec,
 # Vector{PackageSpec}, kwarg-form, and Vector{NamedTuple} are generated
@@ -617,13 +649,8 @@ end
 develop(pkg::AbstractString; kwargs...) = develop([String(pkg)]; kwargs...)
 develop(pkgs::AbstractVector{<:AbstractString}; kwargs...) = develop([PackageSpec(; name) for name in pkgs]; kwargs...)
 
-"develop by name: clone the registry repo into the dev dir and track it"
-function _develop_name(
-        pkg::String;
-        shared::Bool = true, preserve::PreserveLevel = default_preserve(), io::IO = stderr_f(),
-    )
-    ctx = op_context(; io, update_registry = :auto)
-    env = load_environment(; depots = ctx.config.depots)
+"develop by name: clone the registry repo into the dev dir, return the track path"
+function _develop_name_path(ctx::OpContext, env::Environment, pkg::String; shared::Bool, io::IO)
     name, uuid = Planning.resolve_request(env, ctx.registries, PackageRequest(pkg))
     # a manifest entry already tracking a repository knows the url (and
     # subdir) even when the package is unregistered; the registry is the
@@ -641,18 +668,7 @@ function _develop_name(
         Git.ensure_clone(io, clone_dir, url)
     end
     subdir === nothing || (track_path = joinpath(track_path, subdir))
-    printpkgstyle(io, :Resolving, "package versions...")
-    planned = plan_develop(env, ctx.registries, ctx.config, track_path; preserve, fetcher = source_fetcher(ctx.config))
-    return run_plan(ctx, env, planned; autoprecompile = false)   # develop never auto-precompiles
-end
-
-"track a local path (the `develop(path = ...)` core)"
-function _develop_path(path::String; preserve::PreserveLevel = default_preserve(), io::IO = stderr_f())
-    ctx = op_context(; io)
-    env = load_environment(; depots = ctx.config.depots)
-    printpkgstyle(io, :Resolving, "package versions...")
-    planned = plan_develop(env, ctx.registries, ctx.config, path; preserve, fetcher = source_fetcher(ctx.config))
-    return run_plan(ctx, env, planned; autoprecompile = false)
+    return track_path
 end
 
 rm(pkg::AbstractString; kwargs...) = rm([String(pkg)]; kwargs...)
@@ -702,6 +718,8 @@ up(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _up_requests(requests(pk
         preserve::Union{Nothing, PreserveLevel} = nothing,
         mode::Union{Symbol, PackageMode} = :project, workspace::Bool = false,
         update_registry::Union{Nothing, Symbol} = nothing,
+        skip_writing_project::Bool = false,
+        download_loadable_only::Bool = false,
     )
     mode = Configs.mode_symbol(mode)
     # fully-pinned environments short-circuit before any registry work.
@@ -711,7 +729,9 @@ up(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _up_requests(requests(pk
     # on an unregistered path/repo-tracked package forces no fetch (Pkg.jl#3496).
     reg = update_registry
     let env = load_environment(; depots = depot_stack())
-        if !isempty(env.manifest.deps) && all(kv -> kv.second.pinned, env.manifest.deps)
+        # only the update-everything form may short-circuit: targeted requests
+        # must reach plan_up so invalid names error instead of being ignored
+        if isempty(reqs) && !isempty(env.manifest.deps) && all(kv -> kv.second.pinned, env.manifest.deps)
             printpkgstyle(io, :Update, "All dependencies are pinned - nothing to update.", color = Base.info_color())
             return nothing
         end
@@ -722,7 +742,7 @@ up(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _up_requests(requests(pk
     repos = refresh_repo_packages(ctx, env, reqs; mode, workspace, io)
     printpkgstyle(io, :Resolving, "package versions...")
     planned = plan_up(env, ctx.registries, ctx.config, reqs; level, preserve, mode, workspace, repos, fetcher = source_fetcher(ctx.config))
-    run_plan(ctx, env, planned)
+    run_plan(ctx, env, planned; skip_writing_project, download_loadable_only)
     _auto_gc(ctx)
     return nothing
 end
@@ -834,12 +854,19 @@ free(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _free_requests(request
     return nothing
 end
 
-@operation function resolve(; io::IO = stderr_f())
+"""
+    resolve(; skip_writing_project = true, io)
+
+Re-resolve the environment's manifest from its project. `Project.toml` is
+authored input: by default it is never rewritten (Pkg.jl#4713); pass
+`skip_writing_project = false` to also sync `[sources]` back into it.
+"""
+@operation function resolve(; skip_writing_project::Bool = true, io::IO = stderr_f())
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     printpkgstyle(io, :Resolving, "package versions...")
     planned = plan_resolve(env, ctx.registries, ctx.config; fetcher = source_fetcher(ctx.config))
-    return run_plan(ctx, env, planned; autoprecompile = false)
+    return run_plan(ctx, env, planned; autoprecompile = false, skip_writing_project)
 end
 
 """
@@ -847,10 +874,12 @@ end
 
 Make the environment ready to use. With a
 manifest, download everything it records; without one (or with
-`manifest = false`) resolve the project from scratch via `up`.
-`update_on_mismatch = true` falls back to `up` when the manifest does not
-match the project or was resolved with a different julia minor version.
-`verbose` sends build output of newly-installed packages to
+`manifest = false`) resolve the project from scratch via `up` — the whole
+workspace resolves into the shared manifest, but unless `workspace = true`
+only the active project's loadable dependencies are downloaded
+(Pkg.jl#4699). `update_on_mismatch = true` falls back to `up` when the
+manifest does not match the project or was resolved with a different julia
+minor version. `verbose` sends build output of newly-installed packages to
 `stdout`/`stderr` instead of their log files.
 """
 @operation function instantiate(;
@@ -866,11 +895,11 @@ match the project or was resolved with a different julia minor version.
     # respects the once-per-session / daily cooldown instead of forcing a
     # redundant registry re-download (Pkg.jl#3555).
     if manifest === false || (manifest === nothing && isempty(env.manifest.deps) && !isfile(env.manifest_file))
-        return up(; io, update_registry = :auto)
+        return up(; io, update_registry = :auto, skip_writing_project = true, download_loadable_only = !workspace)
     end
     if update_on_mismatch && !Execution.manifest_matches_project(env)
         printpkgstyle(io, :Info, "The manifest does not match the project, updating...", color = Base.info_color())
-        return up(; io, update_registry = :auto)
+        return up(; io, update_registry = :auto, skip_writing_project = true, download_loadable_only = !workspace)
     end
     installed = Execution.instantiate!(env, ctx.registries, ctx.config; julia_version_strict, workspace, io)
     isempty(installed) || BuildOps.build!(env, ctx.config.depots, [i.uuid for i in installed]; verbose, io)
@@ -996,8 +1025,7 @@ instantiates and precompiles across all workspace members.
 precompile(pkg::AbstractString; kwargs...) = precompile([String(pkg)]; kwargs...)
 precompile(pkgs::AbstractVector{<:AbstractString}; kwargs...) = precompile(String.(pkgs); kwargs...)
 precompile(spec::PackageSpec; kwargs...) = precompile([spec]; kwargs...)
-precompile(specs::Vector{PackageSpec}; kwargs...) =
-    precompile([something(s.name, string(s.uuid)) for s in specs]; kwargs...)
+precompile(specs::Vector{PackageSpec}; kwargs...) = precompile(spec_names(specs); kwargs...)
 
 # do-block form: auto-precompilation is deferred while `f` runs (batching
 # several manifest-changing operations), then one precompile happens
@@ -1149,15 +1177,14 @@ why(pkgs::AbstractVector{<:AbstractString}; kwargs...) =
 why(spec::PackageSpec; kwargs...) = why([spec]; kwargs...)
 function why(specs::Vector{PackageSpec}; kwargs...)
     for s in specs
-        name = s.name
-        if name === nothing
+        if s.name !== nothing
+            why(s.name; kwargs...)
+        else
+            # a UUID names the package exactly — resolving it to a name and
+            # re-looking that up could pick a same-named different package
             s.uuid === nothing && pkgerror("name or UUID required when calling `why`")
-            env = load_environment(; depots = depot_stack())
-            entry = get(env.manifest, s.uuid, nothing)
-            entry === nothing && pkgerror("could not find package $(s.uuid) in the manifest")
-            name = entry.name
+            why(s.uuid; kwargs...)
         end
-        why(name; kwargs...)
     end
     return nothing
 end
@@ -1166,12 +1193,20 @@ why(pkg::AbstractString; kwargs...) = why(String(pkg); kwargs...)
     # a pure manifest query: no OpContext, so a fresh depot is not
     # bootstrapped with registries just to answer it
     env = load_environment(; depots = depot_stack())
-    target = nothing
-    for (uuid, entry) in env.manifest
-        entry.name == pkg && (target = uuid)
-    end
-    target === nothing && pkgerror("could not find package $pkg in the manifest")
-
+    targets = UUID[uuid for (uuid, entry) in env.manifest if entry.name == pkg]
+    isempty(targets) && pkgerror("could not find package $pkg in the manifest")
+    length(targets) > 1 && pkgerror(
+        "multiple packages named `$pkg` in the manifest; disambiguate with " *
+            "`why(PackageSpec(uuid = ...))`: " * join(targets, ", ")
+    )
+    return _why(env, only(targets); workspace, io)
+end
+@operation function why(uuid::UUID; workspace::Bool = false, io::IO = stdout_f())
+    env = load_environment(; depots = depot_stack())
+    haskey(env.manifest, uuid) || pkgerror("could not find package $uuid in the manifest")
+    return _why(env, uuid; workspace, io)
+end
+function _why(env, target::UUID; workspace::Bool, io::IO)
     # reverse strong-dependency edges
     incoming = Dict{UUID, Set{UUID}}()
     for (uuid, entry) in env.manifest
@@ -1365,15 +1400,22 @@ Base.@kwdef struct PackageInfo
 end
 
 """
-    dependencies() -> Dict{UUID, PackageInfo}
+    dependencies(; workspace::Bool = false) -> Dict{UUID, PackageInfo}
 
 The full dependency graph of the active environment: every manifest package
-(direct and indirect), keyed by uuid.
+(direct and indirect), keyed by uuid. With `workspace = true` the direct
+dependencies of every workspace project count as direct, not only the
+active project's.
 """
-function dependencies()
+function dependencies(; workspace::Bool = false)
     depots = depot_stack()
     env = load_environment(; depots)
     direct = Set{UUID}(values(env.project.deps))
+    if workspace
+        for (_, wproj) in env.workspace
+            union!(direct, values(wproj.deps))
+        end
+    end
     info = Dict{UUID, PackageInfo}()
     for (uuid, entry) in env.manifest
         tree = EnvFiles.entry_tree_hash(entry)
@@ -1410,18 +1452,26 @@ Base.@kwdef struct ProjectInfo
 end
 
 """
-    project() -> ProjectInfo
+    project(; workspace::Bool = false) -> ProjectInfo
 
 Information about the active project: name, uuid, version, whether it is a
-package, its direct dependencies, and the project file path.
+package, its direct dependencies, and the project file path. With
+`workspace = true` the direct dependencies of every workspace project are
+merged into `dependencies`.
 """
-function project()
+function project(; workspace::Bool = false)
     env = load_environment(; depots = depot_stack())
     p = env.project
+    deps = Dict{String, UUID}(p.deps)
+    if workspace
+        for (_, wproj) in env.workspace
+            merge!(deps, wproj.deps)
+        end
+    end
     return ProjectInfo(;
         name = p.name, uuid = p.uuid, version = p.version,
         ispackage = p.name !== nothing && p.uuid !== nothing,
-        dependencies = Dict{String, UUID}(p.deps),
+        dependencies = deps,
         path = env.project_file,
     )
 end

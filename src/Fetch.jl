@@ -48,6 +48,19 @@ function server_host(server::String)
     return m === nothing ? server : String(m[1]::SubString{String})
 end
 
+"""
+    url_is_pkg_server(url, server) -> Bool
+
+Whether `url` addresses the package server `server` and so may carry its
+Authorization header. The prefix must end at a path boundary: a raw
+`startswith` would also match sibling hosts (`https://pkg.server.evil.tld/…`
+for server `https://pkg.server`), sending the bearer token to a host the
+package — not the user — chose. `server` comes slash-stripped from
+`pkg_server()`.
+"""
+url_is_pkg_server(url::String, server::String) =
+    url == server || startswith(url, server * "/")
+
 # The per-server directory name: characters that are invalid in filenames on
 # some platform (':' on Windows, notably from `host:port`) map to '_', e.g.
 # "localhost:8888" → "localhost_8888".
@@ -251,7 +264,7 @@ function download(
         show_progress::Bool = true,
     )
     server = pkg_server()
-    is_server_url = server !== nothing && startswith(url, server)
+    is_server_url = server !== nothing && url_is_pkg_server(url, server)
     headers = is_server_url ? pkg_server_headers(server::String; depots) : Pair{String, String}[]
     resp = _download(url, dest, headers; io, progress_header, show_progress)
     if is_server_url && resp.status == 401
@@ -442,23 +455,28 @@ function install_archive(
 end
 
 """
-    ensure_package_installed!(depots, name, uuid, tree_hash, repo_urls; readonly, io)
+    ensure_package_installed!(depots, name, uuid, tree_hash, repo_urls; archive_urls, readonly, io)
         -> (path, new::Bool)
 
 Idempotent content-addressed install: returns the existing tree if any depot
 has it, otherwise downloads/verifies/installs into the first depot under a
-pidlock. Throws when every source fails.
+pidlock. Throws when every source fails. `repo_urls` feeds the git fallback;
+`archive_urls` (default: the same list) feeds GitHub tarball synthesis —
+callers exclude subdir-package repos there, since a repo-root tarball cannot
+verify against the subdir tree hash while the git fallback finds the subdir
+tree object directly.
 """
 function ensure_package_installed!(
         depots::DepotStack, name::String, uuid::UUID, tree_hash::SHA1,
         repo_urls::Vector{String};
+        archive_urls::Vector{String} = repo_urls,
         readonly::Bool = true, io::IO = stderr_f(),
         server::Union{Nothing, String} = pkg_server(),
     )
     path, installed = find_installed(depots, name, uuid, tree_hash)
     installed && return path, false
 
-    urls = package_archive_urls(uuid, tree_hash, repo_urls; server)
+    urls = package_archive_urls(uuid, tree_hash, archive_urls; server)
     mkpath(dirname(path))
     # `already` distinguishes "another process installed the tree while we
     # blocked on the pidlock" from "we installed it": only the latter is `new`.

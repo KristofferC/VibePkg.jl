@@ -1029,7 +1029,7 @@ persisted update log is more recent than `update_cooldown` are skipped
                 Dict{UUID, SHA1}()
             else
                 try
-                    server_registry_hashes(server)
+                    server_registry_hashes(server; depots = depots_arg)
                 catch err
                     err isa InterruptException && rethrow()
                     @error "Some registries failed to update:" exception = err

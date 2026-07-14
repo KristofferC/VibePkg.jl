@@ -211,20 +211,60 @@ end
 project_uuid(env::Environment) =
     something(env.project.uuid, Base.dummy_uuid(env.project_file))
 
+# Several workspace projects may declare the same dep in `[sources]`; only
+# one entry can win, so they must all agree (paths compared after rebasing
+# to manifest-relative).
+function assert_no_conflicting_sources(name::String, sources::Vector{SourceSpec})
+    length(sources) < 2 && return
+    paths = Set(s.path for s in sources if s.path !== nothing)
+    urls = Set(s.url for s in sources if s.url !== nothing)
+    revs = Set(s.rev for s in sources if s.rev !== nothing)
+    subdirs = Set(s.subdir for s in sources if s.subdir !== nothing)
+    conflicts = String[]
+    if !isempty(paths) && (!isempty(urls) || !isempty(revs))
+        push!(conflicts, "both a path and a url/rev")
+    end
+    length(paths) > 1 && push!(conflicts, "paths: " * join(sort!(collect(paths)), ", "))
+    length(urls) > 1 && push!(conflicts, "urls: " * join(sort!(collect(urls)), ", "))
+    length(revs) > 1 && push!(conflicts, "revs: " * join(sort!(collect(revs)), ", "))
+    length(subdirs) > 1 && push!(conflicts, "subdirs: " * join(sort!(collect(subdirs)), ", "))
+    isempty(conflicts) && return
+    pkgerror(
+        "Package $(name) has conflicting sources specified by different projects " *
+            "in the workspace: $(join(conflicts, "; ")).\n" *
+            "Make the `[sources]` entries for this package agree across the workspace."
+    )
+end
+
 # Direct dependencies of the environment as nodes — the union over the
 # active project and every workspace member, each member included as a
 # fixed node of its own when it is a package.
 function load_direct_deps(env::Environment, nodes::Vector{Node} = Node[]; preserve::PreserveLevel = PRESERVE_DIRECT)
     out = Node[]
-    have(uuid) = findfirst(n -> n.uuid == uuid, nodes) !== nothing ||
-        findfirst(n -> n.uuid == uuid, out) !== nothing
+    # membership across `nodes` and everything pushed to `out` so far
+    seen = Set{UUID}(n.uuid for n in nodes if n.uuid !== nothing)
+    have(uuid) = uuid in seen
     projects = vcat([env.project_file => env.project], env.workspace)
+    sources_for = Dict{UUID, Vector{SourceSpec}}()
+    name_for = Dict{UUID, String}()
+    for (project_file, project) in projects
+        for (name, uuid) in project.deps
+            source = project_source(project, project_file, env.manifest_file, name)
+            source === nothing && continue
+            push!(get!(Vector{SourceSpec}, sources_for, uuid), source)
+            get!(name_for, uuid, name)
+        end
+    end
+    for (uuid, sources) in sources_for
+        assert_no_conflicting_sources(name_for[uuid], sources)
+    end
     # every member's self node first, so a member that is also a dep of a
     # sibling project keeps its path tracking instead of a registry seed
     for (project_file, project) in projects
         if project.name !== nothing && project.uuid !== nothing && !have(project.uuid)
             path = relpath(dirname(project_file), dirname(env.manifest_file))
             push!(out, Node(; name = project.name, uuid = project.uuid, version = project.version, path))
+            push!(seen, project.uuid)
         end
     end
     for (project_file, project) in projects
@@ -249,6 +289,7 @@ function load_direct_deps(env::Environment, nodes::Vector{Node} = Node[]; preser
             end
             merge_node_source!(n, source)
             push!(out, n)
+            push!(seen, uuid)
         end
     end
     return vcat(nodes, out)
@@ -256,9 +297,11 @@ end
 
 function load_manifest_deps(manifest::Manifest, nodes::Vector{Node} = Node[]; preserve::PreserveLevel = PRESERVE_ALL)
     nodes = copy(nodes)
+    seen = Set{UUID}(n.uuid for n in nodes if n.uuid !== nothing)
     for (uuid, entry) in manifest
-        findfirst(n -> n.uuid == uuid, nodes) === nothing || continue
+        uuid in seen && continue
         push!(nodes, entry_to_node(uuid, entry, load_version(entry_version(entry), entry_isfixed(entry), preserve)))
+        push!(seen, uuid)
     end
     return nodes
 end
@@ -267,7 +310,8 @@ function load_all_deps(env::Environment, nodes::Vector{Node} = Node[]; preserve:
     nodes = load_manifest_deps(env.manifest, nodes; preserve)
     # [sources] overlay from the active project AND every workspace member —
     # each member's sources apply to (at least) its own direct deps; first
-    # source found wins, the active project consulted first
+    # source found wins, the active project consulted first (safe: for direct
+    # deps load_direct_deps rejects workspace projects whose entries disagree)
     for n in nodes
         name = something(n.name, "")
         for (project_file, project) in vcat([env.project_file => env.project], env.workspace)
@@ -316,7 +360,7 @@ end
 
 # Recursive closure of path-tracked packages: a dev'd package's dev'd deps
 # are also fixed.
-function collect_developed!(env::Environment, n::Node, developed::Vector{Node}, depots::DepotStack)
+function collect_developed!(env::Environment, n::Node, developed::Vector{Node}, seen::Set{UUID}, depots::DepotStack)
     source = source_path(env.manifest_file, n, depots)
     source === nothing && return
     source_project_file = projectfile_path(source; strict = true)
@@ -325,7 +369,7 @@ function collect_developed!(env::Environment, n::Node, developed::Vector{Node}, 
     nodes = load_direct_deps(source_env)
     for dep in nodes
         dep.uuid == n.uuid && continue
-        any(x -> x.uuid == dep.uuid, developed) && continue
+        dep.uuid in seen && continue
         if is_tracking_path(dep)
             # normalize the path to be relative to *our* manifest
             dep_source = source_path(source_env.manifest_file, dep, depots)
@@ -336,9 +380,11 @@ function collect_developed!(env::Environment, n::Node, developed::Vector{Node}, 
             isdir(dep_source) || continue
             dep.path = relpath(dep_source, dirname(env.manifest_file))
             push!(developed, dep)
-            collect_developed!(env, dep, developed, depots)
+            push!(seen, dep.uuid)
+            collect_developed!(env, dep, developed, seen, depots)
         elseif is_tracking_repo(dep)
             push!(developed, dep)
+            push!(seen, dep.uuid)
         end
     end
     return
@@ -346,8 +392,10 @@ end
 
 function collect_developed(env::Environment, nodes::Vector{Node}, depots::DepotStack)
     developed = Node[]
+    # mirrors `developed` for O(1) dedup across the recursive collection
+    seen = Set{UUID}()
     for n in filter(is_tracking_path, nodes)
-        collect_developed!(env, n, developed, depots)
+        collect_developed!(env, n, developed, seen, depots)
     end
     return developed
 end
@@ -790,20 +838,25 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
     names = Dict{UUID, String}(uuid => info.name for (uuid, info) in stdlib_infos())
     # recursive search for packages tracking a path
     developed = collect_developed(env, nodes, depots)
+    node_uuids = Set{UUID}(n.uuid::UUID for n in nodes)
     for n in developed
-        if !any(x -> x.uuid == n.uuid, nodes)
+        if !(n.uuid in node_uuids)
             push!(nodes, n)
+            push!(node_uuids, n.uuid)
         end
     end
-    request_uuids = Set{UUID}(n.uuid::UUID for n in nodes)
+    # identical contents by construction; collect_fixed only membership-tests
+    # the set during the call, so mutating it afterwards is safe
+    request_uuids = node_uuids
     nodes_fixed = filter(!is_tracking_registry, nodes)
     fixed, new_fixed = collect_fixed(env, nodes_fixed, request_uuids, names, julia_version, config, registries, fetcher)
     for new_node in new_fixed
-        any(x -> x.uuid == new_node.uuid, nodes) && continue
+        new_node.uuid in node_uuids && continue
         push!(nodes, new_node)
+        push!(node_uuids, new_node.uuid)
     end
 
-    @assert length(Set(n.uuid::UUID for n in nodes)) == length(nodes)
+    @assert length(node_uuids) == length(nodes)
 
     # check compat
     for n in nodes
@@ -861,9 +914,11 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
     end
     vers = vers_fix
 
-    # apply the solution to the node set
+    # apply the solution to the node set (`vers` is a Dict, so nodes pushed
+    # below can never be looked up in the same loop — no index upkeep needed)
+    node_index = Dict{UUID, Int}(n.uuid::UUID => i for (i, n) in pairs(nodes))
     for (uuid, ver) in vers
-        idx = findfirst(n -> n.uuid == uuid, nodes)
+        idx = get(node_index, uuid, nothing)
         if idx !== nothing
             n = nodes[idx]
             # fixed packages are not returned by resolve
@@ -1016,18 +1071,20 @@ end
 
 "Keep only entries reachable from `keep` through strong dependency edges."
 function prune_manifest(manifest::Manifest, keep::Set{UUID})
+    # forward-reachability as a worklist BFS instead of a manifest-rescanning
+    # fixpoint (Pkg.jl#4720); uuids without a manifest entry still enter
+    # `keep` (harmless — the filter below drops them) exactly as before
     keep = copy(keep)
-    while true
-        clean = true
-        for (uuid, entry) in manifest
-            uuid in keep || continue
-            for dep_uuid in values(entry.deps)
-                dep_uuid in keep && continue
-                push!(keep, dep_uuid)
-                clean = false
-            end
+    worklist = collect(keep)
+    while !isempty(worklist)
+        uuid = pop!(worklist)
+        entry = get(manifest, uuid, nothing)
+        entry === nothing && continue
+        for dep_uuid in values(entry.deps)
+            dep_uuid in keep && continue
+            push!(keep, dep_uuid)
+            push!(worklist, dep_uuid)
         end
-        clean && break
     end
     return with_manifest(manifest; deps = Dict(uuid => entry for (uuid, entry) in manifest.deps if uuid in keep))
 end
@@ -1432,16 +1489,17 @@ function rm_manifest!(manifest, new_deps, requests)
         end
         found || @warn("`$(something(r.name, r.uuid))` not in manifest, ignoring")
     end
-    while true
-        grew = false
-        for (uuid, entry) in manifest
-            uuid in targets && continue
-            if any(in(targets), values(entry.deps))
-                push!(targets, uuid)
-                grew = true
-            end
+    # reverse-dependency closure as a worklist BFS over a dependents map
+    # built once — a manifest-rescanning fixpoint is quadratic (Pkg.jl#4720)
+    dependents = manifest_dependents_map(manifest)
+    worklist = collect(targets)
+    while !isempty(worklist)
+        uuid = pop!(worklist)
+        for dependent in get(dependents, uuid, UUID[])
+            dependent in targets && continue
+            push!(targets, dependent)
+            push!(worklist, dependent)
         end
-        grew || break
     end
     filter!(p -> !(p.second in targets), new_deps)
     return with_manifest(
@@ -1519,46 +1577,62 @@ Track the package at a local `path` (explicit-path form; by-name cloning
 needs git support). The path is stored as given:
 absolute stays absolute, relative is interpreted against the project.
 """
+plan_develop(
+    env::Environment, registries::Vector{RegistryInstance}, config::Config,
+    path::String; kwargs...,
+) = plan_develop(env, registries, config, [path]; kwargs...)
+
 function plan_develop(
         env::Environment, registries::Vector{RegistryInstance}, config::Config,
-        path::String; preserve::PreserveLevel = default_preserve(), julia_version = VERSION,
+        paths::Vector{String}; preserve::PreserveLevel = default_preserve(), julia_version = VERSION,
         fetcher = nothing,
     )
-    dev_dir = isabspath(path) ? path : normpath(joinpath(dirname(env.project_file), path))
-    if !isdir(dev_dir)
-        if isfile(dev_dir)
-            pkgerror("Dev path `$(dev_dir)` is a file, but a directory is required.")
-        else
-            pkgerror("Dev path `$(dev_dir)` does not exist.")
-        end
-    end
-    project_file = projectfile_path(dev_dir; strict = true)
-    project_file === nothing && pkgerror(
-        "could not find project file (Project.toml or JuliaProject.toml) in package at `$path` maybe `subdir` needs to be specified"
-    )
-    dev_project = read_project(project_file)
-    (dev_project.name === nothing || dev_project.uuid === nothing) && pkgerror(
-        "expected a `name` and `uuid` entry in project file at `$project_file`"
-    )
-    name, uuid = dev_project.name, dev_project.uuid
-    if uuid == env.project.uuid
-        pkgerror("cannot develop package $(err_rep(name, uuid)) into itself")
-    end
-
-    # store manifest-relative (or absolute) like the manifest wants it
-    node_path = isabspath(path) ? path : relpath(dev_dir, dirname(env.manifest_file))
-    node = Node(; name, uuid, path = node_path, version = VersionSpec())
-
+    isempty(paths) && pkgerror("no packages specified")
+    nodes = Node[]
     new_deps = Dict{String, UUID}(env.project.deps)
-    new_deps[name] = uuid
     # the develop request must win over a stale [sources] url/rev entry
     # during planning (the write re-derives [sources] from the manifest)
     sources = Dict{String, SourceSpec}(env.project.sources)
-    sources[name] = SourceSpec(path, nothing, nothing, nothing)
-    project = with_project(env.project; deps = new_deps, sources)
+    # a name developed as a real dep is promoted out of [weakdeps] (Pkg
+    # parity); left in both sections the reader would demote it to weak-only
+    # and then reject its [sources] entry
+    weakdeps = Dict{String, UUID}(env.project.weakdeps)
+    deps_weak = Dict{String, UUID}(env.project.deps_weak)
+    for path in paths
+        dev_dir = isabspath(path) ? path : normpath(joinpath(dirname(env.project_file), path))
+        if !isdir(dev_dir)
+            if isfile(dev_dir)
+                pkgerror("Dev path `$(dev_dir)` is a file, but a directory is required.")
+            else
+                pkgerror("Dev path `$(dev_dir)` does not exist.")
+            end
+        end
+        project_file = projectfile_path(dev_dir; strict = true)
+        project_file === nothing && pkgerror(
+            "could not find project file (Project.toml or JuliaProject.toml) in package at `$path` maybe `subdir` needs to be specified"
+        )
+        dev_project = read_project(project_file)
+        (dev_project.name === nothing || dev_project.uuid === nothing) && pkgerror(
+            "expected a `name` and `uuid` entry in project file at `$project_file`"
+        )
+        name, uuid = dev_project.name, dev_project.uuid
+        if uuid == env.project.uuid
+            pkgerror("cannot develop package $(err_rep(name, uuid)) into itself")
+        end
+
+        # store manifest-relative (or absolute) like the manifest wants it
+        node_path = isabspath(path) ? path : relpath(dev_dir, dirname(env.manifest_file))
+        push!(nodes, Node(; name, uuid, path = node_path, version = VersionSpec()))
+
+        new_deps[name] = uuid
+        sources[name] = SourceSpec(path, nothing, nothing, nothing)
+        delete!(weakdeps, name)
+        delete!(deps_weak, name)
+    end
+    project = with_project(env.project; deps = new_deps, weakdeps, deps_weak, sources)
     env′ = Environment(env.project_file, env.manifest_file, project, env.manifest, env.workspace)
 
-    resolved, deps_map = resolve_with_preserve(env′, registries, [node], preserve, julia_version, config; fetcher)
+    resolved, deps_map = resolve_with_preserve(env′, registries, nodes, preserve, julia_version, config; fetcher)
     manifest = build_manifest(env′, resolved, deps_map, julia_version, registries)
     return Environment(env.project_file, env.manifest_file, project, manifest, env.workspace)
 end

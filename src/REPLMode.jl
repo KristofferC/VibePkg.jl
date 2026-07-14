@@ -152,7 +152,7 @@ function build_command_table()
         shorts = Dict("p" => "project", "m" => "manifest", "v" => "verbose", "u" => "update_on_mismatch"),
         help = "instantiate [-p|--project] [-m|--manifest] [-v|--verbose] [--workspace] [--julia_version_strict] [-u|--update_on_mismatch]\n\nMake the environment ready to use: download everything the manifest records. `--project` resolves from the project instead of using the manifest; `--verbose` shows build output; `--julia_version_strict` errors instead of warning on manifest version check failures; `--update_on_mismatch` falls back to `up` when the manifest does not match the project."
     )
-    register!("resolve", nothing, API.resolve, :none, 0:0; help = "resolve\n\nReconcile the manifest with the project without moving installed versions.")
+    register!("resolve", nothing, API.resolve, :none, 0:0; help = "resolve\n\nReconcile the manifest with the project without moving installed versions. Never modifies Project.toml.")
     register!(
         "precompile", nothing, API.precompile, :strings, 0:typemax(Int),
         Dict(
@@ -699,26 +699,46 @@ function reachable_registries()
     )
 end
 
+const REGISTERED_PACKAGE_NAMES = Ref{Union{Nothing, Vector{String}}}(nothing)
+const DEPRECATED_PACKAGE_NAMES = Ref{Union{Nothing, Set{String}}}(nothing)
+
+function reset_completion_cache!()
+    REGISTERED_PACKAGE_NAMES[] = nothing
+    DEPRECATED_PACKAGE_NAMES[] = nothing
+    return
+end
+
 function registered_package_names()
+    cached = REGISTERED_PACKAGE_NAMES[]
+    cached === nothing || return cached
     names = String[]
     for registry in reachable_registries(), (_, package) in Registries.registry_pkgs(registry)
         push!(names, package.name)
     end
-    return sort!(unique!(names))
+    sort!(unique!(names))
+    REGISTERED_PACKAGE_NAMES[] = names
+    return names
 end
 
-function is_deprecated_package_name(name::String)
-    found = false
-    for registry in reachable_registries()
-        for uuid in Registries.uuids_from_name(registry, name)
-            package = get(registry, uuid, nothing)
-            package === nothing && continue
-            found = true
-            Registries.isdeprecated(Registries.registry_info(registry, package)) || return false
-        end
+# a name counts as deprecated when it is registered and every registered
+# package carrying it is deprecated; computed in one registry sweep and
+# cached — the per-candidate registry walk made every completion re-discover
+# registries and reload package metadata
+function deprecated_package_names()
+    cached = DEPRECATED_PACKAGE_NAMES[]
+    cached === nothing || return cached
+    deprecated = Set{String}()
+    live = Set{String}()
+    for registry in reachable_registries(), (_, package) in Registries.registry_pkgs(registry)
+        info = Registries.registry_info(registry, package)
+        push!(Registries.isdeprecated(info) ? deprecated : live, package.name)
     end
-    return found
+    setdiff!(deprecated, live)
+    DEPRECATED_PACKAGE_NAMES[] = deprecated
+    return deprecated
 end
+
+is_deprecated_package_name(name::String) = name in deprecated_package_names()
 
 function environment_dependency_names()
     env = Environments.load_environment(; depots = depot_stack())

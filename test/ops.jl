@@ -1249,3 +1249,250 @@ end
         end
     end
 end
+
+# developing a package listed in [weakdeps] must promote it to a real dep in
+# both representations — left in weakdeps the reader demotes it to weak-only
+# and then rejects its [sources] entry, making the environment unloadable
+@testset "develop of a weakdep promotes it out of [weakdeps]" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            devuuid = "deadbeef-dead-beef-dead-beefdeadbeef"
+            devpkg = joinpath(dir, "MyDev")
+            mkpath(joinpath(devpkg, "src"))
+            write(
+                joinpath(devpkg, "Project.toml"), """
+                name = "MyDev"
+                uuid = "$devuuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(devpkg, "src", "MyDev.jl"), "module MyDev end\n")
+
+            envdir = mkpath(joinpath(dir, "env"))
+            write(
+                joinpath(envdir, "Project.toml"), """
+                [weakdeps]
+                MyDev = "$devuuid"
+                """
+            )
+            env = load_environment(envdir; depots)
+            planned = plan_develop(env, regs, Config(depots), devpkg)
+            @test haskey(planned.project.deps, "MyDev")
+            @test !haskey(planned.project.weakdeps, "MyDev")
+            @test !haskey(planned.project.deps_weak, "MyDev")
+
+            # the round-trip through disk must load (and stay a real dep)
+            write_environment(env, planned)
+            env2 = load_environment(envdir; depots)
+            @test haskey(env2.project.deps, "MyDev")
+            @test !haskey(env2.project.deps_weak, "MyDev")
+            @test is_path_tracked(env2.manifest[UUID(devuuid)])
+        end
+    end
+end
+
+# targeted `up` on a fully-pinned environment must validate the request
+# instead of silently returning through the all-pinned shortcut
+@testset "targeted up validates names on a fully-pinned env" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        mktempdir() do dir
+            # a hand-written fully-pinned environment: every manifest entry is
+            # pinned (a resolved fixture env would drag in unpinned stdlibs)
+            envdir = mkpath(joinpath(dir, "env"))
+            write(
+                joinpath(envdir, "Project.toml"),
+                "[deps]\nExample = \"7876af07-990d-54b4-ab0e-23690620f79a\"\n"
+            )
+            write(
+                joinpath(envdir, "Manifest.toml"), """
+                julia_version = "1.12.6"
+                manifest_format = "2.0"
+                project_hash = "1111111111111111111111111111111111111111"
+
+                [[deps.Example]]
+                git-tree-sha1 = "2222222222222222222222222222222222222222"
+                pinned = true
+                uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+                version = "0.5.1"
+                """
+            )
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_offline = VibePkg.API.OFFLINE_MODE[]
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                VibePkg.API.OFFLINE_MODE[] = true   # hermetic: no registry fetch
+                # the update-everything form still short-circuits
+                buf = IOBuffer()
+                VibePkg.up(; io = buf)
+                @test occursin("All dependencies are pinned", String(take!(buf)))
+                # an unknown target errors instead of hitting the shortcut
+                @test_throws PkgError VibePkg.up("Nonexistent"; io = devnull)
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.OFFLINE_MODE[] = old_offline
+            end
+        end
+    end
+end
+
+# develop of a vector applies as ONE transaction: a failing item must leave
+# the environment untouched (per-item mutation loops commit earlier items)
+@testset "vector develop is atomic" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        mktempdir() do dir
+            good = joinpath(dir, "GoodPkg")
+            mkpath(joinpath(good, "src"))
+            write(
+                joinpath(good, "Project.toml"), """
+                name = "GoodPkg"
+                uuid = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(good, "src", "GoodPkg.jl"), "module GoodPkg end\n")
+            envdir = mkpath(joinpath(dir, "env"))
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                @test_throws PkgError VibePkg.develop(
+                    [
+                        VibePkg.PackageSpec(path = good),
+                        VibePkg.PackageSpec(path = joinpath(dir, "NoSuchPkg")),
+                    ]; io = devnull
+                )
+                # the failing second item rolled the whole call back
+                @test !isfile(joinpath(envdir, "Manifest.toml"))
+                proj = joinpath(envdir, "Project.toml")
+                @test !isfile(proj) || !occursin("GoodPkg", read(proj, String))
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            end
+        end
+    end
+end
+
+# name-keyed wrappers accept UUID-only PackageSpecs (previously the UUID was
+# stringified into a "name" no manifest entry could match)
+@testset "UUID-only PackageSpec for build" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            write_environment(env, plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.1")]))
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                # not installed -> build has nothing to run, but the UUID must
+                # resolve to `Example` instead of erroring on a uuid-string name
+                VibePkg.build(VibePkg.PackageSpec(uuid = EXAMPLE_UUID); io = devnull)
+                @test true
+                # an unknown uuid errors clearly
+                @test_throws PkgError VibePkg.build(
+                    VibePkg.PackageSpec(uuid = Base.UUID("99999999-9999-9999-9999-999999999999"));
+                    io = devnull
+                )
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            end
+        end
+    end
+end
+
+# why: a UUID names the package exactly; a duplicated name errors instead of
+# silently explaining whichever entry the manifest iteration hit last
+@testset "why disambiguates duplicate manifest names" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        u1 = "11111111-1111-1111-1111-111111111111"
+        u2 = "22222222-2222-2222-2222-222222222222"
+        root = "33333333-3333-3333-3333-333333333333"
+        other = "44444444-4444-4444-4444-444444444444"
+        write(
+            joinpath(envdir, "Project.toml"), """
+            [deps]
+            Root = "$root"
+            Other = "$other"
+            """
+        )
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "1.12.6"
+            manifest_format = "2.0"
+            project_hash = "1111111111111111111111111111111111111111"
+
+            [[deps.Root]]
+            git-tree-sha1 = "2222222222222222222222222222222222222222"
+            uuid = "$root"
+            version = "1.0.0"
+
+                [deps.Root.deps]
+                Dup = "$u1"
+
+            [[deps.Other]]
+            git-tree-sha1 = "3333333333333333333333333333333333333333"
+            uuid = "$other"
+            version = "1.0.0"
+
+                [deps.Other.deps]
+                Dup = "$u2"
+
+            [[deps.Dup]]
+            git-tree-sha1 = "4444444444444444444444444444444444444444"
+            uuid = "$u1"
+            version = "1.0.0"
+
+            [[deps.Dup]]
+            git-tree-sha1 = "5555555555555555555555555555555555555555"
+            uuid = "$u2"
+            version = "2.0.0"
+            """
+        )
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot_path = copy(Base.DEPOT_PATH)
+        try
+            copy!(Base.DEPOT_PATH, [depot])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            # by uuid: each Dup is explained through its own dependent
+            buf = IOBuffer()
+            VibePkg.why(VibePkg.PackageSpec(uuid = Base.UUID(u1)); io = buf)
+            out1 = String(take!(buf))
+            @test occursin("Root", out1) && !occursin("Other", out1)
+            VibePkg.why(VibePkg.PackageSpec(uuid = Base.UUID(u2)); io = buf)
+            out2 = String(take!(buf))
+            @test occursin("Other", out2) && !occursin("Root", out2)
+            # by name: ambiguous -> error, never a silent last-wins pick
+            @test_throws PkgError VibePkg.why("Dup"; io = devnull)
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot_path)
+        end
+    end
+end

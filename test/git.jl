@@ -28,6 +28,10 @@ using VibePkg.EnvFiles: entry_version, entry_repo_url, entry_repo_rev,
 # IO; tests run it against devnull
 quiet(f) = Base.ScopedValues.with(f, DEFAULT_IO => devnull)
 
+if !@isdefined(make_test_registry)
+    include("testhelpers.jl")
+end
+
 # A repository-tracked manifest records the canonical Git tree object id.
 # Re-hashing a Windows worktree is not equivalent because the checkout cannot
 # faithfully represent all Unix mode bits stored in the tree.
@@ -195,12 +199,15 @@ function make_track_repo(dir)
 end
 
 # branch-vs-commit tracking through `up`, end to end through the API.
-# The session runs against a private depot and env; no package server
-# (JULIA_PKG_SERVER = "") so no registry bootstrap/update is attempted.
+# The session runs against a private depot and env with no package server
+# (JULIA_PKG_SERVER = ""). The depot gets the offline test registry: a fresh
+# registry-less depot would (correctly, Pkg parity) try to bootstrap General
+# over git, which the hermetic proxy blocks.
 @testset "branch vs commit tracking" begin
     mktempdir() do dir
         src, commit1, branch = make_track_repo(dir)
         depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
         env_branch = mkpath(joinpath(dir, "env_branch"))
         env_commit = mkpath(joinpath(dir, "env_commit"))
 
@@ -495,6 +502,8 @@ end
         src = make_subdir_repo(dir)
         subdir = joinpath("pkgs", "SubPkg")
         depot = mkpath(joinpath(dir, "depot"))
+        # a registry-less depot would bootstrap General over git (Pkg parity)
+        make_test_registry(depot)
         envdir = mkpath(joinpath(dir, "env"))
 
         old_active = Base.ACTIVE_PROJECT[]

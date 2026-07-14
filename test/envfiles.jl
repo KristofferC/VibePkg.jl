@@ -516,3 +516,30 @@ end
     @test rt == m
     @test rt[d1].julia_syntax_version == v"1.13.0"
 end
+
+# Pkg.jl#4720: reverse-dependency edges built in one pass
+@testset "manifest_dependents_map" begin
+    u = i -> UUID(UInt128(i))
+    mkentry(name, uuid, deps) = EnvFiles.ManifestEntry(
+        name, uuid, RegistryTracked(v"1.0.0", nothing, String[]), false,
+        deps, Dict{String, UUID}(),
+        Dict{String, Union{String, Vector{String}}}(), Dict{String, AppInfo}(),
+        nothing, nothing, Dict{String, Any}(),
+    )
+    # A -> {B, C}, B -> {C}, C -> {}, D isolated
+    m = with_manifest(
+        EnvFiles.Manifest();
+        deps = Dict(
+            u(1) => mkentry("A", u(1), Dict("B" => u(2), "C" => u(3))),
+            u(2) => mkentry("B", u(2), Dict("C" => u(3))),
+            u(3) => mkentry("C", u(3), Dict{String, UUID}()),
+            u(4) => mkentry("D", u(4), Dict{String, UUID}()),
+        ),
+    )
+    dependents = manifest_dependents_map(m)
+    @test sort(dependents[u(2)]) == [u(1)]
+    @test sort(dependents[u(3)]) == [u(1), u(2)]
+    @test !haskey(dependents, u(1))     # nothing depends on A
+    @test !haskey(dependents, u(4))
+    @test isempty(manifest_dependents_map(EnvFiles.Manifest()))
+end

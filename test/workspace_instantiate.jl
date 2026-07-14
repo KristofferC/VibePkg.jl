@@ -69,3 +69,161 @@ end
         @test isdir(joinpath(depot, "packages", "Example"))   # reinstalled
     end
 end
+
+# Project.toml is authored input: resolve and every instantiate path must
+# leave it byte-for-byte untouched — comments, formatting and non-canonical
+# [sources] paths included. Pkg.jl#4713
+@testset "resolve/instantiate never rewrite Project.toml" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+
+        root = mkpath(joinpath(dir, "root"))
+        leaf = mkpath(joinpath(root, "Leaf"))
+        mkpath(joinpath(leaf, "src"))
+        write(
+            joinpath(leaf, "Project.toml"), """
+            name = "Leaf"
+            uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(leaf, "src", "Leaf.jl"), "module Leaf end\n")
+        sub = mkpath(joinpath(root, "sub"))
+        mkpath(joinpath(sub, "src"))
+        write(
+            joinpath(sub, "Project.toml"), """
+            name = "Sub"
+            uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(sub, "src", "Sub.jl"), "module Sub end\n")
+
+        project_file = joinpath(root, "Project.toml")
+        # tripwire: a comment the lossy serializer would drop and a
+        # non-canonical sources path sync_sources would rebase to "Leaf"
+        authored = """
+        # DO-NOT-DROP this comment
+        [workspace]
+        projects = ["sub"]
+
+        [deps]
+        Leaf = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+
+        [sources]
+        Leaf = {path = "./Leaf"}
+        """
+        write(project_file, authored)
+        manifest_file = joinpath(root, "Manifest.toml")
+
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        try
+            with_ws_env(root, depot) do
+                VibePkg.resolve(; io = devnull)
+                @test isfile(manifest_file)
+                @test read(project_file, String) == authored
+
+                VibePkg.instantiate(; io = devnull)              # manifest present
+                @test read(project_file, String) == authored
+
+                Base.rm(manifest_file)                           # no-manifest ⇒ up fallback
+                VibePkg.instantiate(; io = devnull)
+                @test isfile(manifest_file)
+                @test read(project_file, String) == authored
+
+                # doctor the manifest's julia_version to another minor so the
+                # update_on_mismatch fallback (also via up) triggers
+                doctored = replace(
+                    read(manifest_file, String),
+                    r"julia_version = \"[^\"]+\"" => "julia_version = \"1.0.0\"",
+                )
+                write(manifest_file, doctored)
+                VibePkg.instantiate(; update_on_mismatch = true, io = devnull)
+                @test read(project_file, String) == authored
+
+                # the opt-out still syncs [sources] (guards the plumbing):
+                # the manifest-relative rebase canonicalizes "./Leaf" to "Leaf"
+                VibePkg.resolve(; skip_writing_project = false, io = devnull)
+                @test read(project_file, String) != authored
+                synced = VibePkg.EnvFiles.read_project(project_file)
+                @test synced.sources["Leaf"].path == "Leaf"
+            end
+        finally
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+    end
+end
+
+# Instantiating a workspace member with no manifest resolves the WHOLE
+# workspace into the shared manifest, but with `workspace = false` downloads
+# only the active project's loadable deps. Pkg.jl#4699
+@testset "selective workspace instantiate without a manifest" begin
+    LocalPkgServer.ensure!()
+    PHANTOM_UUID = "99999999-9999-4999-9999-999999999999"
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        add_default_registries!(depot_stack([depot]); io = devnull)   # installable Example
+        # extra local registry with a root-only package that CANNOT be
+        # downloaded (bogus tree hash): if the selective filter is broken,
+        # instantiate fails loudly trying to fetch it
+        reg = joinpath(depot, "registries", "PhantomReg")
+        pkg = joinpath(reg, "P", "Phantom")
+        mkpath(pkg)
+        write(
+            joinpath(reg, "Registry.toml"), """
+            name = "PhantomReg"
+            uuid = "44449594-aafe-5451-b93e-139f81909106"
+            repo = "https://example.com/PhantomReg.git"
+
+            [packages]
+            $PHANTOM_UUID = { name = "Phantom", path = "P/Phantom" }
+            """
+        )
+        write(
+            joinpath(pkg, "Package.toml"), """
+            name = "Phantom"
+            uuid = "$PHANTOM_UUID"
+            repo = "https://example.com/Phantom.jl.git"
+            """
+        )
+        write(
+            joinpath(pkg, "Versions.toml"), """
+            ["0.1.0"]
+            git-tree-sha1 = "9999999999999999999999999999999999999999"
+            """
+        )
+
+        root = mkpath(joinpath(dir, "root"))
+        write(
+            joinpath(root, "Project.toml"), """
+            [workspace]
+            projects = ["sub"]
+
+            [deps]
+            Phantom = "$PHANTOM_UUID"
+            """
+        )
+        sub = mkpath(joinpath(root, "sub"))
+        write(joinpath(sub, "Project.toml"), "[deps]\nExample = \"$EX_UUID\"\n")
+
+        @test !isfile(joinpath(root, "Manifest.toml"))
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        try
+            with_ws_env(sub, depot) do            # activate the MEMBER
+                VibePkg.instantiate(; workspace = false, io = devnull)
+            end
+        finally
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+
+        # member's loadable dep installed; root-only dep NOT downloaded
+        @test isdir(joinpath(depot, "packages", "Example"))
+        @test !isdir(joinpath(depot, "packages", "Phantom"))
+        # but the shared manifest is fully resolved for the whole workspace
+        m = VibePkg.EnvFiles.read_manifest(joinpath(root, "Manifest.toml"))
+        @test haskey(m, Base.UUID(EX_UUID))
+        @test haskey(m, Base.UUID(PHANTOM_UUID))
+    end
+end

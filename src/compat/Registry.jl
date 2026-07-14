@@ -65,6 +65,11 @@ end
 Update installed registries (all of them, or only the named ones).
 """
 function update(names::String...; io::IO = stderr_f())
+    if API.is_offline()
+        # offline mode issues no network requests at all (Pkg.jl#4579)
+        printpkgstyle(io, :Offline, "skipping registry update", color = Base.info_color())
+        return nothing
+    end
     Registries.update_registries!(
         depot_stack(); names = isempty(names) ? nothing : collect(String, names), io,
     )

@@ -478,3 +478,186 @@ end
         @test only(values(read_project(joinpath(docs, "Project.toml")).sources)).path == ".."
     end
 end
+
+# Two workspace projects pinning the same dep to disagreeing [sources] must
+# be rejected at resolve time instead of one variant silently winning.
+# Pkg.jl#4709
+@testset "workspace projects with conflicting [sources]" begin
+    SHARED = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+
+    make_shared(dir, sub) = begin
+        pkg = mkpath(joinpath(dir, sub, "SharedDep"))
+        mkpath(joinpath(pkg, "src"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "SharedDep"
+            uuid = "$SHARED"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "SharedDep.jl"), "module SharedDep end\n")
+        return pkg
+    end
+
+    make_workspace(dir, source_a, source_b) = begin
+        root = mkpath(joinpath(dir, "root"))
+        write(
+            joinpath(root, "Project.toml"), """
+            [workspace]
+            projects = ["A", "B"]
+            """
+        )
+        for (member, uuid, source) in (("A", A_UUID, source_a), ("B", B_UUID, source_b))
+            m = mkpath(joinpath(root, member))
+            mkpath(joinpath(m, "src"))
+            write(
+                joinpath(m, "Project.toml"), """
+                name = "$(member)Pkg"
+                uuid = "$uuid"
+                version = "0.1.0"
+
+                [deps]
+                SharedDep = "$SHARED"
+
+                [sources]
+                SharedDep = $source
+                """
+            )
+            write(joinpath(m, "src", "$(member)Pkg.jl"), "module $(member)Pkg end\n")
+        end
+        return root
+    end
+
+    # conflicting paths: resolve must throw, not silently pick variant1
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        make_shared(dir, "variant1")
+        make_shared(dir, "variant2")
+        root = make_workspace(
+            dir,
+            "{path = \"../../variant1/SharedDep\"}",
+            "{path = \"../../variant2/SharedDep\"}",
+        )
+        env = load_environment(joinpath(root, "A"); depots)
+        err = try
+            plan_resolve(env, regs, Config(depots))
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test occursin("conflicting sources", err.msg)
+        @test occursin("SharedDep", err.msg)
+    end
+
+    # path vs url is also a conflict
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        make_shared(dir, "variant1")
+        root = make_workspace(
+            dir,
+            "{path = \"../../variant1/SharedDep\"}",
+            "{url = \"https://example.com/SharedDep.jl.git\"}",
+        )
+        env = load_environment(joinpath(root, "A"); depots)
+        err = try
+            plan_resolve(env, regs, Config(depots))
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test occursin("conflicting sources", err.msg)
+    end
+
+    # control: agreeing sources (same location, spelled from each member's
+    # own project — rebasing makes them comparable) still resolve
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        make_shared(dir, "variant1")
+        root = make_workspace(
+            dir,
+            "{path = \"../../variant1/SharedDep\"}",
+            "{path = \"../../variant1/SharedDep\"}",
+        )
+        env = load_environment(joinpath(root, "A"); depots)
+        planned = plan_resolve(env, regs, Config(depots))
+        @test is_path_tracked(planned.manifest[SHARED])
+    end
+end
+
+# dependencies() and project() report only the active project's direct deps
+# by default; workspace = true widens directness to every workspace project.
+# Pkg.jl#4719
+@testset "workspace-aware dependencies() and project()" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+
+        root = mkpath(joinpath(dir, "root"))
+        write(
+            joinpath(root, "Project.toml"), """
+            [workspace]
+            projects = ["A"]
+
+            [deps]
+            APkg = "$A_UUID"
+            """
+        )
+        a = mkpath(joinpath(root, "A"))
+        mkpath(joinpath(a, "src"))
+        write(
+            joinpath(a, "Project.toml"), """
+            name = "APkg"
+            uuid = "$A_UUID"
+            version = "0.1.0"
+
+            [deps]
+            Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+            """
+        )
+        write(joinpath(a, "src", "APkg.jl"), "module APkg end\n")
+
+        # shared manifest so dependencies() has entries to report
+        env = load_environment(root; depots)
+        write_environment(env, plan_resolve(env, regs, Config(depots)))
+
+        # activate the root for the public no-arg API
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(root, "Project.toml")
+            copy!(Base.DEPOT_PATH, [depot; Base.append_bundled_depot_path!(String[])])
+
+            # member-only dep Example: in the shared manifest but not direct
+            deps = VibePkg.dependencies()
+            @test deps[A_UUID].is_direct_dep
+            @test !deps[EXAMPLE_UUID].is_direct_dep
+            deps_ws = VibePkg.dependencies(; workspace = true)
+            @test deps_ws[A_UUID].is_direct_dep
+            @test deps_ws[EXAMPLE_UUID].is_direct_dep
+
+            proj = VibePkg.project()
+            @test keys(proj.dependencies) == Set(["APkg"])
+            proj_ws = VibePkg.project(; workspace = true)
+            @test keys(proj_ws.dependencies) == Set(["APkg", "Example"])
+            @test proj_ws.dependencies["Example"] == EXAMPLE_UUID
+            # the workspace merge must not leak into a plain project() call
+            @test keys(VibePkg.project().dependencies) == Set(["APkg"])
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+        end
+    end
+end

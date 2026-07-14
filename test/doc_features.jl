@@ -477,3 +477,79 @@ end
         end
     end
 end
+
+# the Authorization header must go only to the package server itself: a raw
+# prefix match would also send the bearer token to attacker-chosen sibling
+# hosts (e.g. a malicious artifact url `https://pkg.server.evil.tld/...`)
+@testset "auth headers stop at the server boundary" begin
+    server = "https://pkg.example.org"
+    @test Fetch.url_is_pkg_server(server, server)
+    @test Fetch.url_is_pkg_server("$server/registries", server)
+    @test Fetch.url_is_pkg_server("$server/artifact/abc", server)
+    # sibling-domain prefixes must not match
+    @test !Fetch.url_is_pkg_server("https://pkg.example.org.evil.tld/artifact/abc", server)
+    @test !Fetch.url_is_pkg_server("https://pkg.example.orgx/artifact/abc", server)
+    # same host but a different scheme or port is a different server
+    @test !Fetch.url_is_pkg_server("http://pkg.example.org/artifact/abc", server)
+    @test !Fetch.url_is_pkg_server("https://pkg.example.org:8080/artifact/abc", server)
+    # userinfo tricks do not reach the host either
+    @test !Fetch.url_is_pkg_server("https://pkg.example.org@evil.tld/artifact/abc", server)
+    # a server url with a path component keeps its own boundary
+    @test Fetch.url_is_pkg_server("https://example.org/pkg/registries", "https://example.org/pkg")
+    @test !Fetch.url_is_pkg_server("https://example.org/pkgevil/x", "https://example.org/pkg")
+
+    # end-to-end: download() attaches credentials to server urls only
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        d = depot_stack([depot])
+        port, tcpserver = Sockets.listenany(Sockets.ip"127.0.0.1", 40000)
+        received = Channel{String}(Inf)   # auth header per request, "" if absent
+        srv = errormonitor(
+            @async while isopen(tcpserver)
+                sock = try
+                    Sockets.accept(tcpserver)
+                catch
+                    break
+                end
+                @async try
+                    readline(sock)  # request line
+                    auth = ""
+                    while true
+                        line = readline(sock)
+                        isempty(strip(line)) && break
+                        m = match(r"^authorization:\s*(.*)$"i, line)
+                        m === nothing || (auth = String(strip(m[1])))
+                    end
+                    put!(received, auth)
+                    body = "OK"
+                    write(sock, "HTTP/1.1 200 OK\r\nContent-Length: $(sizeof(body))\r\nConnection: close\r\n\r\n")
+                    write(sock, body)
+                catch
+                finally
+                    close(sock)
+                end
+            end
+        )
+        url = "http://127.0.0.1:$(Int(port))/pkg"
+        try
+            withenv("JULIA_PKG_SERVER" => url) do
+                authdir = mkpath(joinpath(depot, "servers", Fetch.server_dirname(url)))
+                write(
+                    joinpath(authdir, "auth.toml"), """
+                    access_token = "secret-token"
+                    expires_at = $(floor(Int, time()) + 100_000)
+                    """
+                )
+                # a real server url carries the token
+                Fetch.download("$url/x", joinpath(dir, "dl1"); depots = d, io = devnull)
+                @test take!(received) == "Bearer secret-token"
+                # a prefix-matching sibling path must not
+                Fetch.download("$(url)evil/x", joinpath(dir, "dl2"); depots = d, io = devnull)
+                @test take!(received) == ""
+            end
+        finally
+            close(tcpserver)
+            wait(srv)
+        end
+    end
+end

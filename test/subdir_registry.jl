@@ -1,10 +1,10 @@
 # Pkg.jl subdir.jl "registry-resolved subdir add/develop" — a registry whose
-# package declares a `subdir` field. VibePkg *resolves* such a package (the
-# subdir is read from the registry and the version selected), but installing it
-# by cloning the repo and extracting the subtree is still a TODO in the source
-# (`repo_urls_for` excludes subdir packages: "…or (later) git"), so an offline
-# add currently errors clearly rather than silently misbehaving. This test pins
-# both the working half and the documented limitation.
+# package declares a `subdir` field. VibePkg resolves such a package (the
+# subdir is read from the registry and the version selected) and installs it
+# without a package server through the git fallback: the registry's subdir
+# tree hash is itself a git tree object, so it is checked out directly from
+# a clone of the repository (tarball synthesis stays excluded — a repo-root
+# tarball cannot verify against the subdir tree hash).
 if !@isdefined(LocalPkgServer)
     include("local_pkg_server.jl")
 end
@@ -15,7 +15,7 @@ using Base: SHA1
 import LibGit2
 using VibePkg
 using VibePkg.Configs: Config
-using VibePkg.Depots: depot_stack
+using VibePkg.Depots: depot_stack, find_installed
 using VibePkg.Registries: reachable_registries, registry_info
 using VibePkg.Environments: load_environment
 using VibePkg.Planning: plan_add, PackageRequest
@@ -65,18 +65,15 @@ const SUB_UUID = "5ab5ab5a-0000-0000-0000-000000000001"
         planned = plan_add(env, regs, Config(depots), [PackageRequest("SubPkg")])
         @test entry_version(planned.manifest[Base.UUID(SUB_UUID)]) == v"0.1.0"
 
-        # installing offline (no pkg server) is not yet supported — a subdir
-        # package's tree can't be fetched as a tarball and the git-clone path is
-        # a documented TODO, so add errors clearly instead of silently failing.
-        err = try
-            Base.ScopedValues.with(VibePkg.Utils.DEFAULT_IO => devnull) do
-                apply!(env, planned, regs, Config(depots); io = devnull)
-            end
-            nothing
-        catch e
-            e
+        # with no pkg server reachable, the git fallback clones the repo and
+        # checks the registry's subdir tree object out directly
+        Base.ScopedValues.with(VibePkg.Utils.DEFAULT_IO => devnull) do
+            apply!(env, planned, regs, Config(depots); io = devnull)
         end
-        @test err isa PkgError
-        @test occursin("repository URL", err.msg)
+        path, installed = find_installed(depots, "SubPkg", Base.UUID(SUB_UUID), th)
+        @test installed
+        @test isfile(joinpath(path, "Project.toml"))
+        @test isfile(joinpath(path, "src", "SubPkg.jl"))
+        @test !isfile(joinpath(path, "README.md"))   # the subdir tree, not the repo root
     end
 end

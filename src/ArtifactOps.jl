@@ -282,6 +282,7 @@ function collect_artifact_installs(
         pkg_uuid::Union{Nothing, UUID} = nothing,
         platform::AbstractPlatform = HostPlatform(),
         include_lazy::Bool = false,
+        usage_out::Union{Nothing, Vector{String}} = nothing,
     )
     out = Tuple{String, Dict}[]
     for f in ArtifactsStdlib.artifact_names
@@ -299,8 +300,14 @@ function collect_artifact_installs(
             end
             push!(out, (name, meta))
         end
-        # GC marks artifacts through the Artifacts.toml files recorded here
-        log_usage(d, artifacts_toml, "artifact_usage.toml")
+        # GC marks artifacts through the Artifacts.toml files recorded here;
+        # a caller looping many packages passes `usage_out` and writes ONE
+        # batched log entry instead of a read-rewrite cycle per package
+        if usage_out === nothing
+            log_usage(d, artifacts_toml, "artifact_usage.toml")
+        else
+            push!(usage_out, artifacts_toml)
+        end
         break   # first matching Artifacts.toml wins
     end
     return out
