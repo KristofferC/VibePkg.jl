@@ -54,7 +54,13 @@ end
 ResolverTimeoutError(msg::AbstractString) = ResolverTimeoutError(msg, nothing)
 
 function Base.showerror(io::IO, pkgerr::ResolverError)
-    print(io, pkgerr.msg)
+    # color is baked into `msg` at construction time (see `logstr`); honor the
+    # target IO's color support here by stripping ANSI escapes when it's off.
+    msg = pkgerr.msg
+    if !get(io, :color, false)
+        msg = replace(msg, r"\e\[[0-9;]*m" => "")
+    end
+    print(io, msg)
     return if pkgerr.ex !== nothing
         pkgex = pkgerr.ex
         if isa(pkgex, CompositeException)

@@ -202,14 +202,18 @@ end
 function run_plan(
         ctx::OpContext, env::Environment, planned::Environment;
         autoprecompile::Bool = true, precompile_pkgs::Vector{String} = String[],
+        build_uuids::Vector{UUID} = UUID[],
     )
     io = ctx.config.io
     result = Execution.apply!(env, planned, ctx.registries, ctx.config; io)
     print_env_diff(io, env, result.env; registries = ctx.registries, depots = ctx.config.depots)
     record_undo!(env, result.env)
-    # newly installed packages with a deps/build.jl get built
-    if !isempty(result.installed)
-        BuildOps.build!(result.env, ctx.config.depots, [i.uuid for i in result.installed]; io)
+    # newly installed packages with a deps/build.jl get built; repo packages
+    # (materialized on disk before resolve, so never counted as newly
+    # installed) are built too when the caller passes their uuids
+    to_build = union(UUID[i.uuid for i in result.installed], build_uuids)
+    if !isempty(to_build)
+        BuildOps.build!(result.env, ctx.config.depots, to_build; io)
     end
     autoprecompile && _auto_precompile(ctx, precompile_pkgs)
     return nothing
@@ -432,7 +436,7 @@ function add(
         name === nothing || push!(added_names, name)
     end
     planned, compat_added = compat_on_add(planned, added_names)
-    run_plan(ctx, env, planned; precompile_pkgs = added_names)
+    run_plan(ctx, env, planned; precompile_pkgs = added_names, build_uuids = UUID[r.uuid for r in repos])
     isempty(compat_added) ||
         printpkgstyle(io, :Compat, "entries added for $(join(compat_added, ", "))")
     return nothing
@@ -696,16 +700,23 @@ function _up_requests(
         io::IO = stderr_f(), level::UpgradeLevel = UPLEVEL_MAJOR,
         preserve::Union{Nothing, PreserveLevel} = nothing,
         mode::Union{Symbol, PackageMode} = :project, workspace::Bool = false,
+        update_registry::Union{Nothing, Symbol} = nothing,
     )
     mode = Configs.mode_symbol(mode)
-    # fully-pinned environments short-circuit before any registry work
+    # fully-pinned environments short-circuit before any registry work.
+    # `update_registry` policy: a caller may force one (e.g. `instantiate`
+    # delegates with `:auto` so a session that already updated does not
+    # re-fetch — Pkg.jl#3555); otherwise decide from the requests, so `up Foo`
+    # on an unregistered path/repo-tracked package forces no fetch (Pkg.jl#3496).
+    reg = update_registry
     let env = load_environment(; depots = depot_stack())
         if !isempty(env.manifest.deps) && all(kv -> kv.second.pinned, env.manifest.deps)
             printpkgstyle(io, :Update, "All dependencies are pinned - nothing to update.", color = Base.info_color())
             return nothing
         end
+        reg === nothing && (reg = _up_needs_registry(env, reqs) ? :force : :none)
     end
-    ctx = op_context(; io, update_registry = :force)
+    ctx = op_context(; io, update_registry = reg)
     env = load_environment(; depots = ctx.config.depots)
     repos = refresh_repo_packages(ctx, env, reqs; mode, workspace, io)
     printpkgstyle(io, :Resolving, "package versions...")
@@ -715,6 +726,26 @@ function _up_requests(
     return nothing
 end
 const update = up
+
+# `up` forces a registry update, but only when it could matter: an empty
+# request set (`up` everything) or a target that is registry-tracked — or
+# unresolvable without a registry, and thus possibly registered. When every
+# requested package resolves to a path/repo-tracked manifest entry the
+# registry is irrelevant and must not be fetched (Pkg.jl#3496).
+function _up_needs_registry(env::Environment, reqs::Vector{PackageRequest})
+    isempty(reqs) && return true
+    for r in reqs
+        uuid = try
+            Planning.resolve_request(env, RegistryInstance[], r)[2]
+        catch err
+            err isa PkgError || rethrow()
+            return true
+        end
+        entry = get(env.manifest, uuid, nothing)
+        (entry === nothing || EnvFiles.is_registry_tracked(entry)) && return true
+    end
+    return false
+end
 
 # Branch-tracked git packages update by pulling their tracked branch: `up`
 # re-materializes the recorded repo/rev (fetch-first) so a moved branch
@@ -829,13 +860,16 @@ function instantiate(;
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     # decision tree: no manifest (or `manifest = false`) ⇒
-    # full `up()`; a mismatched manifest under `update_on_mismatch` too
+    # full `up()`; a mismatched manifest under `update_on_mismatch` too.
+    # `instantiate` delegates to `up` with `update_registry = :auto` so it
+    # respects the once-per-session / daily cooldown instead of forcing a
+    # redundant registry re-download (Pkg.jl#3555).
     if manifest === false || (manifest === nothing && isempty(env.manifest.deps) && !isfile(env.manifest_file))
-        return up(; io)
+        return up(; io, update_registry = :auto)
     end
     if update_on_mismatch && !Execution.manifest_matches_project(env)
         printpkgstyle(io, :Info, "The manifest does not match the project, updating...", color = Base.info_color())
-        return up(; io)
+        return up(; io, update_registry = :auto)
     end
     installed = Execution.instantiate!(env, ctx.registries, ctx.config; julia_version_strict, workspace, io)
     isempty(installed) || BuildOps.build!(env, ctx.config.depots, [i.uuid for i in installed]; verbose, io)

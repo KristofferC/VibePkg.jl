@@ -274,7 +274,24 @@ end
 function is_manifest_current(env::Environment)
     recorded = env.manifest.project_hash
     recorded === nothing && return nothing
-    return recorded == resolve_hash(env)
+    recorded == resolve_hash(env) || return false
+    # `project_hash` only covers the active/workspace projects, so a change to
+    # a path-tracked (deved) package's own Project.toml — e.g. a newly declared
+    # dependency — does not move it. Check each such package's declared deps are
+    # still recorded in the manifest, or the staleness goes undetected (#4103).
+    for (_, entry) in env.manifest.deps
+        path = entry_path(entry)
+        path === nothing && continue
+        dir = isabspath(path) ? path : normpath(joinpath(dirname(env.manifest_file), path))
+        project_file = projectfile_path(dir; strict = true)
+        project_file === nothing && continue
+        project = read_project(project_file)
+        recorded_deps = merge(entry.deps, entry.weakdeps)
+        for (name, uuid) in project.deps
+            get(recorded_deps, name, nothing) == uuid || return false
+        end
+    end
+    return true
 end
 
 ###########

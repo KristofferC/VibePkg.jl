@@ -102,6 +102,7 @@ function tree_hash(
         ::Type{HashType}, root::AbstractString;
         legacy_symlink_size::Bool = false,
     ) where {HashType}
+    isdir(root) || throw(ArgumentError("tree_hash root is not a directory: $(repr(root))"))
     entries = Tuple{String, Vector{UInt8}, GitMode}[]
     for f in sort(readdir(root; join = true); by = f -> gitmode(f) == mode_dir ? f * "/" : f)
         basename(f) == ".git" && continue

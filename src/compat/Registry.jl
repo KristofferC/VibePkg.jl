@@ -45,10 +45,10 @@ end
 Remove registries from the depot. `spec` is a name, `name=uuid`, or a
 bare uuid; a name shared by several registries requires the uuid form.
 """
-function rm(specs::String...; io::IO = stderr_f())
+function rm(specs::AbstractString...; io::IO = stderr_f())
     isempty(specs) && pkgerror("`registry rm` requires at least one registry")
     for spec in specs
-        name, uuid = parse_registry_spec(spec)
+        name, uuid = parse_registry_spec(String(spec))
         Registries.remove_registry!(depot_stack(), name, uuid; io)
     end
     return nothing
