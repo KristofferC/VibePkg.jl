@@ -409,10 +409,11 @@ end
 
             [extras]
             Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+            TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
             UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
             [targets]
-            test = ["Test"]
+            test = ["Test", "TOML"]
 
             [preferences.LegacyT]
             from_pkg_project = "yes"
@@ -435,9 +436,15 @@ end
             joinpath(pkg, "test", "runtests.jl"), """
             import TOML
             deps = TOML.parsefile(Base.active_project())["deps"]
+            haskey(ENV, "JULIA_PROJECT") && error("JULIA_PROJECT leaked into test subprocess")
+            Base.LOAD_PATH[1] == "@" || error("active project is not first on LOAD_PATH")
+            length(Base.LOAD_PATH) == 2 || error("unexpected LOAD_PATH entries: \$(Base.LOAD_PATH)")
+            startswith(Base.active_project(), Base.LOAD_PATH[2]) || error("sandbox is not on LOAD_PATH")
             haskey(deps, "Test") || error("Test missing from sandbox project deps")
+            haskey(deps, "TOML") || error("TOML missing from sandbox project deps")
             haskey(deps, "LegacyDep") || error("regular dependency missing from sandbox project deps")
             haskey(deps, "UUIDs") && error("UUIDs (untargeted extra) leaked into sandbox deps")
+            Base.identify_package("UUIDs") === nothing || error("undeclared stdlib is loadable")
             haskey(deps, "LegacyT") || error("tested package missing from sandbox project deps")
             using Test, LegacyDep, LegacyT
             @test LegacyT.answer() == 44
@@ -452,6 +459,7 @@ end
         env, depots = dev_fixture(dir, pkg)
         sandbox = TestOps.sandbox_project(pkg, "LegacyT", LG_UUID, env.project)
         @test sandbox.deps["LegacyDep"] == LD_UUID
+        @test haskey(sandbox.deps, "TOML")
         @test sandbox.compat["LegacyDep"] == Compat("0.2")
         @test sandbox.sources["LegacyDep"].path == regular_dep
         @test !haskey(sandbox.deps, "UUIDs")

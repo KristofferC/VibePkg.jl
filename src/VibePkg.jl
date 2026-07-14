@@ -8,6 +8,7 @@ end
 # files included before it.
 include("Errors.jl")
 include("Utils.jl")
+include("Timing.jl")
 include("MiniProgressBars.jl")
 include("FuzzySorting.jl")
 include("Versions.jl")

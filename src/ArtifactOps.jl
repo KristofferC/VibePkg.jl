@@ -130,11 +130,12 @@ function try_install_from(
         url::String, sha256_str::Union{Nothing, String}, hash::SHA1, dest::String;
         depots::Union{Nothing, DepotStack} = nothing,
         io::IO = stderr_f(),
+        progress_header::Union{Nothing, String} = nothing,
     )
     tarball = tempname()
     try
         try
-            Fetch.download(url, tarball; io, depots)
+            Fetch.download(url, tarball; io, depots, progress_header)
         catch err
             err isa InterruptException && rethrow()
             return false
@@ -210,7 +211,10 @@ function ensure_artifact_installed!(
         success = mkpidlock(path * ".pid", stale_age = 20) do
             isdir(path) && return true
             for (url, sha) in sources
-                try_install_from(url, sha, hash, path; depots = d, io) && return true
+                try_install_from(
+                    url, sha, hash, path;
+                    depots = d, io, progress_header = "Downloading artifact: $(name)",
+                ) && return true
             end
             false
         end

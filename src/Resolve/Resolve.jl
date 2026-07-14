@@ -12,6 +12,7 @@ using ..Stdlibs
 const Registry = Registries
 const Types = Stdlibs
 import ..Utils: stdout_f
+using ..Timing: @timeit, TIMER
 
 using Printf: @sprintf
 using Random: Random, shuffle!
@@ -77,7 +78,7 @@ include("graphtype.jl")
 include("maxsum.jl")
 
 "Resolve package dependencies."
-function resolve(graph::Graph)
+@timeit TIMER "solver" function resolve(graph::Graph)
     sol = _resolve(graph::Graph, nothing, nothing)
 
     # return the solution as a Dict mapping UUID => VersionNumber

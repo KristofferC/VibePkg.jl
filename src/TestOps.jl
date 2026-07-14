@@ -28,6 +28,7 @@ using Base: UUID
 
 using ..Errors: pkgerror
 using ..Utils: stderr_f, precompile_io, precompile_detach_kwargs
+using ..Timing: @timeit, TIMER
 using ..Versions: VersionSpec, semver_spec
 using ..EnvFiles
 using ..EnvFiles: ManifestEntry, PathTracked, SourceSpec, with_project,
@@ -212,7 +213,7 @@ requested packages before erroring with the collected failures).
 """
 # run `runtests` in a subprocess against the environment at `project_dir`;
 # returns `(name, process)` on failure, `nothing` on success
-function run_test_process(
+@timeit TIMER "run tests" function run_test_process(
         name::String, project_dir::String, runtests::String, source::String;
         coverage, julia_args, test_args, autoprecompile::Bool, io,
     )
@@ -230,7 +231,7 @@ function run_test_process(
         old_project = Base.ACTIVE_PROJECT[]
         Base.ACTIVE_PROJECT[] = project_dir
         try
-            Base.Precompilation.precompilepkgs(
+            @timeit TIMER "precompile sandbox" Base.Precompilation.precompilepkgs(
                 ; configs = flags => cacheflags, warn_loaded = false,
                 io = precompile_io(io), precompile_detach_kwargs()...
             )
@@ -240,8 +241,8 @@ function run_test_process(
     end
     sep = Sys.iswindows() ? ';' : ':'
     cmd = addenv(
-        `$(Base.julia_cmd()) --threads=$(test_threads_spec()) $flags --project=$project_dir $runtests $test_args`,
-        "JULIA_LOAD_PATH" => "@$(sep)@stdlib",
+        `$(Base.julia_cmd()) --threads=$(test_threads_spec()) $flags $runtests $test_args`,
+        "JULIA_LOAD_PATH" => "@$(sep)$(project_dir)",
         "JULIA_PROJECT" => nothing,
     )
     printpkgstyle(io, :Testing, "Running tests...")

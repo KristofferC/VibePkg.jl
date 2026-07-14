@@ -1345,7 +1345,7 @@ All six testsets exercise the `Pkg.BinaryPlatforms` compat shim (`Linux`/`MacOS`
 
 ### Basic `test` sandboxing — line 14
 - **Tests:** `Pkg.test` runs in a sandbox: the manifest holds the compat-obeying versions (Unregistered 0.20.0), the active project is the sandbox not `JULIA_PROJECT`, `LOAD_PATH[1]=="@"` and `[2]` prefixes the active project; test-only deps are preserved from the parent manifest when possible.
-- **VibePkg:** 🟡 PARTIAL — sandbox resolve/isolation and parent-version preservation covered by buildtest.jl "test: sources-based test/Project.toml" and "test: sandbox manifest keeps the parent's versions" (#1423), compat obedience by "test: force_latest_compat". Missing: the explicit `JULIA_PROJECT`-doesn't-leak / `LOAD_PATH[1]=="@"` in-subprocess assertions.
+- **VibePkg:** ✅ COVERED — sandbox resolve/isolation and parent-version preservation are covered by buildtest.jl "test: sources-based test/Project.toml" and "test: sandbox manifest keeps the parent's versions" (#1423), compat obedience by "test: force_latest_compat", and the legacy sandbox test asserts in-process that `JULIA_PROJECT` is absent, `LOAD_PATH` is exactly `[@, sandbox]`, and an untargeted stdlib is not loadable.
 
 ### Preferences sandboxing without test/Project.toml — line 50
 - **Tests:** With no `test/Project.toml`, preferences declared in the package project are copied into the test sandbox and readable via `Preferences.load_preference`.
