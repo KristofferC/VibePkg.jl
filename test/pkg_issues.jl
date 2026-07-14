@@ -1641,6 +1641,101 @@ end
     end
 end
 
+@testset "Pkg.jl#2922 interrupting test does not orphan sandbox child" begin
+    TestOps = VibePkg.TestOps
+
+    # true iff process `pid` still exists (unix `kill -0`)
+    alive = function (pid)
+        try
+            run(pipeline(`kill -0 $pid`; stdout = devnull, stderr = devnull))
+            return true
+        catch
+            return false
+        end
+    end
+
+    mktempdir() do dir
+        # a synthetic sandbox package: empty Project.toml + a runtests.jl that
+        # records its own pid and then loops for 120s swallowing interrupts, so
+        # nothing but an external kill can stop it.
+        write(joinpath(dir, "Project.toml"), "")
+        testdir = mkpath(joinpath(dir, "test"))
+        pidfile = joinpath(dir, "child.pid")
+        runtests = joinpath(testdir, "runtests.jl")
+        write(
+            runtests, """
+            Base.exit_on_sigint(false)
+            write(raw"$pidfile", string(getpid()))
+            flush(stdout)
+            t0 = time()
+            while time() - t0 < 120
+                try
+                    sleep(0.05)
+                catch
+                end
+            end
+            """
+        )
+
+        # launch the test subprocess exactly as Pkg.test's driver does, inside a
+        # task we can inject an InterruptException into (the REPL raw-mode ^C
+        # case where the signal reaches only the parent, not the child).
+        task = @async try
+            TestOps.run_test_process(
+                "Sandbox", dir, runtests, dir;
+                coverage = false, julia_args = String[], test_args = String[],
+                autoprecompile = false, io = devnull,
+            )
+        catch
+        end
+
+        # wait for the child to boot and publish its pid
+        child_pid = nothing
+        t0 = time()
+        while time() - t0 < 60
+            if isfile(pidfile)
+                s = strip(read(pidfile, String))
+                if !isempty(s)
+                    child_pid = parse(Int, s)
+                    break
+                end
+            end
+            sleep(0.1)
+        end
+
+        @test child_pid !== nothing
+        @test child_pid !== nothing && alive(child_pid)
+
+        try
+            # simulate ^C reaching only the driver task
+            schedule(task, InterruptException(); error = true)
+
+            # #2922: interrupting the driver must terminate the child test
+            # session, never orphan it. subprocess_handler forwards SIGINT and
+            # escalates to SIGKILL after 4s, so the child dies well inside the
+            # 8s poll window even though it swallows interrupts.
+            child_dead = false
+            t1 = time()
+            while time() - t1 < 8
+                if !alive(child_pid)
+                    child_dead = true
+                    break
+                end
+                sleep(0.1)
+            end
+            @test child_dead
+        finally
+            # never leave a stray child running past the test
+            if child_pid !== nothing
+                try
+                    run(pipeline(`kill -9 $child_pid`; stdout = devnull, stderr = devnull))
+                catch
+                end
+            end
+        end
+    end
+end
+
 @testset "Pkg.jl#3112 add does not mutate caller request/env in place" begin
     mktempdir() do depot
         make_test_registry(depot)

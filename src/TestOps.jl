@@ -261,7 +261,10 @@ function subprocess_handler(cmd::Cmd, io::IO, error_msg::String)
     # whole run; unwrapping the IOContext hands an interactive child the real
     # terminal handle
     out = io isa IOContext ? io.io : io
-    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out), wait = false)
+    # the child inherits OS fd 0 so tests can read stdin (Pkg.jl#3185); the
+    # raw fd rather than the `stdin` object keeps this independent of the
+    # parent's libuv stream state (`run(cmd; wait = true)` semantics)
+    p = run(pipeline(ignorestatus(cmd); stdin = RawFD(0), stdout = out, stderr = out), wait = false)
     interrupted = false
     try
         wait(p)

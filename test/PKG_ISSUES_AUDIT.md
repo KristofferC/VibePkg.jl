@@ -28,33 +28,34 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **124 → 99 FIXED, 19 PERSISTS, 6 N/A**. The other 302 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
-- **Every FIXED issue has a passing regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **97 FIXED** → **`test/pkg_issues.jl`** (97 self-contained `@testset`s, all green, auto-discovered by `runtests.jl`).
-- **Every remaining PERSISTS bug has a `@test_broken` test** in **`test/pkg_issues_broken.jl`** (19 testsets, each asserting the *correct* behavior so it records **Broken** today and flips to an *Unexpected Pass* the moment the bug is fixed — at which point it moves into `test/pkg_issues.jl` as a passing `@test`).
+- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **124 → 100 FIXED, 18 PERSISTS, 6 N/A**. The other 302 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
+- **Every FIXED issue has a passing regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **98 FIXED** → **`test/pkg_issues.jl`** (98 self-contained `@testset`s, all green, auto-discovered by `runtests.jl`).
+- **Every remaining PERSISTS bug has a `@test_broken` test** in **`test/pkg_issues_broken.jl`** (18 testsets, each asserting the *correct* behavior so it records **Broken** today and flips to an *Unexpected Pass* the moment the bug is fixed — at which point it moves into `test/pkg_issues.jl` as a passing `@test`).
 - **Fixing progress (worktree-isolated agent per bug, file-partitioned):**
   - **Wave 1 — 8 fixed:** #4705 (`Planning.jl`), #4006 (`Resolve.jl`), #3420 (`compat/Registry.jl`), #3365 (`TreeHash.jl`), #3150 (`Display.jl`), #2894 (`Git.jl`), #1657 (`ArtifactOps.jl`), #1236 (`API.jl`).
   - **Wave 2 — 6 fixed:** #4553 (registry extract `..`/symlink path → `Fetch.jl`), #3644 (`Pkg.test` mirrors `--warn-overwrite` → `TestOps.jl`), #4103 (`is_manifest_current` detects deved-pkg dep changes → `Environments.jl`), #4351 (`resolve` picks up nested-`[sources]` rev changes → `Planning.jl`), #3795 (JLL build-metadata deps kept consistent → `Planning.jl`), #3496 (`up <unregistered>` doesn't force a registry update → `API.jl`).
   - **Wave 3 — 2 fixed:** #4131 (sysimage JLL build mismatch no longer downgrades on update → `Planning.jl`), #3555 (`instantiate` uses `:auto` registry update, no redundant refetch → `API.jl`).
-  - **Deferred (attempted, not merged — need a lower-risk fix):** #3326 (symlinked `Project.toml`: the fix reworks core `write_environment`/`load_environment` and regressed manifest-mode `status`); #3901 (resolver error shows build numbers: fix makes hot `VersionBound` non-`isbits` — needs the `isbits` encoding); #2922 (interrupt-orphaned test child: interrupt handling exists but the assertion is load/timing-fragile). All three stay `@test_broken`.
+  - **Wave 4 — 1 fixed:** #2922 (interrupt-orphaned test child: `subprocess_handler`'s SIGINT-forward + 4s SIGKILL escalation kills the child deterministically — confirmed by an Unexpected Pass on loaded CI, so the timing-fragility concern was unfounded → test promoted to `@test`). Same pass restored the #3185 stdin forwarding that `subprocess_handler`'s `run(...; wait = false)` had silently regressed (`wait = false` defaults stdin to `devnull`; now passes `RawFD(0)` explicitly → `TestOps.jl`).
+  - **Deferred (attempted, not merged — need a lower-risk fix):** #3326 (symlinked `Project.toml`: the fix reworks core `write_environment`/`load_environment` and regressed manifest-mode `status`); #3901 (resolver error shows build numbers: fix makes hot `VersionBound` non-`isbits` — needs the `isbits` encoding). Both stay `@test_broken`.
   - **Excluded (features / design-calls, left as `@test_broken`):** #1568 (build-metadata version support), #3269 (raw-artifact file modes), #708 (git submodules), #4579/#4580 (offline-mode), #2028 (`semver_spec` consistency).
 - Method: `Workflow` fan-out — triage, reproduce, write `@test`/`@test_broken`, and fix (worktree-isolated, one src file each, diffs integrated serially; test migration done centrally).
 
-### The 19 remaining PERSISTS (each covered by a `@test_broken`)
+### The 18 remaining PERSISTS (each covered by a `@test_broken`)
 
 Pages 1–6: #4580, #4579, #4082, #3269.
 Pages 7–8: #4068, #3901, #3853, #2303.
 Pages 9–11: #3494, #3326, #1568.
-Pages 12–14: #2922, #2525, #708.
+Pages 12–14: #2525, #708.
 Pages 15–17: #2211, #2028, #2023, #2007, #1829.
-(Fixed & moved to the passing suite — wave 1: #4705, #4006, #3420, #3365, #3150, #2894, #1657, #1236; wave 2: #4553, #3644, #4103, #4351, #3795, #3496; wave 3: #4131, #3555.)
+(Fixed & moved to the passing suite — wave 1: #4705, #4006, #3420, #3365, #3150, #2894, #1657, #1236; wave 2: #4553, #3644, #4103, #4351, #3795, #3496; wave 3: #4131, #3555; wave 4: #2922.)
 
 Themes: resolver/`up` edge cases (build-metadata JLL deps, targeted-`up` no-ops, stale
 explicit-requirement / dropped-build-number messages, name↔UUID mismatch), `JULIA_PKG_OFFLINE`
 not honored on registry-update/instantiate, redundant registry updates on instantiate/`up`,
-`Pkg.test` subprocess interrupt-orphaning & hardcoded `--warn-overwrite`, artifact file-mode &
-missing-`arch` TypeError, `dev`/`add` not running `deps/build.jl`, symlinked project/depot dev
-paths, git submodules & non-standard SSH ports, and `semver_spec("0.0.0")` / `Registry.rm(SubString)`
-/ build-metadata version quirks. See per-page tables for per-issue evidence.
+artifact file-mode & missing-`arch` TypeError, `dev`/`add` not running `deps/build.jl`,
+symlinked project/depot dev paths, git submodules & non-standard SSH ports, and
+`semver_spec("0.0.0")` / `Registry.rm(SubString)` / build-metadata version quirks.
+See per-page tables for per-issue evidence.
 
 ---
 
@@ -384,7 +385,7 @@ paths, git submodules & non-standard SSH ports, and `semver_spec("0.0.0")` / `Re
 | 3060 | Interrupting add resulting in unending download error logs | bug | N/A | The `Error: curl_multi_socket_action: 8` spam originates entirely in Julia's Downloads.jl stdlib, not in Pkg/VibePkg. Traced the exact string to Downloads/src/Curl/Multi.jl:200 (`@check curl_multi_socket_action(...)`) inside the a… |
 | 3054 | Prompt to install package should purge input buffer before reading fro | bug | N/A | Issue #3054 is about `try_prompt_pkg_add`, which real Pkg registers into `REPL.install_packages_hooks` (reference ext/REPLExt/REPLExt.jl:241 and 377-378) to prompt "Install packages? (y/n/o)" via `Base.prompt(stdin, ...)` when `us… |
 | 3006 | Trouble Installing Packages | question | SKIP | support request; corrupt git index on Windows, environment-specific external error |
-| 2922 | Interrupting Pkg.test sometimes orphans the test sandbox process | bug | **PERSISTS** | Ran a runtime repro against VibePkg's actual test code path (src/TestOps.jl:212 run_test_process) via the r2922 daemon. Built a synthetic sandbox package whose test/runtests.jl calls Base.exit_on_sigint(false), writes its PID, and… |
+| 2922 | Interrupting Pkg.test sometimes orphans the test sandbox process | bug | **FIXED** | `subprocess_handler` (src/TestOps.jl) forwards SIGINT to the child and escalates to SIGKILL after 4s, so an interrupted driver task can no longer orphan the sandbox child (verified 3× locally + Unexpected Pass on loaded CI). — _test:_ `test/pkg_issues.jl` "Pkg.jl#2922 interrupting test does not orphan sandbox child" |
 | 2789 | Can't specify a prerelease tag in the `compat` sectiion of a Project.t | feature | SKIP | labeled feature request to support prerelease tags in compat/VersionSpec |
 | 2743 | 1.7.0-rc1: clean up bad registry tarball on EOF exception | bug | **FIXED** | Ran install_server_registry! against a LocalPkgServer serving a truncated General registry tarball (half the bytes, guaranteeing EOF). Observed: (1) the exact issue error is thrown — "EOFError :: EOFError: read end of file" during… |
 | 2738 | Improve the "empty intersection" error message | feature | SKIP | error-message enhancement request |
