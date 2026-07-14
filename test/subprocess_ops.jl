@@ -54,6 +54,8 @@ end
             """;
             test_depot = shared,               # all workers isolate to this one depot
         )
+        # the installer is identified by Fetch's `@debug "Installed ..."`
+        cmd = addenv(cmd, "JULIA_DEBUG" => "VibePkg")
         installed = Threads.Atomic{Int}(0)
         failed = Threads.Atomic{Int}(0)
         outs = fill("", 3)

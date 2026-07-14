@@ -10,6 +10,7 @@ using Base: UUID
 
 using ..Errors: pkgerror
 using ..Utils: stderr_f
+using ..Timing: @timeit, TIMER
 using ..EnvFiles
 using ..EnvFiles: ManifestEntry, entry_tree_hash, is_path_tracked, with_project
 using ..Depots: DepotStack, depots1, scratchspaces_dir, log_usage
@@ -115,7 +116,7 @@ Build the given packages (deps-first) if they have a `deps/build.jl`.
 With an empty `uuids`, builds the project's direct dependencies that need it.
 `verbose` sends build output to `stdout`/`stderr` instead of the log file.
 """
-function build!(
+@timeit TIMER "build packages" function build!(
         env::Environment, depots::DepotStack, uuids::Vector{UUID} = UUID[];
         verbose::Bool = false, io::IO = stderr_f(),
     )

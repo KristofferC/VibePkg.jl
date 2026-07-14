@@ -10,7 +10,8 @@ module Execution
 using Base: UUID, SHA1
 
 using ..Errors: pkgerror
-using ..Utils: can_fancyprint, printpkgstyle
+using ..Utils: can_fancyprint
+using ..Timing: @timeit, TIMER
 using ..MiniProgressBars
 using ..EnvFiles
 using ..EnvFiles: ManifestEntry, PathTracked, RepoTracked, RegistryTracked,
@@ -55,13 +56,66 @@ function entry_source_path(manifest_file::String, entry::ManifestEntry, depots::
     return first(find_installed(depots, entry.name, entry.uuid, hash))
 end
 
+# Shared scaffolding for the parallel download loops: semaphore-bounded
+# @async workers (task-level IO concurrency; installs are pidlocked) and,
+# when several items download on a terminal, one aggregate N/M bar — per-item
+# bars would interleave — showing the in-flight names. Worker log records
+# (e.g. hash-mismatch warnings) are routed above the bar.
+function parallel_foreach_progress(
+        f, work::Vector, names::Vector{String};
+        io::IO, header::String, concurrency::Int,
+    )
+    sem = Base.Semaphore(concurrency)
+    aggregate = can_fancyprint(io) && length(work) > 1
+    bar = MiniProgressBar(; header, color = Base.info_color(), mode = :int, always_reprint = true)
+    bar.max = length(work)
+    inner_io = aggregate ? devnull : io
+    inflight = String[]
+    set_below!() = bar.below = isempty(inflight) ? String[] : [join(inflight, ", ")]
+    logger = Base.CoreLogging.current_logger()
+    aggregate && (logger = ProgressLogger(logger, io, bar))
+    aggregate && start_progress(io, bar)
+    return try
+        Base.CoreLogging.with_logger(logger) do
+            @sync for (i, item) in enumerate(work)
+                @async Base.acquire(sem) do
+                    @lock io begin
+                        push!(inflight, names[i])
+                        set_below!()
+                        aggregate && show_progress(io, bar)
+                    end
+                    try
+                        f(item, inner_io)
+                    finally
+                        @lock io begin
+                            j = findfirst(==(names[i]), inflight)
+                            j === nothing || deleteat!(inflight, j)
+                            bar.current += 1
+                            set_below!()
+                            aggregate && show_progress(io, bar)
+                        end
+                    end
+                end
+            end
+        end
+    catch err
+        # surface the first real failure instead of a CompositeException
+        while err isa CompositeException || err isa TaskFailedException
+            err = err isa CompositeException ? first(err.exceptions) : err.task.exception
+        end
+        rethrow(err)
+    finally
+        aggregate && end_progress(io, bar)
+    end
+end
+
 """
     ensure_sources_installed!(env, registries, config; io) -> Vector{NamedTuple}
 
 Make every manifest entry's source tree present on disk. Returns the newly
 installed packages as `(uuid, name, path)`.
 """
-function ensure_sources_installed!(
+@timeit TIMER "install packages" function ensure_sources_installed!(
         env::Environment, registries::Vector{RegistryInstance}, config::Config;
         io::IO = config.io,
     )
@@ -91,43 +145,12 @@ function ensure_sources_installed!(
             installed || push!(work, (; uuid, name = entry.name, hash, urls = repo_urls_for(registries, uuid), version = entry_version(entry)))
         end
     end
-    # concurrent downloads (task-level IO concurrency; installs are pidlocked)
-    sem = Base.Semaphore(config.concurrency)
-    # with several parallel downloads, one aggregate progress bar replaces
-    # the (interleaving) per-download bars
-    aggregate = can_fancyprint(io) && length(work) > 1
-    bar = MiniProgressBar(header = "Downloading packages", color = Base.info_color(), mode = :int, always_reprint = true)
-    bar.max = length(work)
-    aggregate && start_progress(io, bar)
-    inner_io = aggregate ? devnull : io
-    max_name = maximum(textwidth(w.name) for w in work; init = 0)
-    try
-        @sync for item in work
-            @async Base.acquire(sem) do
-                path, new = Fetch.ensure_package_installed!(depots, item.name, item.uuid, item.hash, item.urls; io = inner_io, server = config.server)
-                new && push!(new_installs, (; item.uuid, item.name, path))
-                # pinned per-package `Installed Name ──── vX.Y.Z` line
-                vstr = item.version !== nothing ? "v$(item.version)" : "[$(string(item.hash)[1:16])]"
-                @lock io begin
-                    if new
-                        aggregate && print_progress_bottom(io)
-                        printpkgstyle(io, :Installed, string(rpad(item.name * " ", max_name + 2, "─"), " ", vstr))
-                    end
-                    if aggregate
-                        bar.current += 1
-                        show_progress(io, bar)
-                    end
-                end
-            end
-        end
-    catch err
-        # surface the first real failure instead of a CompositeException
-        while err isa CompositeException || err isa TaskFailedException
-            err = err isa CompositeException ? first(err.exceptions) : err.task.exception
-        end
-        rethrow(err)
-    finally
-        aggregate && end_progress(io, bar)
+    parallel_foreach_progress(
+        work, [w.name for w in work];
+        io, header = "Downloading packages", concurrency = config.concurrency,
+    ) do item, inner_io
+        path, new = Fetch.ensure_package_installed!(depots, item.name, item.uuid, item.hash, item.urls; io = inner_io, server = config.server)
+        new && push!(new_installs, (; item.uuid, item.name, path))
     end
     return new_installs
 end
@@ -187,10 +210,10 @@ function sandbox_preferences(env::Environment, primary::String)
     end
 end
 
-# The sandbox subprocess runs with the load path cut down to
-# `@:@stdlib`, so the flattened preferences are materialized as the
-# sandbox's `JuliaLocalPreferences.toml` — the highest-priority
-# preferences name, shadowing any plain `LocalPreferences.toml`.
+# The sandbox subprocess runs with the load path cut down to `@` and the
+# sandbox directory, so the flattened preferences are materialized as the
+# sandbox's `JuliaLocalPreferences.toml` — the highest-priority preferences
+# name, shadowing any plain `LocalPreferences.toml`.
 function write_sandbox_preferences(sandbox_dir::String, prefs::Dict{String, Any})
     isempty(prefs) && return
     open(joinpath(sandbox_dir, first(Base.preferences_names)), "w") do io
@@ -205,7 +228,7 @@ end
 Install the artifacts selected by every package in the environment
 (including the project itself) for the host platform.
 """
-function ensure_artifacts!(env::Environment, config::Config; io::IO = config.io)
+@timeit TIMER "install artifacts" function ensure_artifacts!(env::Environment, config::Config; io::IO = config.io)
     depots = config.depots
     # gather selections serially (cheap TOML reads), install concurrently,
     # deduplicated by tree hash (many packages share artifacts)
@@ -228,30 +251,12 @@ function ensure_artifacts!(env::Environment, config::Config; io::IO = config.io)
     isempty(jobs) && return String[]
 
     new_names = String[]
-    sem = Base.Semaphore(config.concurrency)
-    aggregate = can_fancyprint(io) && length(jobs) > 1
-    bar = MiniProgressBar(header = "Downloading artifacts", color = Base.info_color(), mode = :int, always_reprint = true)
-    bar.max = length(jobs)
-    aggregate && start_progress(io, bar)
-    inner_io = aggregate ? devnull : io
-    try
-        @sync for (name, meta) in jobs
-            @async Base.acquire(sem) do
-                _, new = ensure_artifact_installed!(depots, name, meta; io = inner_io, server = config.server)
-                new && push!(new_names, name)
-                if aggregate
-                    bar.current += 1
-                    show_progress(io, bar)
-                end
-            end
-        end
-    catch err
-        while err isa CompositeException || err isa TaskFailedException
-            err = err isa CompositeException ? first(err.exceptions) : err.task.exception
-        end
-        rethrow(err)
-    finally
-        aggregate && end_progress(io, bar)
+    parallel_foreach_progress(
+        jobs, first.(jobs);
+        io, header = "Downloading artifacts", concurrency = config.concurrency,
+    ) do (name, meta), inner_io
+        _, new = ensure_artifact_installed!(depots, name, meta; io = inner_io, server = config.server)
+        new && push!(new_names, name)
     end
     return new_names
 end

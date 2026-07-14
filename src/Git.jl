@@ -14,8 +14,9 @@ import LibGit2
 using SHA: sha1
 
 using ..Errors: PkgError, pkgerror
-using ..Utils: stderr_f, stdout_f, can_fancyprint, mv_temp_dir_retries,
+using ..Utils: stderr_f, can_fancyprint, mv_temp_dir_retries,
     create_cachedir_tag
+using ..Timing: @timeit, TIMER
 using ..MiniProgressBars
 using ..TreeHash
 using ..EnvFiles: read_project, projectfile_path, RepoPackage
@@ -30,29 +31,27 @@ const RESOLVING_DELTAS_HEADER = "Resolving Deltas:"
 
 function transfer_progress(progress::Ptr{LibGit2.TransferProgress}, p::Any)
     progress = unsafe_load(progress)
-    bar = p[:transfer_progress]
-    @assert bar isa MiniProgressBar
+    io, bar = p[:transfer_progress]::Tuple{IO, MiniProgressBar}
     if progress.total_deltas != 0
-        if bar.header != RESOLVING_DELTAS_HEADER
-            bar.header = RESOLVING_DELTAS_HEADER
-            bar.prev = 0
-        end
+        # show_progress redraws on header change and on backwards progress,
+        # so the phase switch needs no further bookkeeping
+        bar.header = RESOLVING_DELTAS_HEADER
         bar.max = progress.total_deltas
         bar.current = progress.indexed_deltas
     else
         bar.max = progress.total_objects
         bar.current = progress.received_objects
     end
-    show_progress(stdout_f(), bar)
+    show_progress(io, bar)
     return Cint(0)
 end
 
-function transfer_callbacks(fancyprint::Bool, bar::MiniProgressBar)
+function transfer_callbacks(fancyprint::Bool, io::IO, bar::MiniProgressBar)
     return if fancyprint
         LibGit2.Callbacks(
             :transfer_progress => (
                 @cfunction(transfer_progress, Cint, (Ptr{LibGit2.TransferProgress}, Any)),
-                bar,
+                (io, bar),
             )
         )
     else
@@ -135,7 +134,7 @@ function clone(io::IO, url, source_path; header = nothing, credentials = nothing
             end
             LibGit2.GitRepo(source_path)
         else
-            callbacks = transfer_callbacks(fancyprint, bar)
+            callbacks = transfer_callbacks(fancyprint, io, bar)
             mkpath(source_path)
             if depth > 0
                 LibGit2.clone(url, source_path; callbacks, credentials, isbare, depth)
@@ -202,7 +201,7 @@ function fetch(io::IO, repo::LibGit2.GitRepo, remoteurl = nothing; header = noth
                 pkgerror("The command $(cmd) failed, error: $err")
             end
         else
-            callbacks = transfer_callbacks(fancyprint, bar)
+            callbacks = transfer_callbacks(fancyprint, io, bar)
             if depth > 0
                 LibGit2.fetch(repo; remoteurl, callbacks, credentials, refspecs, depth)
             else
@@ -428,7 +427,7 @@ The effectful pre-phase of add-by-url: clone/update the repo cache, resolve
 `rev` (default branch when not given), check the tree out into the package
 store, and read the package's Project.toml for its identity.
 """
-function materialize_repo_package!(
+@timeit TIMER "materialize repo" function materialize_repo_package!(
         depots::DepotStack, url::String;
         rev::Union{Nothing, String} = nothing,
         subdir::Union{Nothing, String} = nothing,

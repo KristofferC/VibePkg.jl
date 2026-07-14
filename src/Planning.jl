@@ -22,6 +22,7 @@ using Base: UUID, SHA1
 
 using ..Errors: pkgerror
 using ..Utils: stderr_f, printpkgstyle, pkgstyle_indent
+using ..Timing: @timeit, TIMER
 import ..FuzzySorting
 using ..Versions: VersionSpec, VersionRange, VersionBound, semver_spec
 using ..EnvFiles
@@ -382,7 +383,7 @@ function materialize_node!(n::Node, registries::Vector{RegistryInstance}, config
     return rp.path
 end
 
-function collect_fixed(env::Environment, nodes::Vector{Node}, request_uuids::Set{UUID}, names::Dict{UUID, String}, julia_version, config::Config, registries::Vector{RegistryInstance}, fetcher)
+@timeit TIMER "collect fixed" function collect_fixed(env::Environment, nodes::Vector{Node}, request_uuids::Set{UUID}, names::Dict{UUID, String}, julia_version, config::Config, registries::Vector{RegistryInstance}, fetcher)
     depots = config.depots
     deps_map = Dict{UUID, Vector{Node}}()
     weak_map = Dict{UUID, Set{UUID}}()
@@ -542,7 +543,7 @@ end
 
 const PKGORIGIN_HAVE_VERSION = :version in fieldnames(Base.PkgOrigin)
 
-function deps_graph(
+@timeit TIMER "deps graph" function deps_graph(
         env::Environment, registries::Vector{RegistryInstance}, uuid_to_name::Dict{UUID, String},
         reqs::Resolve.Requires, fixed::Dict{UUID, Resolve.Fixed}, julia_version,
         installed_only::Bool, config::Config,
@@ -763,7 +764,7 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
 
 # The heart: turn seed nodes into concrete versions + a dependency map.
 # Returns (nodes, final_deps_map, julia_version_stamp).
-function resolve_versions(
+@timeit TIMER "resolve versions" function resolve_versions(
         env::Environment, registries::Vector{RegistryInstance}, nodes::Vector{Node}, julia_version,
         installed_only::Bool, config::Config,
         preferred_versions::Dict{UUID, VersionNumber} = Dict{UUID, VersionNumber}();

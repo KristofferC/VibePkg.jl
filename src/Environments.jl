@@ -16,6 +16,7 @@ using Base: UUID, SHA1
 using SHA: sha1
 
 using ..Errors: pkgerror
+using ..Timing: @timeit, TIMER
 using ..EnvFiles
 using ..EnvFiles: SourceSpec, entry_path, entry_repo_url, entry_repo_rev,
     entry_repo_subdir, with_project,
@@ -158,7 +159,7 @@ function collect_workspace_members!(
     return members
 end
 
-function load_environment_from(project_file::String; depots::DepotStack)
+@timeit TIMER "load environment" function load_environment_from(project_file::String; depots::DepotStack)
     project = read_project(project_file)
     dir = dirname(project_file)
     workspace = Pair{String, Project}[]
@@ -340,7 +341,7 @@ end
 Write `new`'s files where they differ from `old` (value comparison; no-op
 changes touch nothing on disk). Returns whether anything was written.
 """
-function write_environment(
+@timeit TIMER "write environment" function write_environment(
         old::Environment, new::Environment;
         skip_writing_project::Bool = false,
         skip_readonly_check::Bool = false,

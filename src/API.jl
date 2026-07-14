@@ -15,6 +15,7 @@ using Dates: Dates
 
 using ..Errors: PkgError, pkgerror
 using ..Utils: stderr_f, stdout_f, precompile_io, precompile_detach_kwargs
+using ..Timing: @operation, @timeit, TIMER
 import ..Depots
 import ..Stdlibs
 using ..Depots: DepotStack, depot_stack, depots, depots1
@@ -171,7 +172,7 @@ source_fetcher(config::Config) =
 function _auto_precompile(ctx::OpContext, pkgs::Vector{String} = String[])
     should_autoprecompile() || return
     try
-        Base.Precompilation.precompilepkgs(
+        @timeit TIMER "auto precompile" Base.Precompilation.precompilepkgs(
             pkgs; io = precompile_io(ctx.config.io), precompile_detach_kwargs()...
         )
     catch err
@@ -372,7 +373,7 @@ function registry_repo_url(registries::Vector{RegistryInstance}, uuid::UUID)
     return nothing
 end
 
-function add(
+@operation function add(
         specs::Vector{PackageSpec};
         preserve::PreserveLevel = default_preserve(), target::Symbol = :deps,
         prefer_loaded_versions::Bool = in_repl_mode(), io::IO = stderr_f(),
@@ -553,7 +554,7 @@ function _add_to_target(specs::Vector{PackageSpec}, target::Symbol; io::IO)
     return nothing
 end
 
-function develop(
+@operation function develop(
         specs::Vector{PackageSpec};
         shared::Bool = true, preserve::PreserveLevel = default_preserve(), io::IO = stderr_f(),
     )
@@ -667,7 +668,7 @@ function all_requests(env::Environment, mode::Symbol)
     end
 end
 
-function _rm_requests(
+@operation "rm" function _rm_requests(
         reqs::Vector{PackageRequest};
         mode::Union{Symbol, PackageMode} = :project, all_pkgs::Bool = false, io::IO = stderr_f(),
     )
@@ -695,7 +696,7 @@ end
 
 up(pkg::AbstractString; kwargs...) = up([String(pkg)]; kwargs...)
 up(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _up_requests(requests(pkgs); kwargs...)
-function _up_requests(
+@operation "up" function _up_requests(
         reqs::Vector{PackageRequest};
         io::IO = stderr_f(), level::UpgradeLevel = UPLEVEL_MAJOR,
         preserve::Union{Nothing, PreserveLevel} = nothing,
@@ -801,7 +802,7 @@ end
 
 pin(pkg::AbstractString; kwargs...) = pin([String(pkg)]; kwargs...)
 pin(pkgs::AbstractVector{<:AbstractString}; kwargs...) = pin(requests(pkgs); kwargs...)
-function pin(reqs::Vector{PackageRequest}; all_pkgs::Bool = false, workspace::Bool = false, io::IO = stderr_f())
+@operation function pin(reqs::Vector{PackageRequest}; all_pkgs::Bool = false, workspace::Bool = false, io::IO = stderr_f())
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     if all_pkgs
@@ -819,7 +820,7 @@ end
 
 free(pkg::AbstractString; kwargs...) = free([String(pkg)]; kwargs...)
 free(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _free_requests(requests(pkgs); kwargs...)
-function _free_requests(reqs::Vector{PackageRequest}; all_pkgs::Bool = false, workspace::Bool = false, io::IO = stderr_f())
+@operation "free" function _free_requests(reqs::Vector{PackageRequest}; all_pkgs::Bool = false, workspace::Bool = false, io::IO = stderr_f())
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     if all_pkgs
@@ -833,7 +834,7 @@ function _free_requests(reqs::Vector{PackageRequest}; all_pkgs::Bool = false, wo
     return nothing
 end
 
-function resolve(; io::IO = stderr_f())
+@operation function resolve(; io::IO = stderr_f())
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     printpkgstyle(io, :Resolving, "package versions...")
@@ -852,7 +853,7 @@ match the project or was resolved with a different julia minor version.
 `verbose` sends build output of newly-installed packages to
 `stdout`/`stderr` instead of their log files.
 """
-function instantiate(;
+@operation function instantiate(;
         manifest::Union{Nothing, Bool} = nothing, verbose::Bool = false,
         workspace::Bool = false, julia_version_strict::Bool = false,
         update_on_mismatch::Bool = false, io::IO = stderr_f(),
@@ -1011,7 +1012,7 @@ function precompile(f::Function; kwargs...)
     return precompile(; kwargs...)
 end
 
-function precompile(
+@operation function precompile(
         pkgs::Vector{String} = String[];
         strict::Bool = false, timing::Bool = false, workspace::Bool = false,
         io::IO = stderr_f(),
@@ -1019,7 +1020,7 @@ function precompile(
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     Execution.instantiate!(env, ctx.registries, ctx.config; workspace, io)
-    Base.Precompilation.precompilepkgs(
+    @timeit TIMER "precompilepkgs" Base.Precompilation.precompilepkgs(
         pkgs; strict, timing, manifest = workspace, io = precompile_io(io),
         precompile_detach_kwargs()...
     )
@@ -1049,7 +1050,7 @@ status(pkgs::AbstractVector{<:AbstractString}; kwargs...) = status([PackageSpec(
 status(spec::PackageSpec; kwargs...) = status([spec]; kwargs...)
 status(reqs::Vector{PackageRequest}; kwargs...) =
     status([PackageSpec(; name = r.name, uuid = r.uuid) for r in reqs]; kwargs...)
-function status(specs::Vector{PackageSpec} = PackageSpec[]; io::IO = stdout_f(), mode::Union{Symbol, PackageMode} = :project, outdated::Bool = false, deprecated::Bool = false, workspace::Bool = false, compat::Bool = false, extensions::Bool = false, diff::Bool = false)
+@operation function status(specs::Vector{PackageSpec} = PackageSpec[]; io::IO = stdout_f(), mode::Union{Symbol, PackageMode} = :project, outdated::Bool = false, deprecated::Bool = false, workspace::Bool = false, compat::Bool = false, extensions::Bool = false, diff::Bool = false)
     mode = Configs.mode_symbol(mode)
     filter_uuids = UUID[s.uuid for s in specs if s.uuid !== nothing]
     filter_names = String[s.name for s in specs if s.name !== nothing]
@@ -1161,7 +1162,7 @@ function why(specs::Vector{PackageSpec}; kwargs...)
     return nothing
 end
 why(pkg::AbstractString; kwargs...) = why(String(pkg); kwargs...)
-function why(pkg::String; workspace::Bool = false, io::IO = stdout_f())
+@operation function why(pkg::String; workspace::Bool = false, io::IO = stdout_f())
     # a pure manifest query: no OpContext, so a fresh depot is not
     # bootstrapped with registries just to answer it
     env = load_environment(; depots = depot_stack())
@@ -1238,7 +1239,7 @@ dependencies that have one), dependencies first.
 """
 build(pkg::AbstractString; kwargs...) = build([String(pkg)]; kwargs...)
 build(pkgs::AbstractVector{<:AbstractString}; kwargs...) = build(String.(pkgs); kwargs...)
-function build(pkgs::Vector{String}; verbose::Bool = false, io::IO = stderr_f())
+@operation function build(pkgs::Vector{String}; verbose::Bool = false, io::IO = stderr_f())
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     uuids = UUID[]
@@ -1259,7 +1260,7 @@ Test packages in a sandbox (default: the active project itself).
 """
 test(pkg::AbstractString; kwargs...) = test([String(pkg)]; kwargs...)
 test(pkgs::AbstractVector{<:AbstractString}; kwargs...) = test(String.(pkgs); kwargs...)
-function test(
+@operation function test(
         pkgs::Vector{String};
         test_args::Union{Cmd, AbstractVector{<:AbstractString}} = String[],
         julia_args::Union{Cmd, AbstractVector{<:AbstractString}} = String[],
@@ -1334,7 +1335,7 @@ A collection also runs automatically after `up`/`pin`/`free`/`rm` when the
 first depot has not been swept for a week; set `JULIA_PKG_GC_AUTO=false` (or
 call `API.auto_gc(false)`) to disable that.
 """
-function gc(; collect_delay = nothing, verbose::Bool = false, force::Bool = false, io::IO = stderr_f())
+@operation function gc(; collect_delay = nothing, verbose::Bool = false, force::Bool = false, io::IO = stderr_f())
     return GCOps.gc(depot_stack(); collect_delay, verbose, force, io)
 end
 

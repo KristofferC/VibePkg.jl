@@ -683,3 +683,34 @@ end
         end
     end
 end
+
+@testset "transfer_progress callback" begin
+    # locks the payload contract with transfer_callbacks: (io, bar), delivered
+    # in LibGit2's Dict keyed by callback name
+    bar = VibePkg.MiniProgressBars.MiniProgressBar(header = "Cloning:", color = :cyan)
+    buf = IOBuffer()
+    io = IOContext(buf, :displaysize => (24, 80))
+    payload = Dict{Symbol, Any}(:transfer_progress => (io, bar))
+    tp = Ref(LibGit2.TransferProgress(total_objects = 100, received_objects = 42))
+    ret = GC.@preserve tp Git.transfer_progress(
+        Base.unsafe_convert(Ptr{LibGit2.TransferProgress}, tp), payload
+    )
+    @test ret == Cint(0)
+    @test bar.max == 100 && bar.current == 42
+    @test occursin("42.0 %", String(take!(buf)))
+    # delta phase: header switches and the (lower) percentage still redraws
+    tp = Ref(
+        LibGit2.TransferProgress(
+            total_objects = 100, received_objects = 100,
+            total_deltas = 50, indexed_deltas = 10,
+        )
+    )
+    bar.time_shown = 0.0
+    ret = GC.@preserve tp Git.transfer_progress(
+        Base.unsafe_convert(Ptr{LibGit2.TransferProgress}, tp), payload
+    )
+    @test ret == Cint(0)
+    @test bar.header == "Resolving Deltas:"
+    @test bar.max == 50 && bar.current == 10
+    @test occursin("20.0 %", String(take!(buf)))
+end

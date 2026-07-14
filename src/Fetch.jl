@@ -294,6 +294,12 @@ function _download(
                     if total > 0
                         bar.max = total
                         bar.current = now
+                        bar.status = ""
+                        MiniProgressBars.show_progress(io, bar)
+                    elseif now > 0
+                        # no Content-Length (e.g. chunked GitHub archives):
+                        # show the bytes received instead of nothing at all
+                        bar.status = MiniProgressBars.pkg_format_bytes(now; digits = 1)
                         MiniProgressBars.show_progress(io, bar)
                     end
                 end,
@@ -469,6 +475,7 @@ function ensure_package_installed!(
         end
     end
     new = !already[]
+    new && @debug "Installed $name"
     readonly && new && set_readonly(path)
     return path, new
 end

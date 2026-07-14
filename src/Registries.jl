@@ -24,6 +24,7 @@ using FileWatching: mkpidlock
 
 using ..Errors: pkgerror
 using ..Utils: stderr_f, create_cachedir_tag
+using ..Timing: @timeit, TIMER
 using ..Versions: VersionSpec, VersionRange
 using ..Depots: DepotStack, depots, depots1, registries_dir, scratchspaces_dir, atomic_toml_write
 using ..Fetch: uncompress_registry, get_extract_cmd, read_tarball_simple
@@ -285,7 +286,7 @@ mutable struct RegistryInstance
     loaded::Union{Nothing, LoadedRegistry}
 end
 
-function _load_registry(r::RegistryInstance)::LoadedRegistry
+@timeit TIMER "parse registry" function _load_registry(r::RegistryInstance)::LoadedRegistry
     in_memory_registry = if r.compressed_file !== nothing
         uncompress_registry(joinpath(dirname(r.path), r.compressed_file))
     else
@@ -565,7 +566,7 @@ whether packed `Name.toml` + tarball registries are visible (the Config
 layer derives it from `JULIA_PKG_SERVER`/`JULIA_PKG_UNPACK_REGISTRY`); a
 packed registry shadows an unpacked directory of the same name.
 """
-function reachable_registries(d::DepotStack; read_from_tarball::Bool = true)
+@timeit TIMER "reachable registries" function reachable_registries(d::DepotStack; read_from_tarball::Bool = true)
     registries = RegistryInstance[]
     for depot in depots(d)
         isdir(depot) || continue
@@ -667,7 +668,7 @@ end
 # Download registry `uuid` at `hash` from the server, verify the tree hash
 # of the decompressed tarball, and install it packed (Name.toml stub +
 # Name.tar.gz) into `depot`.
-function install_server_registry!(depot::String, server::String, uuid::UUID, hash::SHA1; io::IO = stderr_f())
+@timeit TIMER "install registry" function install_server_registry!(depot::String, server::String, uuid::UUID, hash::SHA1; io::IO = stderr_f())
     tmp = tempname()
     try
         Fetch.download("$server/registry/$uuid/$hash", tmp; depots = DepotStack([depot]))
@@ -997,7 +998,7 @@ named registries (`nothing` updates all). Registries whose entry in the
 persisted update log is more recent than `update_cooldown` are skipped
 (Pkg parity: `add` passes one day, explicit updates the ~zero default).
 """
-function update_registries!(
+@timeit TIMER "update registries" function update_registries!(
         depots_arg::DepotStack; io::IO = stderr_f(),
         names::Union{Nothing, Vector{String}} = nothing,
         server::Union{Nothing, String} = Fetch.pkg_server(),
