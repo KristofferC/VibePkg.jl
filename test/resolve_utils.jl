@@ -1,0 +1,191 @@
+# Resolver test helpers ported from Pkg.jl (test/resolve_utils.jl) and adapted
+# to VibePkg's Resolve API. Not a standalone test file — included by resolve.jl.
+
+module ResolveUtils
+
+using Test
+using UUIDs
+using VibePkg.Resolve
+using VibePkg.Resolve: add_reqs!, simplify_graph!, sanity_check, resolve, Graph,
+    pkgID, uuid_julia, Fixed, Requires
+using VibePkg.Versions: VersionSpec, VersionRange
+
+export sanity_tst, resolve_tst, VERBOSE
+
+# print info, stats etc.
+const VERBOSE = false
+
+# auxiliary functions
+const uuid_package = UUID("cfb74b52-ec16-5bb7-a574-95d9e393895e")
+pkguuid(p::String) = uuid5(uuid_package, p)
+function storeuuid(p::String, uuid_to_name::Dict{UUID, String})
+    uuid = p == "julia" ? uuid_julia : pkguuid(p)
+    if haskey(uuid_to_name, uuid)
+        @assert uuid_to_name[uuid] == p
+    else
+        uuid_to_name[uuid] = p
+    end
+    return uuid
+end
+wantuuids(want_data) = Dict{UUID, VersionNumber}(pkguuid(p) => v for (p, v) in want_data)
+
+"""
+    graph = graph_from_data(deps_data)
+
+Generate a package dependency graph from the entries in the array `deps_data`, where each entry
+is an array of the form `["PkgName", v"x.y.z", "DependencyA", v"Ax.Ay.Az", ...]`.
+This states that the package "PkgName" with version `v"x.y.z"` depends on "DependencyA" with the
+specified compatibility information. The last entry of the array can optionally be `:weak`.
+"""
+function graph_from_data(deps_data)
+    uuid_to_name = Dict{UUID, String}()
+    uuid(p) = storeuuid(p, uuid_to_name)
+    fixed = Dict{UUID, Fixed}()
+
+    deps = Dict{String, Dict{VersionNumber, Dict{String, VersionSpec}}}()
+    deps_w = Dict{String, Dict{VersionNumber, Set{String}}}()
+    for d in deps_data
+        p, vn, r = d[1], d[2], d[3:end]
+        if !haskey(deps, p)
+            deps[p] = Dict{VersionNumber, Dict{String, VersionSpec}}()
+        end
+        if !haskey(deps[p], vn)
+            deps[p][vn] = Dict{String, VersionSpec}()
+        end
+        isempty(r) && continue
+        rp = r[1]
+        weak = length(r) > 1 && r[end] == :weak
+        rvs = VersionSpec(r[2:(end - weak)]...)
+        deps[p][vn][rp] = rvs
+        if weak
+            # same as push!(deps_w[p][vn], rp) but create keys as needed
+            push!(get!(Set{String}, get!(Dict{VersionNumber, Set{String}}, deps_w, p), vn), rp)
+        end
+    end
+    # Build pkg_versions map
+    pkg_versions = Dict{UUID, Vector{VersionNumber}}()
+    for (p, preq) in deps
+        u = uuid(p)
+        pkg_versions[u] = sort!(collect(keys(preq)))
+    end
+
+    # Convert per-version data to compressed format
+    # For tests, each version gets its own VersionRange
+    all_deps_compressed = Dict{UUID, Dict{VersionRange, Set{UUID}}}()
+    all_compat_compressed = Dict{UUID, Dict{VersionRange, Dict{UUID, VersionSpec}}}()
+    all_weak_deps_compressed = Dict{UUID, Dict{VersionRange, Set{UUID}}}()
+    all_weak_compat_compressed = Dict{UUID, Dict{VersionRange, Dict{UUID, VersionSpec}}}()
+
+    for (p, preq) in deps
+        u = uuid(p)
+        all_deps_compressed[u] = Dict{VersionRange, Set{UUID}}()
+        all_compat_compressed[u] = Dict{VersionRange, Dict{UUID, VersionSpec}}()
+        all_weak_deps_compressed[u] = Dict{VersionRange, Set{UUID}}()
+        all_weak_compat_compressed[u] = Dict{VersionRange, Dict{UUID, VersionSpec}}()
+
+        for (vn, vreq) in preq
+            # Create a single-version range for this version
+            vrange = VersionRange(vn, vn)
+            deps_set = Set{UUID}()
+            compat_dict = Dict{UUID, VersionSpec}()
+            weak_deps_set = Set{UUID}()
+            weak_compat_dict = Dict{UUID, VersionSpec}()
+
+            for (rp, rvs) in vreq
+                dep_uuid = uuid(rp)
+                push!(deps_set, dep_uuid)
+                compat_dict[dep_uuid] = rvs
+
+                # weak dependency?
+                if haskey(deps_w, p) && haskey(deps_w[p], vn) && (rp ∈ deps_w[p][vn])
+                    push!(weak_deps_set, dep_uuid)
+                    weak_compat_dict[dep_uuid] = rvs
+                end
+            end
+
+            all_deps_compressed[u][vrange] = deps_set
+            all_compat_compressed[u][vrange] = compat_dict
+            if !isempty(weak_deps_set)
+                all_weak_deps_compressed[u][vrange] = weak_deps_set
+                all_weak_compat_compressed[u][vrange] = weak_compat_dict
+            end
+        end
+    end
+
+    # Wrap in vectors for multi-registry support (tests simulate a single registry)
+    all_deps_compressed_vec = Dict{UUID, Vector{Dict{VersionRange, Set{UUID}}}}(
+        u => [d] for (u, d) in all_deps_compressed
+    )
+    all_compat_compressed_vec = Dict{UUID, Vector{Dict{VersionRange, Dict{UUID, VersionSpec}}}}(
+        u => [c] for (u, c) in all_compat_compressed
+    )
+    all_weak_deps_compressed_vec = Dict{UUID, Vector{Dict{VersionRange, Set{UUID}}}}(
+        u => [d] for (u, d) in all_weak_deps_compressed
+    )
+    all_weak_compat_compressed_vec = Dict{UUID, Vector{Dict{VersionRange, Dict{UUID, VersionSpec}}}}(
+        u => [c] for (u, c) in all_weak_compat_compressed
+    )
+
+    # Create pkg_versions_per_registry (single registry with all versions)
+    pkg_versions_per_registry = Dict{UUID, Vector{Set{VersionNumber}}}(
+        u => [Set(versions)] for (u, versions) in pkg_versions
+    )
+
+    return Graph(all_deps_compressed_vec, all_compat_compressed_vec, all_weak_deps_compressed_vec, all_weak_compat_compressed_vec, pkg_versions, pkg_versions_per_registry, uuid_to_name, Requires(), fixed, VERBOSE)
+end
+function reqs_from_data(reqs_data, graph::Graph)
+    reqs = Dict{UUID, VersionSpec}()
+    function uuid_check(p)
+        uuid = pkguuid(p)
+        @assert graph.data.uuid_to_name[uuid] == p
+        return uuid
+    end
+    for r in reqs_data
+        p = uuid_check(r[1])
+        reqs[p] = VersionSpec(r[2:end])
+    end
+    return reqs
+end
+function sanity_tst(deps_data, expected_result; pkgs = [])
+    graph = graph_from_data(deps_data)
+    id(p) = pkgID(pkguuid(p), graph)
+    result = sanity_check(graph, Set(pkguuid(p) for p in pkgs), VERBOSE)
+
+    length(result) == length(expected_result) || return false
+    expected_result_uuid = [(id(p), vn) for (p, vn) in expected_result]
+    for r in result
+        r ∈ expected_result_uuid || return false
+    end
+    return true
+end
+sanity_tst(deps_data; kw...) = sanity_tst(deps_data, []; kw...)
+
+function resolve_tst(deps_data, reqs_data, want_data = nothing; validate_versions = true)
+    graph = graph_from_data(deps_data)
+    reqs = reqs_from_data(reqs_data, graph)
+    add_reqs!(graph, reqs)
+    simplify_graph!(graph; validate_versions)
+    want = resolve(graph)
+
+    id(u) = pkgID(u, graph)
+    wd = wantuuids(want_data)
+    if want ≠ wd
+        for (u, vn) in want
+            if u ∉ keys(wd)
+                @info "resolver decided to install $(id(u)) (v$vn), package wasn't expected"
+            elseif vn ≠ wd[u]
+                @info "version mismatch for $(id(u)), resolver wants v$vn, expected v$(wd[u])"
+            end
+        end
+        for (u, vn) in wd
+            if u ∉ keys(want)
+                @info "was expecting the resolver to install $(id(u)) (v$vn)"
+            end
+        end
+        return false
+    else
+        return true
+    end
+end
+
+end

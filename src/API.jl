@@ -953,9 +953,10 @@ end
 Instantiate, then precompile the environment (delegates to
 `Base.Precompilation`, which owns precompilation on Julia 1.12+). With
 `pkgs` only those packages (and their dependencies) precompile. Errors only
-throw for direct dependencies unless `strict = true`; `timing = true`
-reports per-package compile time; `workspace = true` instantiates and
-precompiles across all workspace members.
+throw for explicitly requested `pkgs` (on Julia 1.12 also for any direct
+dependency) unless `strict = true`, which makes every failure throw;
+`timing = true` reports per-package compile time; `workspace = true`
+instantiates and precompiles across all workspace members.
 """
 precompile(pkg::AbstractString; kwargs...) = precompile([String(pkg)]; kwargs...)
 precompile(pkgs::AbstractVector{<:AbstractString}; kwargs...) = precompile(String.(pkgs); kwargs...)
@@ -1160,39 +1161,39 @@ function why(pkg::String; workspace::Bool = false, io::IO = stdout_f())
             push!(queue, parent)
         end
     end
-    name(uuid) = env.manifest[uuid].name
-    children(uuid) = sort!(filter(in(relevant), collect(values(env.manifest[uuid].deps))); by = name)
     # each package is expanded at most once; later occurrences print as
     # `Name (*)` (this also guards against dependency cycles); branches
-    # terminating in the queried package get a colored arrowhead
+    # terminating in the queried package get a colored arrowhead. Rendered by a
+    # top-level recursion to avoid a boxed self-referential closure.
     expanded = Set{UUID}()
-    function print_node(uuid, prefix, branch, childprefix)
-        kids = children(uuid)
-        print(io, prefix, branch)
-        if uuid == target
-            printstyled(io, "▶ "; color = :green, bold = true)
-        elseif !isempty(branch)
-            print(io, " ")
-        end
-        if !isempty(kids) && uuid in expanded
-            println(io, name(uuid), " (*)")
-            return
-        end
-        println(io, name(uuid))
-        push!(expanded, uuid)
-        for (i, kid) in enumerate(kids)
-            last = i == length(kids)
-            print_node(
-                kid, childprefix, last ? "└─" : "├─",
-                childprefix * (last ? "   " : "│  ")
-            )
-        end
-        return
-    end
-    for root in sort!(filter(in(relevant), collect(roots)); by = name)
-        print_node(root, "  ", "", "  ")
+    for root in sort!(filter(in(relevant), collect(roots)); by = u -> env.manifest[u].name)
+        why_print_node(io, env, relevant, target, expanded, root, "  ", "", "  ")
     end
     return nothing
+end
+
+function why_print_node(io, env, relevant, target::UUID, expanded, uuid, prefix, branch, childprefix)
+    kids = sort!(filter(in(relevant), collect(values(env.manifest[uuid].deps))); by = u -> env.manifest[u].name)
+    print(io, prefix, branch)
+    if uuid == target
+        printstyled(io, "▶ "; color = :green, bold = true)
+    elseif !isempty(branch)
+        print(io, " ")
+    end
+    if !isempty(kids) && uuid in expanded
+        println(io, env.manifest[uuid].name, " (*)")
+        return
+    end
+    println(io, env.manifest[uuid].name)
+    push!(expanded, uuid)
+    for (i, kid) in enumerate(kids)
+        last = i == length(kids)
+        why_print_node(
+            io, env, relevant, target, expanded, kid, childprefix,
+            last ? "└─" : "├─", childprefix * (last ? "   " : "│  "),
+        )
+    end
+    return
 end
 
 """

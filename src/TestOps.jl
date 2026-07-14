@@ -114,7 +114,10 @@ function force_latest_compat(
         end
         spec = intersect(existing, semver_spec(">= $(floor.major).$(floor.minor).$(floor.patch)"))
         isempty(spec) && continue
-        compat[name] = EnvFiles.Compat(spec, ">= $floor")
+        # build the compat from the spec's own string so value and string stay
+        # consistent (the single-arg constructor derives the value from the
+        # string — see destructure_project's consistency check)
+        compat[name] = EnvFiles.Compat(string(spec))
     end
     return with_project(project; compat)
 end
@@ -242,14 +245,38 @@ function run_test_process(
         "JULIA_PROJECT" => nothing,
     )
     printpkgstyle(io, :Testing, "Running tests...")
-    # the subprocess writes through the op's io so `io = devnull` silences
-    # the whole run (load-time precompilation included); unwrapping the
-    # IOContext hands an interactive child the real terminal handle
-    out = io isa IOContext ? io.io : io
-    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out))
+    p, interrupted = subprocess_handler(cmd, io, "Testing of $name interrupted")
+    interrupted && throw(InterruptException())
     success(p) || return (name, p)
     printpkgstyle(io, :Testing, "$name tests passed")
     return nothing
+end
+
+# Run `cmd` and forward a ^C to the child. At the REPL the terminal is in raw
+# mode, so ^C only raises an `InterruptException` in this process and the child
+# never sees a signal — without forwarding it would be SIGKILLed by process
+# cleanup and never get to report. Returns `(process, interrupted::Bool)`.
+function subprocess_handler(cmd::Cmd, io::IO, error_msg::String)
+    # the subprocess writes through the op's io so `io = devnull` silences the
+    # whole run; unwrapping the IOContext hands an interactive child the real
+    # terminal handle
+    out = io isa IOContext ? io.io : io
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out), wait = false)
+    interrupted = false
+    try
+        wait(p)
+    catch e
+        e isa InterruptException || rethrow()
+        interrupted = true
+        printpkgstyle(io, :Testing, "$error_msg\n", color = Base.error_color())
+        # Windows `kill` cannot deliver SIGINT (it terminates immediately)
+        Sys.iswindows() || kill(p, Base.SIGINT)
+        # give the child's handler time to report + exit, then force-kill
+        if timedwait(() -> !process_running(p), 4) == :timed_out
+            kill(p, Base.SIGKILL)
+        end
+    end
+    return p, interrupted
 end
 
 function test!(
@@ -289,6 +316,13 @@ function test!(
     member = findfirst(m -> Environments.samefile_or_equal(dirname(m.first), test_dir), env.workspace)
     if member !== nothing
         test_env = Environments.load_environment_from(env.workspace[member].first; depots)
+        # Pkg parity: resolve the shared workspace manifest first so the test
+        # project's dependencies are present, then run it in place.
+        if Environments.is_manifest_current(test_env) !== true
+            resolved = Planning.plan_resolve(test_env, registries, config)
+            write_environment(test_env, resolved)
+            test_env = Environments.load_environment_from(env.workspace[member].first; depots)
+        end
         installed = Execution.instantiate!(test_env, registries, config; io)
         isempty(installed) || BuildOps.build!(test_env, depots, [i.uuid for i in installed]; io)
         return run_test_process(name, test_dir, runtests, source; coverage, julia_args, test_args, autoprecompile, io)

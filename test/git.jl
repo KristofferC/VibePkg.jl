@@ -657,3 +657,29 @@ end
         @test SPECIALSETS_UUID in values(planned.manifest[REWRITE_UUID].deps)
     end
 end
+
+# Pkg.jl new.jl "downloads with JULIA_PKG_USE_CLI_GIT" — with the env var set,
+# repo materialization goes through the command-line git instead of libgit2 and
+# still installs a working, read-only source tree. (VibePkg gates only on
+# JULIA_PKG_USE_CLI_GIT; it has no use_git_for_all_downloads/only-tarballs kwargs.)
+@testset "materialize via CLI git" begin
+    if Sys.which("git") === nothing
+        @test_skip "git CLI not available"
+    else
+        @test Git.use_cli_git() == false                    # default is libgit2
+        withenv("JULIA_PKG_USE_CLI_GIT" => "true") do
+            @test Git.use_cli_git() == true
+            mktempdir() do dir
+                src = make_git_package(dir)                  # a local git repo package
+                depot = mkpath(joinpath(dir, "depot"))
+                depots = depot_stack([depot])
+                rp = quiet(() -> Git.materialize_repo_package!(depots, src; io = devnull))
+                @test rp !== nothing
+                envdir = mkpath(joinpath(dir, "env"))
+                env = load_environment(envdir; depots)
+                planned = quiet(() -> plan_add(env, RegistryInstance[], Config(depots), [rp]; julia_version = VERSION))
+                @test is_repo_tracked(planned.manifest[GITPKG_UUID])
+            end
+        end
+    end
+end

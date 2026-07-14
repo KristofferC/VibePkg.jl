@@ -17,6 +17,7 @@ using VibePkg.Planning: PackageRequest
 using VibePkg.EnvFiles: entry_version, is_path_tracked, is_registry_tracked
 using VibePkg.Errors: PkgError
 using VibePkg.Display: print_env_diff, print_status
+using VibePkg.Execution: instantiate!, manifest_matches_project
 
 # reuses make_test_registry from registries.jl (Example: 0.5.0, 0.5.1, 1.0.0-yanked)
 
@@ -890,6 +891,282 @@ end
             write_environment(env, planned)
             env = load_environment(envdir; depots)
             @test haskey(env.manifest, b1_uuid) && haskey(env.manifest, b2_uuid)
+        end
+    end
+end
+
+# Pkg.jl new.jl "update: input checking" — updating a named package that is
+# not present in the manifest is an error.
+@testset "up of a package not in the manifest errors" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        env = load_environment(mktempdir(); depots)
+        @test_throws PkgError plan_up(env, regs, Config(depots), [PackageRequest("Example")])
+    end
+end
+
+# Pkg.jl new.jl "update/instantiate: input checking" — a manifest that
+# references a package with no registry entry cannot be resolved (up) or
+# materialized (instantiate).
+@testset "up/instantiate reject an unregistered manifest UUID" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            ghost = "12345678-1234-1234-1234-123456789abc"
+            write(
+                joinpath(envdir, "Project.toml"), """
+                [deps]
+                Ghost = "$ghost"
+                """
+            )
+            write(
+                joinpath(envdir, "Manifest.toml"), """
+                julia_version = "$VERSION"
+                manifest_format = "2.0"
+
+                [[deps.Ghost]]
+                uuid = "$ghost"
+                version = "1.0.0"
+                git-tree-sha1 = "0000000000000000000000000000000000000000"
+                """
+            )
+            env = load_environment(envdir; depots)
+            # up can't resolve a package the registry has never heard of...
+            @test_throws VibePkg.Resolve.ResolverError plan_up(env, regs, Config(depots))
+            # ...and instantiate refuses to materialize it.
+            @test_throws PkgError instantiate!(env, regs, Config(depots); io = devnull)
+        end
+    end
+end
+
+# Pkg.jl api.jl "`[compat]` entries for `julia`" — developing/adding a path
+# package whose `[compat] julia` excludes the running Julia is rejected.
+@testset "path package with incompatible [compat] julia errors" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            badpkg = joinpath(dir, "FarPast")
+            mkpath(joinpath(badpkg, "src"))
+            write(
+                joinpath(badpkg, "Project.toml"), """
+                name = "FarPast"
+                uuid = "aaaaaaaa-0000-0000-0000-000000000001"
+                version = "0.1.0"
+
+                [compat]
+                julia = "1.0 - 1.5"
+                """
+            )
+            write(joinpath(badpkg, "src", "FarPast.jl"), "module FarPast end\n")
+            env = load_environment(mkpath(joinpath(dir, "env")); depots)
+            err = try
+                plan_develop(env, regs, Config(depots), badpkg)
+                nothing
+            catch e
+                e
+            end
+            @test err isa PkgError
+            @test occursin("julia version requirement", err.msg)
+        end
+    end
+end
+
+# Pkg.jl api.jl "resolve error shows yanked packages warning" — when a resolve
+# fails and the manifest still references registry versions that were yanked,
+# the error is accompanied by a warning naming those yanked versions.
+@testset "yanked versions named in a failed resolve" begin
+    mktempdir() do depot
+        make_test_registry(depot)               # Example 1.0.0 is yanked
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            write(joinpath(envdir, "Project.toml"), "[deps]\nExample = \"$EXAMPLE_UUID\"\n")
+            write(
+                joinpath(envdir, "Manifest.toml"), """
+                julia_version = "$VERSION"
+                manifest_format = "2.0"
+
+                [[deps.Example]]
+                uuid = "$EXAMPLE_UUID"
+                version = "1.0.0"
+                git-tree-sha1 = "3333333333333333333333333333333333333333"
+                """
+            )
+            env = load_environment(envdir; depots)
+            buf = IOBuffer()
+            err = Base.ScopedValues.with(VibePkg.Utils.DEFAULT_IO => buf) do
+                try
+                    # 0.9.0 doesn't exist, so the resolve is unsatisfiable
+                    plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.9.0")])
+                    nothing
+                catch e
+                    e
+                end
+            end
+            @test err isa VibePkg.Resolve.ResolverError
+            out = String(take!(buf))
+            @test occursin("yanked", out) && occursin("Example", out)
+        end
+    end
+end
+
+# Pkg.jl pkg.jl "Suggest `Pkg.develop` instead of `Pkg.add`" — adding a bare
+# local path (a directory that is not an installable registered package) errors
+# rather than silently doing the wrong thing.
+@testset "add of a bare local path errors" begin
+    mktempdir() do dir
+        touch(joinpath(dir, "Project.toml"))
+        @test_throws PkgError VibePkg.add(; path = dir, io = devnull)
+    end
+end
+
+# Pkg.jl pkg.jl "issue #2191: better diagnostic for missing package" — a
+# developed path dependency whose directory has been deleted makes resolve
+# fail with a PkgError instead of some opaque internal error.
+@testset "resolve errors when a dev'd path is gone" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            B = joinpath(dir, "B")
+            mkpath(joinpath(B, "src"))
+            write(
+                joinpath(B, "Project.toml"), """
+                name = "B"
+                uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(B, "src", "B.jl"), "module B end\n")
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            write_environment(env, plan_develop(env, regs, Config(depots), B))
+            env = load_environment(envdir; depots)
+            Base.rm(B; recursive = true)                    # the source disappears
+            @test_throws PkgError plan_resolve(env, regs, Config(depots))
+        end
+    end
+end
+
+# Pkg.jl manifests.jl "no mismatch: update_on_mismatch=true is a no-op" —
+# manifest_matches_project (the predicate instantiate(update_on_mismatch)
+# consults) is true for a freshly resolved env and false once the manifest
+# records a different julia minor version.
+@testset "manifest_matches_project predicate" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            write(joinpath(envdir, "Project.toml"), "[deps]\nExample = \"$EXAMPLE_UUID\"\n")
+            env = load_environment(envdir; depots)
+            write_environment(env, plan_add(env, regs, Config(depots), [PackageRequest("Example")]))
+            env = load_environment(envdir; depots)
+            @test manifest_matches_project(env)             # fresh resolve: matches
+
+            # rewrite the manifest with a stale julia version → no longer matches
+            # (the stamped version is dropbuild(VERSION), not VERSION, so use
+            # what the manifest actually records)
+            man = read(env.manifest_file, String)
+            stamped = env.manifest.julia_version
+            other = VersionNumber(VERSION.major, VERSION.minor == 0 ? 99 : VERSION.minor - 1, 0)
+            newman = replace(man, "julia_version = \"$stamped\"" => "julia_version = \"$other\"")
+            @assert newman != man
+            write(env.manifest_file, newman)
+            env = load_environment(envdir; depots)
+            @test !manifest_matches_project(env)
+        end
+    end
+end
+
+# Pkg.jl new.jl "relative depot path" — a relative entry in the depot stack is
+# usable: registries under it are reachable and resolution works from that cwd.
+@testset "relative depot path" begin
+    mktempdir() do dir
+        cd(dir) do
+            mkpath("reldepot")
+            make_test_registry("reldepot")          # registry lives under the relative depot
+            depots = depot_stack(["reldepot"])       # a RELATIVE depot entry
+            regs = reachable_registries(depots)
+            @test !isempty(regs)
+            envdir = mkpath("env")
+            env = load_environment(envdir; depots)
+            planned = plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.0")])
+            @test entry_version(planned.manifest[EXAMPLE_UUID]) == v"0.5.0"
+        end
+    end
+end
+
+# Pkg.jl#4459 / issue #3766 — developing a package whose `[weakdeps]` references
+# an unregistered / non-existent UUID must succeed (the weak dependency is not
+# resolved against a registry).
+@testset "develop with an unregistered weakdep uuid" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            wd_uuid = UUID("aaaa1111-0000-0000-0000-000000000001")
+            p = joinpath(dir, "WD")
+            mkpath(joinpath(p, "src"))
+            write(
+                joinpath(p, "Project.toml"), """
+                name = "WD"
+                uuid = "$wd_uuid"
+                version = "0.1.0"
+
+                [weakdeps]
+                Ghost = "deadbeef-0000-0000-0000-00000000dead"
+                """
+            )
+            write(joinpath(p, "src", "WD.jl"), "module WD end\n")
+            env = load_environment(mkpath(joinpath(dir, "env")); depots)
+            planned = plan_develop(env, regs, Config(depots), p)
+            @test is_path_tracked(planned.manifest[wd_uuid])
+        end
+    end
+end
+
+# Pkg.jl#1989 / #4435 — status in manifest mode filtered by a package name shows
+# that package together with its dependencies.
+@testset "status manifest filter shows a package's deps" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            p = joinpath(dir, "MyDev")
+            mkpath(joinpath(p, "src"))
+            write(
+                joinpath(p, "Project.toml"), """
+                name = "MyDev"
+                uuid = "deadbeef-dead-beef-dead-beefdeadbeef"
+                version = "0.1.0"
+
+                [deps]
+                Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+
+                [compat]
+                Example = "0.5"
+                """
+            )
+            write(joinpath(p, "src", "MyDev.jl"), "module MyDev end\n")
+            env = load_environment(mkpath(joinpath(dir, "env")); depots)
+            write_environment(env, plan_develop(env, regs, Config(depots), p))
+            env = load_environment(joinpath(dir, "env"); depots)
+            s = sprint(io -> print_status(io, env; manifest_mode = true, filter_names = ["MyDev"]))
+            @test occursin("MyDev", s)
+            @test occursin("Example", s)          # the filtered package's dependency
         end
     end
 end

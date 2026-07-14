@@ -648,20 +648,20 @@ end
 # data (read_tarball_simple has no skip support), so non-matches are
 # drained to devnull.
 function read_file_from_tarball(tarball::String, wanted::String)
-    content = nothing
+    content = Ref{Union{Nothing, String}}(nothing)      # Ref: mutated in the callback, not reassigned
     buf = Vector{UInt8}(undef, Tar.DEFAULT_BUFFER_SIZE)
     io = IOBuffer()
     open(get_extract_cmd(tarball)) do tar
         read_tarball_simple(x -> true, tar; buf) do hdr
-            if hdr.path == wanted && content === nothing
+            if hdr.path == wanted && content[] === nothing
                 Tar.read_data(tar, io; size = hdr.size, buf)
-                content = String(take!(io))
+                content[] = String(take!(io))
             else
                 Tar.read_data(tar, devnull; size = hdr.size, buf)
             end
         end
     end
-    return content
+    return content[]
 end
 
 # Download registry `uuid` at `hash` from the server, verify the tree hash

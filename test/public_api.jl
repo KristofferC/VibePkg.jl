@@ -305,8 +305,110 @@ end
 
             io = IOBuffer()
             VibePkg.precompile(; strict = true, timing = true, io)
+            # Pkg.jl api.jl "timing mode" — timing = true prints a "Precompiling"
+            # banner with a per-package elapsed time and the package name.
+            pcout = String(take!(io))
+            @test occursin("Precompiling", pcout)
+            @test occursin(r"\d+\.\d+ ?m?s", pcout)      # e.g. "181.3 ms" or "0.5 s"
+            @test occursin("PrecompPkg", pcout)
+
             VibePkg.precompile("PrecompPkg"; io = devnull)                     # positional form
             VibePkg.precompile(PackageSpec(name = "PrecompPkg"); io = devnull) # spec form
+
+            # Pkg.jl api.jl "delayed precompilation with do-syntax" — auto-
+            # precompilation is deferred while the do-block runs, then restored,
+            # so batched manifest changes precompile once at block end.
+            @test VibePkg.API.AUTO_PRECOMPILE_ENABLED[]           # enabled to start
+            observed = Ref(true)
+            VibePkg.precompile(io = devnull) do
+                observed[] = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            end
+            @test observed[] == false                             # deferred inside
+            @test VibePkg.API.AUTO_PRECOMPILE_ENABLED[]           # restored after
+        end
+    end
+end
+
+# Pkg.jl api.jl "instantiate" — instantiate triggers precompilation of the
+# environment when auto-precompilation is enabled.
+@testset "instantiate precompiles" begin
+    mktempdir() do dir
+        with_api_env(dir) do proj, depot
+            pkg = joinpath(dir, "InstPCPkg")
+            mkpath(joinpath(pkg, "src"))
+            write(
+                joinpath(pkg, "Project.toml"), """
+                name = "InstPCPkg"
+                uuid = "eeeeeeee-1111-2222-3333-444444444444"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(pkg, "src", "InstPCPkg.jl"), "module InstPCPkg end\n")
+            depots = depot_stack([depot])
+            env = load_environment(proj; depots)
+            write_environment(env, Planning.plan_develop(env, RegistryInstance[], Config(depots), pkg))
+
+            io = IOBuffer()
+            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+                VibePkg.instantiate(io = io)         # freshly dev'd → must precompile it
+            end
+            @test occursin("Precompiling", String(take!(io)))
+        end
+    end
+end
+
+# Pkg.jl api.jl "Pkg.precompile" (no-op detection) + "waiting for trailing
+# tasks" — precompiling twice is a no-op the second time; precompile-time
+# stderr from a package (trailing IO) is surfaced; and a package that errors
+# during precompilation soft-errors under the default but throws under strict.
+@testset "precompile behaviors" begin
+    mktempdir() do dir
+        with_api_env(dir) do proj, depot
+            depots = depot_stack([depot])
+            n = Ref(0)
+            function devgen(name, body)
+                n[] += 1
+                p = joinpath(dir, name)
+                mkpath(joinpath(p, "src"))
+                write(joinpath(p, "Project.toml"), "name = \"$name\"\nuuid = \"aaaaaaaa-0000-0000-0000-00000000000$(n[])\"\nversion = \"0.1.0\"\n")
+                write(joinpath(p, "src", "$name.jl"), body)
+                env = load_environment(proj; depots)
+                write_environment(env, Planning.plan_develop(env, RegistryInstance[], Config(depots), p))
+                return p
+            end
+
+            # no-op detection: first precompile compiles, second does nothing
+            devgen("OkPkg", "module OkPkg end\n")
+            io = IOBuffer()
+            VibePkg.precompile(; io)
+            @test occursin("Precompiling", String(take!(io)))
+            io = IOBuffer()
+            VibePkg.precompile(; io)
+            @test !occursin("Precompiling", String(take!(io)))     # already precompiled
+
+            # trailing IO: a package that writes to stderr during precompilation
+            # has that output surfaced in the precompile log
+            devgen("TrailPkg", "module TrailPkg\nprintln(stderr, \"waiting for IO to finish\")\nsleep(1)\nend\n")
+            io = IOBuffer()
+            VibePkg.precompile(; io)
+            s = String(take!(io))
+            @test occursin("Precompiling", s)
+            @test occursin("waiting for IO to finish", s)
+
+            # broken dep: an explicitly requested package that errors during
+            # precompilation makes precompile raise, and the error names the
+            # offending package. (Requested explicitly because on Julia 1.13+
+            # Base.Precompilation only throws for requested packages or under
+            # `strict`; a bare `precompile()` soft-errors.)
+            devgen("BrokenDep", "module BrokenDep\nerror(\"boom\")\nend\n")
+            err = try
+                VibePkg.precompile(["BrokenDep"]; io = devnull)
+                nothing
+            catch e
+                e
+            end
+            @test err !== nothing
+            @test occursin("BrokenDep", sprint(showerror, err))
         end
     end
 end

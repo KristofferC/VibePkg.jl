@@ -47,6 +47,23 @@ jobs:
           Pkg.develop(path = pwd())
           include(joinpath(pwd(), "test", "jet.jl"))
 
+  aqua:
+    name: Aqua.jl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v3
+      - name: Aqua tests
+        shell: julia --color=yes --project=@aqua {0}
+        run: |
+          using Pkg
+          Pkg.add(PackageSpec(name = "Aqua", version = "0.8"))
+          Pkg.develop(path = pwd())
+          include(joinpath(pwd(), "test", "aqua.jl"))
+
   explicit-imports:
     name: ExplicitImports.jl
     runs-on: ubuntu-latest

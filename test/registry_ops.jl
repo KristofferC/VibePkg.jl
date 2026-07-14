@@ -557,3 +557,28 @@ end
         @test haskey(Registries.registry_info(r, r[UUID("7876af07-990d-54b4-ab0e-23690620f79a")]).version_info, v"0.6.0")
     end
 end
+
+# Pkg.jl registry.jl "multiple registries in one command" — the variadic
+# Registry.add / Registry.rm operate on several registries in a single call.
+@testset "add/rm multiple registries in one call" begin
+    mktempdir() do dir
+        mkreg(name, uuid) = (
+            src = mkpath(joinpath(dir, name));
+            write(
+                joinpath(src, "Registry.toml"),
+                "name = \"$name\"\nuuid = \"$uuid\"\nrepo = \"https://example.com/$name.git\"\n\n[packages]\n",
+            );
+            src
+        )
+        s1 = mkreg("RegOne", "11111111-1111-1111-1111-111111111111")
+        s2 = mkreg("RegTwo", "22222222-2222-2222-2222-222222222222")
+
+        VibePkg.Registry.add(s1, s2; io = devnull)          # one call → two registries
+        out = sprint(io -> VibePkg.Registry.status(; io))
+        @test occursin("RegOne", out) && occursin("RegTwo", out)
+
+        VibePkg.Registry.rm("RegOne", "RegTwo"; io = devnull) # one call → both removed
+        out2 = sprint(io -> VibePkg.Registry.status(; io))
+        @test !occursin("RegOne", out2) && !occursin("RegTwo", out2)
+    end
+end

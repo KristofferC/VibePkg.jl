@@ -32,22 +32,25 @@ function build_log_file(d::DepotStack, entry::ManifestEntry, source::String)
     return joinpath(dir, "build.log")
 end
 
-# deps-first order over the manifest slice `uuids`
+# deps-first order over the manifest slice `uuids` (top-level recursion to
+# avoid a boxed self-referential closure)
+function topo_visit!(order, seen, manifest, uuids, uuid)
+    uuid in seen && return
+    push!(seen, uuid)
+    entry = get(manifest, uuid, nothing)
+    entry === nothing && return
+    for dep in values(entry.deps)
+        topo_visit!(order, seen, manifest, uuids, dep)
+    end
+    uuid in uuids && push!(order, uuid)
+    return
+end
 function topo_order(env::Environment, uuids::Vector{UUID})
     order = UUID[]
     seen = Set{UUID}()
-    function visit(uuid)
-        uuid in seen && return
-        push!(seen, uuid)
-        entry = get(env.manifest, uuid, nothing)
-        entry === nothing && return
-        for dep in values(entry.deps)
-            visit(dep)
-        end
-        uuid in uuids && push!(order, uuid)
-        return
+    for uuid in uuids
+        topo_visit!(order, seen, env.manifest, uuids, uuid)
     end
-    foreach(visit, uuids)
     return order
 end
 

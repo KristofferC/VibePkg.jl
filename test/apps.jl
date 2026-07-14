@@ -137,6 +137,49 @@ end
     end
 end
 
+# Pkg.jl apps.jl "relocated depot keeps working" — the shim derives its depot
+# from its own location (`$DEPOT` = SCRIPT_DIR/..), so moving the whole depot
+# to a new path and running the relocated shim still works.
+@testset "apps: relocated depot keeps working" begin
+    Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
+    mktempdir() do dir
+        pkg = joinpath(dir, "RelocPkg")
+        mkpath(joinpath(pkg, "src"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "RelocPkg"
+            uuid = "$APP_UUID"
+            version = "0.1.0"
+
+            [apps]
+            reloc = {}
+            """
+        )
+        write(
+            joinpath(pkg, "src", "RelocPkg.jl"), """
+            module RelocPkg
+            function (@main)(args)
+                println("reloc says: ", join(args, "+"))
+                return 0
+            end
+            end
+            """
+        )
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        AppsOps.app_develop(Config(depots), RegistryInstance[], pkg; io = devnull)
+        shim = joinpath(depot, "bin", "reloc")
+        @test occursin("reloc says: x+y", run_shim(shim, "x", "y"))
+
+        # move the entire depot elsewhere and run the relocated shim
+        newdepot = joinpath(dir, "moved-depot")
+        mv(depot, newdepot)
+        newshim = joinpath(newdepot, "bin", "reloc")
+        @test isfile(newshim)
+        @test occursin("reloc says: x+y", run_shim(newshim, "x", "y"))
+    end
+end
+
 # `app_add` of a registered package: registry + local git repo fixture, no
 # pkg server (JULIA_PKG_SERVER="" forces the git-clone install fallback)
 @testset "apps: add by registry name" begin

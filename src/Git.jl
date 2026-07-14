@@ -488,8 +488,13 @@ function materialize_repo_package!(
         # store.  Use the Git object's canonical id: re-hashing a Windows
         # checkout can lose Unix mode information and produce an id that does
         # not exist in the repository (and therefore cannot be re-fetched).
+        # snapshot the resolved object/rev into single-assignment locals so the
+        # closure below captures them without boxing (`obj`/`actual_rev` are
+        # reassigned across the resolution branches above)
+        checkout_obj = obj
+        checkout_rev = actual_rev
         mktempdir() do temp
-            tree = LibGit2.peel(LibGit2.GitTree, obj)
+            tree = LibGit2.peel(LibGit2.GitTree, checkout_obj)
             package_tree = nothing
             try
                 checkout_tree_to_path(repo, tree, temp)
@@ -516,7 +521,7 @@ function materialize_repo_package!(
                     mkpath(dirname(path))
                     mv_temp_dir_retries(pkg_root, path; set_permissions = false)
                 end
-                RepoPackage(project.name, project.uuid, url, actual_rev, subdir, tree_hash, path)
+                RepoPackage(project.name, project.uuid, url, checkout_rev, subdir, tree_hash, path)
             finally
                 package_tree !== nothing && package_tree !== tree && close(package_tree)
                 close(tree)

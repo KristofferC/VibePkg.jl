@@ -14,10 +14,14 @@ using VibePkg.Stdlibs
 using VibePkg.Errors: PkgError
 using VibePkg.ArtifactOps: artifact_tree_path
 import VibePkg.Fetch
-using VibePkg.Registries: RegistryInstance
-using VibePkg.Environments: load_environment
-using VibePkg.Planning: plan_up
+using VibePkg.Registries: RegistryInstance, reachable_registries
+using VibePkg.Environments: load_environment, write_environment
+using VibePkg.Planning: plan_up, plan_resolve
 using VibePkg.EnvFiles: entry_version, entry_tree_hash, is_registry_tracked
+
+if !@isdefined(make_test_registry)
+    include("testhelpers.jl")
+end
 
 @testset "Depots" begin
     mktempdir() do depot
@@ -125,6 +129,46 @@ end
     end
 end
 
+# Pkg.jl new.jl "Issue #4345: pidfile in writable location when depot is
+# readonly" — with an actually read-only depot behind a writable one, a package
+# already present in the readonly depot is served without writing a pidfile
+# there, and a new package installs into the writable depot without a
+# permission error.
+@testset "readonly depot: pidfiles stay writable (#4345)" begin
+    fx = LocalPkgServer.ensure!()
+    example_uuid = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+    h4 = Base.SHA1(fx.version_hashes["0.5.4"])
+    h5 = Base.SHA1(fx.version_hashes["0.5.5"])
+    mktempdir() do dir
+        ro = mkpath(joinpath(dir, "ro"))
+        wr = mkpath(joinpath(dir, "wr"))
+        # seed 0.5.4 into the depot that will become read-only
+        Fetch.ensure_package_installed!(
+            depot_stack([ro]), "Example", example_uuid, h4, String[]; readonly = false, io = devnull,
+        )
+        chmod(ro, 0o555; recursive = true)
+        try
+            d = depot_stack([wr, ro])
+            # 0.5.4 is already in the readonly depot: served as-is, no pidfile there
+            p4, new4 = Fetch.ensure_package_installed!(
+                d, "Example", example_uuid, h4, String[]; readonly = false, io = devnull,
+            )
+            @test !new4
+            @test startswith(p4, ro)
+            @test !isfile(joinpath(ro, "packages", "Example", Base.version_slug(example_uuid, h4)) * ".pid")
+            # 0.5.5 is new: installs into the writable depot without erroring
+            p5, new5 = Fetch.ensure_package_installed!(
+                d, "Example", example_uuid, h5, String[]; readonly = false, io = devnull,
+            )
+            @test new5
+            @test startswith(p5, wr)
+            @test isfile(joinpath(p5, "Project.toml"))
+        finally
+            chmod(ro, 0o755; recursive = true)      # restore so mktempdir can clean up
+        end
+    end
+end
+
 # Pkg.jl#4345 — new package trees always land in the FIRST depot of the
 # stack, even when a later (read-only) depot already holds other versions
 @testset "installs land in the first depot" begin
@@ -172,4 +216,35 @@ end
     @test_throws PkgError get_last_stdlibs(nothing)
     # jll-ish stdlibs are versioned, plain ones are not
     @test stdlib_version(dates_uuid, VERSION) isa Union{Nothing, VersionNumber}
+end
+
+# Pkg.jl resolve.jl "Stdlib resolve smoketest" — every standard library must be
+# jointly installable: adding all of them and resolving succeeds, populates the
+# manifest with all of them, and a second resolve is a no-op (idempotent).
+@testset "all stdlibs resolve" begin
+    sl = Stdlibs.load_stdlib()
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = Depots.depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            open(joinpath(envdir, "Project.toml"), "w") do io
+                println(io, "[deps]")
+                for (u, info) in sl
+                    println(io, info.name, " = \"", u, "\"")
+                end
+            end
+            env = load_environment(envdir; depots)
+            resolved = plan_resolve(env, regs, Config(depots))
+            @test all(haskey(resolved.manifest, u) for u in keys(sl))
+            @test length(resolved.manifest.deps) == length(sl)
+
+            # a second resolve over the written manifest changes nothing
+            write_environment(env, resolved)
+            env2 = load_environment(envdir; depots)
+            resolved2 = plan_resolve(env2, regs, Config(depots))
+            @test Set(keys(resolved2.manifest.deps)) == Set(keys(sl))
+        end
+    end
 end

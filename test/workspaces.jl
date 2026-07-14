@@ -17,7 +17,7 @@ using VibePkg.Registries: reachable_registries
 using VibePkg.Environments
 using VibePkg.Planning: plan_resolve, plan_up, UPLEVEL_FIXED
 using VibePkg.Display: print_status
-using VibePkg.EnvFiles: entry_version, is_path_tracked
+using VibePkg.EnvFiles: entry_version, is_path_tracked, entry_path, read_project
 using VibePkg.Errors: PkgError
 import VibePkg.Execution
 
@@ -446,5 +446,35 @@ end
         @test entry_version(planned.manifest[EXAMPLE_UUID]) isa VersionNumber
         @test is_path_tracked(planned.manifest[UNREG_UUID])
         write_environment(env, planned)
+    end
+end
+
+# Pkg.jl workspaces.jl "workspace sources pointing to parent package" (#4539,
+# #4575) — a child subproject whose [sources] points at its parent ({path=".."})
+# resolves without an AssertionError, path-tracks the parent, and the child's
+# project-relative sources path is preserved (never corrupted to ".").
+@testset "subproject [sources] pointing at the parent" begin
+    ROOT = UUID("aaaa0000-0000-0000-0000-000000000001")
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+
+        root = mkpath(joinpath(dir, "RootPkg"))
+        mkpath(joinpath(root, "src"))
+        write(joinpath(root, "Project.toml"), "name = \"RootPkg\"\nuuid = \"$ROOT\"\nversion = \"0.1.0\"\n")
+        write(joinpath(root, "src", "RootPkg.jl"), "module RootPkg end\n")
+
+        docs = mkpath(joinpath(root, "docs"))
+        write(joinpath(docs, "Project.toml"), "[deps]\nRootPkg = \"$ROOT\"\n\n[sources]\nRootPkg = {path=\"..\"}\n")
+
+        env = load_environment(docs; depots)
+        planned = plan_resolve(env, regs, Config(depots))     # must not AssertionError
+        @test is_path_tracked(planned.manifest[ROOT])
+        @test entry_path(planned.manifest[ROOT]) == ".."
+        write_environment(env, planned)
+        # the child's [sources] path stays project-relative, not rewritten to "."
+        @test only(values(read_project(joinpath(docs, "Project.toml")).sources)).path == ".."
     end
 end
