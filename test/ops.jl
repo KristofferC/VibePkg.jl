@@ -1557,8 +1557,10 @@ end
                 # url + subdir: the clone is tracked at its subdirectory
                 gitrepo = LibGit2.init(repo_dir)
                 try
-                    LibGit2.add!(gitrepo, "Project.toml", joinpath("src", "RootPkg.jl"))
-                    LibGit2.add!(gitrepo, joinpath("SubPkg", "Project.toml"), joinpath("SubPkg", "src", "SubPkg.jl"))
+                    # git pathspecs are /-separated on every platform — joinpath
+                    # would produce backslashes on Windows and silently match nothing
+                    LibGit2.add!(gitrepo, "Project.toml", "src/RootPkg.jl")
+                    LibGit2.add!(gitrepo, "SubPkg/Project.toml", "SubPkg/src/SubPkg.jl")
                     sig = LibGit2.Signature("vibepkg-test", "test@example.com")
                     LibGit2.commit(gitrepo, "init"; author = sig, committer = sig)
                 finally

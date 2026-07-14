@@ -160,7 +160,7 @@ function clone(io::IO, url, source_path; header = nothing, credentials = nothing
     end
 end
 
-function ensure_clone(io::IO, target_path, url; kwargs...)
+function ensure_clone(io::IO, target_path, url; kwargs...)::LibGit2.GitRepo
     if ispath(target_path)
         return LibGit2.GitRepo(target_path)
     else
@@ -527,7 +527,7 @@ store, and read the package's Project.toml for its identity.
         actual_rev = rev
         if rev === nothing
             head = try
-                LibGit2.head(repo)
+                LibGit2.head(repo)::LibGit2.GitReference
             catch err
                 err isa LibGit2.GitError || rethrow()
                 # a repository without commits clones fine but has no HEAD;

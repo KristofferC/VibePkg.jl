@@ -682,13 +682,22 @@ end
             end
             @test !isdir(dest)
             @test isempty(readdir(temp_root))
-            # (b) rename failure: a file squatting on the destination makes the
-            # final rename throw — the extraction dir must still be cleaned up
+            # (b) a file squatting on the destination: POSIX rename refuses to
+            # replace a file with a directory and throws — the extraction dir
+            # must still be cleaned up; Windows MoveFileEx replaces the file,
+            # so the install simply wins there
             dest2 = joinpath(adir, string(art.hash))
             write(dest2, "in the way")
-            @test_throws Base.IOError ArtifactOps.try_install_from(
-                file_url(art.gz), art.sha, art.hash, dest2; io = devnull,
-            )
+            if Sys.iswindows()
+                @test ArtifactOps.try_install_from(
+                    file_url(art.gz), art.sha, art.hash, dest2; io = devnull,
+                )
+                @test isdir(dest2)
+            else
+                @test_throws Base.IOError ArtifactOps.try_install_from(
+                    file_url(art.gz), art.sha, art.hash, dest2; io = devnull,
+                )
+            end
             @test isempty(readdir(temp_root))
         end
     end
