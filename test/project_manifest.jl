@@ -89,3 +89,43 @@ end
         # therefore do not assert Pkg's exact sticky/non-prune manifest contents.
     end
 end
+
+# is_manifest_current must compare a deved package's declared strong and weak
+# dependency maps against its manifest entry in BOTH directions: a dep removed
+# from (or moved to [weakdeps] in) the deved package's Project.toml makes the
+# manifest as stale as a newly added one does.
+@testset "is_manifest_current compares deved dep maps bidirectionally" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        e = joinpath(dir, "E")
+        mkpath(joinpath(e, "src"))
+        euuid = "9e2ebf1a-4d2e-4d54-96f6-9d6ee1a1a4d4"
+        eproj(body) = write(
+            joinpath(e, "Project.toml"),
+            "name = \"E\"\nuuid = \"$euuid\"\nversion = \"0.1.0\"\n" * body,
+        )
+        eproj("\n[deps]\nTest = \"$TEST_UUID\"\n")
+        write(joinpath(e, "src", "E.jl"), "module E\nend\n")
+
+        proj = mkpath(joinpath(dir, "proj"))
+        with_env(proj, depot) do
+            VibePkg.develop(; path = e, io = devnull)
+            depots = VibePkg.Depots.depot_stack()
+            env = VibePkg.Environments.load_environment(proj; depots)
+            current() = VibePkg.Environments.is_manifest_current(env)
+            @test current() === true
+
+            # a dep removed from the deved package's Project.toml: stale
+            eproj("")
+            @test current() === false
+
+            # the dep moved from [deps] to [weakdeps]: stale
+            eproj("\n[weakdeps]\nTest = \"$TEST_UUID\"\n")
+            @test current() === false
+
+            # restored to the resolved state: current again
+            eproj("\n[deps]\nTest = \"$TEST_UUID\"\n")
+            @test current() === true
+        end
+    end
+end

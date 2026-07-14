@@ -155,33 +155,28 @@ function weighted_edit_distance(s1::AbstractString, s2::AbstractString)
     d[1, 1:(n + 1)] = 0:n
 
     for i in 1:m, j in 1:n
-        if a[i] == b[j]
-            d[i + 1, j + 1] = d[i, j]  # No cost for exact match
+        # Match (free) or substitution with confusion weighting
+        subst_cost = if a[i] == b[j]
+            d[i, j]
         else
-            # Standard operations
-            insert_cost = d[i, j + 1] + 1.0
-            delete_cost = d[i + 1, j] + 1.0
+            d[i, j] + get(CHARACTER_CONFUSIONS, (a[i], b[j]), 1.0)
+        end
 
-            # Check for repeated character deletion (common typo)
-            if i > 1 && a[i] == a[i - 1] && a[i - 1] == b[j]
-                delete_cost = d[i, j + 1] + 0.3  # Low cost for deleting repeated char
-            end
+        # Deletion of a[i] (predecessor d[i, j+1]): cheap when it repeats
+        # a[i-1] and that character aligns with b[j] — dropping a doubled
+        # character is a common typo; unrelated doubles cost a full unit
+        delete_cost = d[i, j + 1] + (i > 1 && a[i] == a[i - 1] && a[i - 1] == b[j] ? 0.3 : 1.0)
 
-            # Check for repeated character insertion (common typo)
-            if j > 1 && b[j] == b[j - 1] && a[i] == b[j - 1]
-                insert_cost = d[i, j + 1] + 0.3  # Low cost for inserting repeated char
-            end
+        # Insertion of b[j] (predecessor d[i+1, j]): cheap when it repeats
+        # b[j-1] and that character aligns with a[i] — an accidentally
+        # doubled character
+        insert_cost = d[i + 1, j] + (j > 1 && b[j] == b[j - 1] && b[j - 1] == a[i] ? 0.3 : 1.0)
 
-            # Substitution with confusion weighting
-            confusion_key = (a[i], b[j])
-            subst_cost = d[i, j] + get(CHARACTER_CONFUSIONS, confusion_key, 1.0)
+        d[i + 1, j + 1] = min(subst_cost, delete_cost, insert_cost)
 
-            d[i + 1, j + 1] = min(insert_cost, delete_cost, subst_cost)
-
-            # Transposition
-            if i > 1 && j > 1 && a[i] == b[j - 1] && a[i - 1] == b[j]
-                d[i + 1, j + 1] = min(d[i + 1, j + 1], d[i - 1, j - 1] + 1.0)
-            end
+        # Transposition
+        if i > 1 && j > 1 && a[i] == b[j - 1] && a[i - 1] == b[j]
+            d[i + 1, j + 1] = min(d[i + 1, j + 1], d[i - 1, j - 1] + 1.0)
         end
     end
 

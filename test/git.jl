@@ -9,6 +9,7 @@ using Test
 using Base: UUID, SHA1
 import LibGit2
 import TOML
+using FileWatching: mkpidlock
 using VibePkg
 using VibePkg.Configs: Config
 using VibePkg.Errors: PkgError
@@ -689,6 +690,133 @@ end
                 planned = quiet(() -> plan_add(env, RegistryInstance[], Config(depots), [rp]; julia_version = VERSION))
                 @test is_repo_tracked(planned.manifest[GITPKG_UUID])
             end
+        end
+    end
+end
+
+# the bare clone caches are shared across environments and processes, so
+# clone/fetch/lookup must run under a per-cache pidlock: with the lock held
+# elsewhere the operation blocks instead of racing the cache
+@testset "clone caches are pidlocked" begin
+    mktempdir() do dir
+        dir = realpath(dir)
+        src = make_git_package(dir)
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # materialize_repo_package!: url-keyed cache
+        cache = Git.repo_cache_path(depots, src)
+        mkpath(dirname(cache))
+        lock = mkpidlock(cache * ".pid", stale_age = 10)
+        done = Ref(false)
+        t = @async begin
+            rp = Git.materialize_repo_package!(depots, src; io = devnull)
+            done[] = true
+            rp
+        end
+        sleep(2)                     # plenty for the tiny local clone if unlocked
+        @test !done[]                # blocked on the held per-cache lock
+        close(lock)
+        rp = fetch(t)
+        @test done[]
+        @test rp.name == "GitPkg" && isdir(rp.path)
+
+        # install_tree_from_git!: uuid-keyed cache, fresh depot
+        depot2 = mkpath(joinpath(dir, "depot2"))
+        depots2 = depot_stack([depot2])
+        path, installed = find_installed(depots2, "GitPkg", GITPKG_UUID, rp.tree_hash)
+        @test !installed
+        clone_pidfile = joinpath(mkpath(VibePkg.Depots.clones_dir(depot2)), string(GITPKG_UUID)) * ".pid"
+        lock2 = mkpidlock(clone_pidfile, stale_age = 10)
+        done2 = Ref(false)
+        t2 = @async begin
+            Git.install_tree_from_git!(depots2, devnull, GITPKG_UUID, "GitPkg", rp.tree_hash, [src], path)
+            done2[] = true
+        end
+        sleep(2)
+        @test !done2[]
+        close(lock2)
+        fetch(t2)
+        @test done2[]
+        @test isfile(joinpath(path, "src", "GitPkg.jl"))
+    end
+end
+
+const SUBMODPKG_UUID = UUID("70808080-0708-0708-0708-070870870870")
+
+# Pkg.jl#708: adding a git repo that carries a submodule must succeed —
+# libgit2 cannot check a gitlink out of the bare clone cache, so the tree is
+# extracted by hand; the gitlink becomes an empty directory (what a plain
+# `git checkout` leaves for an uninitialized submodule). The same manual path
+# must preserve symlinks and executable bits.
+@testset "add of a git repo containing a submodule" begin
+    if Sys.which("git") === nothing
+        @test_skip "git CLI not available"
+    else
+        mktempdir() do dir
+            dir = realpath(dir)
+            depot = mkpath(joinpath(dir, "depot"))
+            depots = depot_stack([depot])
+
+            # a second local git repo, to be embedded as a submodule
+            subrepo = joinpath(dir, "SubDep")
+            mkpath(subrepo)
+            write(joinpath(subrepo, "README.md"), "submodule content\n")
+            LibGit2.close(LibGit2.init(subrepo))
+            commit_all!(subrepo, "sub initial")
+
+            # a valid package repo carrying a genuine submodule (.gitmodules +
+            # gitlink tree entry); LibGit2's Julia API cannot add submodules,
+            # so the CLI git does the setup
+            src = joinpath(dir, "SubModPkg")
+            mkpath(joinpath(src, "src"))
+            write(
+                joinpath(src, "Project.toml"), """
+                name = "SubModPkg"
+                uuid = "$SUBMODPKG_UUID"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(src, "src", "SubModPkg.jl"), "module SubModPkg end\n")
+            if !Sys.iswindows()
+                # exercise the manual extractor's symlink and exec-bit handling
+                mkpath(joinpath(src, "bin"))
+                write(joinpath(src, "bin", "tool.sh"), "#!/bin/sh\n")
+                chmod(joinpath(src, "bin", "tool.sh"), 0o755)
+                symlink("src/SubModPkg.jl", joinpath(src, "srclink"))
+            end
+            run(pipeline(`git -C $src init -q`; stdout = devnull, stderr = devnull))
+            run(pipeline(`git -C $src -c protocol.file.allow=always submodule add $subrepo vendor/sub`; stdout = devnull, stderr = devnull))
+            run(pipeline(`git -C $src -c user.name=tester -c user.email=t@e.com add -A`; stdout = devnull, stderr = devnull))
+            run(pipeline(`git -C $src -c user.name=tester -c user.email=t@e.com commit -q -m initial`; stdout = devnull, stderr = devnull))
+            @test isfile(joinpath(src, ".gitmodules"))
+
+            rp = Git.materialize_repo_package!(depots, src; io = devnull)
+            @test rp.name == "SubModPkg"
+            @test rp.uuid == SUBMODPKG_UUID
+            @test isdir(rp.path)
+            @test isfile(joinpath(rp.path, "src", "SubModPkg.jl"))
+            @test isfile(joinpath(rp.path, ".gitmodules"))
+            # the gitlink materializes as an empty directory
+            @test isdir(joinpath(rp.path, "vendor", "sub"))
+            @test isempty(readdir(joinpath(rp.path, "vendor", "sub")))
+            # canonical tree id (covers the gitlink entry) is recorded
+            @test rp.tree_hash == git_tree_hash(src, "HEAD")
+            if !Sys.iswindows()
+                @test filemode(joinpath(rp.path, "bin", "tool.sh")) & 0o100 != 0
+                @test islink(joinpath(rp.path, "srclink"))
+                @test readlink(joinpath(rp.path, "srclink")) == "src/SubModPkg.jl"
+            end
+
+            # the git install fallback checks the same tree out of the
+            # uuid-keyed cache into a fresh depot
+            depot2 = mkpath(joinpath(dir, "depot2"))
+            depots2 = depot_stack([depot2])
+            path, installed = find_installed(depots2, "SubModPkg", SUBMODPKG_UUID, rp.tree_hash)
+            @test !installed
+            Git.install_tree_from_git!(depots2, devnull, SUBMODPKG_UUID, "SubModPkg", rp.tree_hash, [src], path)
+            @test isfile(joinpath(path, "src", "SubModPkg.jl"))
+            @test isdir(joinpath(path, "vendor", "sub"))
         end
     end
 end

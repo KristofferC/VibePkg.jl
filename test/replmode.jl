@@ -217,6 +217,24 @@ using VibePkg.Errors: PkgError
         api, args, _ = capture("activate \"some dir/with space\"")
         @test args == Any["some dir/with space"]
 
+        # statement splitting is quote-aware: a quoted `;` stays literal
+        api, args, _ = capture("activate \"dir;name\"")
+        @test api === VibePkg.API.activate && args == Any["dir;name"]
+        api, args, _ = capture("activate 'dir;name'")
+        @test args == Any["dir;name"]
+        cmds = do_cmd("activate \"a;b\"; st")
+        @test length(cmds) == 2
+        @test cmds[1][2] == Any["a;b"] && cmds[2][1] === VibePkg.API.status
+
+        # url recognition covers every scheme the Git layer accepts:
+        # `git://` and `file://` words are urls, not paths
+        api, args, _ = capture("add git://example.com/Repo")
+        @test args[1] == [PackageSpec(; url = "git://example.com/Repo")]
+        api, args, _ = capture("add file:///home/user/Repo")
+        @test args[1] == [PackageSpec(; url = "file:///home/user/Repo")]
+        api, args, _ = capture("add file:///home/user/Repo#branch")
+        @test args[1] == [PackageSpec(; url = "file:///home/user/Repo", rev = "branch")]
+
         # registry subcommands parse, with positional arguments
         @test length(do_cmd("registry status")) == 1
         api, args, _ = capture("registry add General")

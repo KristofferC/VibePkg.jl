@@ -573,11 +573,15 @@ end
     paths = String[]
     for s in specs
         if s.path !== nothing
-            push!(paths, s.path)
+            # honor `subdir`: the tracked project lives below the given path
+            # (`plan_develop` validates the joined path exists and has a
+            # project file)
+            push!(paths, s.subdir === nothing ? s.path : joinpath(s.path, s.subdir))
         elseif s.url !== nothing
             name = splitext(basename(rstrip(s.url, '/')))[1]
             clone_dir, track_path = dev_clone_target(ctx.config, name; shared)
             isdir(clone_dir) || Git.ensure_clone(io, clone_dir, s.url)
+            s.subdir === nothing || (track_path = joinpath(track_path, s.subdir))
             push!(paths, track_path)
         elseif s.name !== nothing
             push!(paths, _develop_name_path(ctx, env, s.name; shared, io))

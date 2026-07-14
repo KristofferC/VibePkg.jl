@@ -1,4 +1,6 @@
 [deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+FileWatching = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 HistoricalStdlibVersions = "6df8b67a-e8a0-4029-b4b7-ac196fe72102"
 LibGit2 = "76f85450-5226-5b5a-8eaa-529ad045b433"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"

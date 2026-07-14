@@ -20,6 +20,9 @@ using VibePkg.Versions: range_of, make_spec, empty_versionspec, matches_spec_ran
         # trailing components are zeroed so field equality is semantic
         @test VersionBound("1.2").t == (1, 2, 0)
         @test_throws ArgumentError VersionBound(1, 2, 3, 4)
+        # malformed input is an ArgumentError, never a BoundsError
+        @test_throws ArgumentError VersionBound("")
+        @test_throws ArgumentError VersionBound("   ")
         @test VersionBound(v"1.2.3") == VersionBound(1, 2, 3)
         # prerelease/build invisible to bounds
         @test VersionBound(v"1.2.3-rc1") == VersionBound(1, 2, 3)
@@ -46,6 +49,14 @@ using VibePkg.Versions: range_of, make_spec, empty_versionspec, matches_spec_ran
         # spaced form parses the same way
         @test VersionRange("1.2 - 3.4") == VersionRange("1.2-3.4")
         @test_throws ArgumentError VersionRange("1-2-3")
+        # empty strings and empty range components are ArgumentErrors,
+        # never BoundsErrors from indexing into an empty component
+        @test_throws ArgumentError VersionRange("")
+        @test_throws ArgumentError VersionRange("  ")
+        @test_throws ArgumentError VersionRange("-")
+        @test_throws ArgumentError VersionRange("1-")
+        @test_throws ArgumentError VersionRange("-1")
+        @test_throws ArgumentError VersionRange("1 - ")
         # lower == upper collapses to the more significant bound
         @test VersionRange("1.2-1.2.0") == VersionRange("1.2.0")
         @test string(VersionRange("1.2-1.2.0")) == "1.2.0"

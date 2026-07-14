@@ -58,6 +58,7 @@ end
 # which needs the source on disk.
 function pkg_may_have_extensions(registries::Vector{RegistryInstance}, uuid::UUID, version)
     version isa VersionNumber || return true
+    attested_no_weakdeps = false
     for reg in registries
         pkg = get(reg, uuid, nothing)
         pkg === nothing && continue
@@ -65,8 +66,13 @@ function pkg_may_have_extensions(registries::Vector{RegistryInstance}, uuid::UUI
         for (vr, weak) in info.weak_deps
             version in vr && !isempty(weak) && return true
         end
+        # only a registry that actually knows this exact version can
+        # affirmatively rule weakdeps out for it
+        haskey(info.version_info, version) && (attested_no_weakdeps = true)
     end
-    return false
+    # no registry covers this package at this exact version — be
+    # conservative and assume it may provide extensions
+    return !attested_no_weakdeps
 end
 
 "UUIDs loadable from the active project: its direct deps and their recursive strong deps."

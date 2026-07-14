@@ -1,10 +1,12 @@
 # Small foundational helpers shared across layers.
 module Utils
 
+using TOML: TOML
+
 export isurl, normalize_path_for_toml, denormalize_path_from_toml, stdout_f, stderr_f,
     unstableio, can_fancyprint, precompile_io, precompile_detach_kwargs,
     printpkgstyle, pkgstyle_indent, pathrepr,
-    set_readonly, create_cachedir_tag, mv_temp_dir_retries, atomic_write
+    set_readonly, create_cachedir_tag, mv_temp_dir_retries, atomic_write, atomic_toml_write
 
 # IO indirection points. Lower layers must go through these so that
 # redirecting output stays a one-place change. The stream is wrapped in
@@ -71,8 +73,14 @@ function pathrepr(path::String)
     return "`" * Base.contractuser(path) * "`"
 end
 
-const URL_regex = r"((file|git|ssh|http(s)?)|([\w\-\.]+@[\w\-\.]+))(:(//)?)([\w\.@\:/\-~]+)(\.git)?(/)?"x
-isurl(r::String) = occursin(URL_regex, r)
+# URL detection is anchored: a string is a URL when it *starts* with a scheme
+# the Git layer understands (`http(s)://`, `git://`, `ssh://`, `file://`) or
+# is SCP-like (`user@host:path`). An unanchored match would accept URL-looking
+# substrings inside plain paths (e.g. `some/dir/ssh:copy`), and a character
+# whitelist after the scheme would reject valid URL characters (`%`, `?`, …).
+const URL_SCHEME_RE = r"^(?:https?|git|ssh|file)://"i
+const SCP_LIKE_RE = r"^[\w\-\.]+@[\w\-\.]+:.+"s
+isurl(r::String) = occursin(URL_SCHEME_RE, r) || occursin(SCP_LIKE_RE, r)
 
 """
     normalize_path_for_toml(path::String)
@@ -201,6 +209,26 @@ function atomic_write(path::AbstractString, str::AbstractString)
         chmod(temp_path, isfile(path) ? filemode(path) : 0o644)
         mv(temp_path, path; force = true)
         return n
+    catch
+        close(temp_io)
+        rm(temp_path; force = true)
+        rethrow()
+    end
+end
+
+"""
+    atomic_toml_write(path, data; kws...)
+
+Write TOML data via a temporary file + rename, preventing torn writes.
+"""
+function atomic_toml_write(path::String, data; kws...)
+    dir = dirname(path)
+    isempty(dir) && (dir = pwd())
+    temp_path, temp_io = mktemp(dir)
+    return try
+        TOML.print(temp_io, data; kws...)
+        close(temp_io)
+        mv(temp_path, path; force = true)
     catch
         close(temp_io)
         rm(temp_path; force = true)

@@ -1,6 +1,6 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
-# FieldValue is a hierarchical numeric type with 5 levels.
+# FieldValue is a hierarchical numeric type with four levels.
 # When summing two FieldValues, the levels are summed independently.
 # When comparing them, lower levels take precedence.
 # The levels are used as such:
@@ -73,11 +73,16 @@ end
 
 # secondmax returns the (normalized) value of the second maximum in a
 # field. It's used to determine the most polarized field.
+# With fewer than two selected states there is no second maximum: the field
+# is maximally polarized, so return typemin directly (subtracting the
+# maximum from the typemin sentinel would overflow).
 function secondmax(f::Field, msk::BitVector = trues(length(f)))
     m = typemin(FieldValue)
     m2 = typemin(FieldValue)
+    nsel = 0
     for i in 1:length(f)
         msk[i] || continue
+        nsel += 1
         a = f[i]
         if a > m
             m2 = m
@@ -86,6 +91,7 @@ function secondmax(f::Field, msk::BitVector = trues(length(f)))
             m2 = a
         end
     end
+    nsel < 2 && return typemin(FieldValue)
     return m2 - m
 end
 

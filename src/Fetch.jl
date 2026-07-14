@@ -348,7 +348,10 @@ function unpack(tarball::String, dest::String)
     end
 end
 
-# Simplified tarball reader without path tracking overhead
+# Simplified tarball reader without path tracking overhead. Entries the
+# predicate rejects have their data drained so the stream stays aligned on
+# the next header; the callback must itself consume every accepted entry's
+# data (e.g. via `Tar.read_data`).
 function read_tarball_simple(
         callback::Function,
         predicate::Function,
@@ -359,7 +362,10 @@ function read_tarball_simple(
     while !eof(tar)
         hdr = Tar.read_header(tar, globals = globals, buf = buf)
         hdr === nothing && break
-        predicate(hdr)::Bool || continue
+        if !(predicate(hdr)::Bool)
+            Tar.skip_data(tar, hdr.size)
+            continue
+        end
         Tar.check_header(hdr)
         before = applicable(position, tar) ? position(tar) : 0
         callback(hdr)
@@ -409,48 +415,64 @@ function install_archive(
 
     tmp_objects = String[]
     url_success = false
-    for (url, top) in urls
-        path = tempname() * randstring(6)
-        push!(tmp_objects, path)
-        url_success = true
-        try
-            download(url, path; io, depots, progress_header = name === nothing ? "Downloading" : "Downloading $(name)")
-        catch e
-            e isa InterruptException && rethrow()
-            url_success = false
-        end
-        url_success || continue
-        dir = tempname(depot_temp) * randstring(6)
-        push!(tmp_objects, dir)
-        try
-            unpack(path, dir)
-        catch e
-            e isa ProcessFailedException || rethrow()
-            @warn "failed to extract archive downloaded from $(url)"
-            url_success = false
-        end
-        url_success || continue
-        if top
-            unpacked = dir
-        else
-            dirs = readdir(dir)
-            # 7z on Windows might create this spurious file
-            filter!(x -> x != "pax_global_header", dirs)
-            @assert length(dirs) == 1
-            unpacked = joinpath(dir, dirs[1])
-        end
-        computed_hash = TreeHash.tree_hash(unpacked)
-        if SHA1(computed_hash) != hash
-            @warn "Downloaded package content does not match expected hash (git-tree-sha1); skipping this source" package = name url = url expected = hash computed = SHA1(computed_hash)
-            url_success = false
-        end
-        url_success || continue
+    try
+        for (url, top) in urls
+            path = tempname() * randstring(6)
+            push!(tmp_objects, path)
+            url_success = true
+            try
+                download(url, path; io, depots, progress_header = name === nothing ? "Downloading" : "Downloading $(name)")
+            catch e
+                e isa InterruptException && rethrow()
+                url_success = false
+            end
+            url_success || continue
+            dir = tempname(depot_temp) * randstring(6)
+            push!(tmp_objects, dir)
+            # a corrupt or malformed archive disqualifies this source only:
+            # the next url may still deliver good content
+            try
+                unpack(path, dir)
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "failed to extract archive downloaded from $(url)" exception = e
+                url_success = false
+            end
+            url_success || continue
+            if top
+                unpacked = dir
+            else
+                dirs = readdir(dir)
+                # 7z on Windows might create this spurious file
+                filter!(x -> x != "pax_global_header", dirs)
+                if length(dirs) != 1
+                    @warn "archive downloaded from $(url) does not contain a single top-level directory; skipping this source" package = name entries = length(dirs)
+                    url_success = false
+                    continue
+                end
+                unpacked = joinpath(dir, dirs[1])
+            end
+            computed_hash = try
+                SHA1(TreeHash.tree_hash(unpacked))
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "failed to hash content of archive downloaded from $(url); skipping this source" package = name exception = e
+                url_success = false
+                continue
+            end
+            if computed_hash != hash
+                @warn "Downloaded package content does not match expected hash (git-tree-sha1); skipping this source" package = name url = url expected = hash computed = computed_hash
+                url_success = false
+            end
+            url_success || continue
 
-        !isdir(dirname(version_path)) && mkpath(dirname(version_path))
-        mv_temp_dir_retries(unpacked, version_path; set_permissions = false)
-        break
+            !isdir(dirname(version_path)) && mkpath(dirname(version_path))
+            mv_temp_dir_retries(unpacked, version_path; set_permissions = false)
+            break
+        end
+    finally
+        foreach(x -> Base.rm(x; force = true, recursive = true), tmp_objects)
     end
-    foreach(x -> Base.rm(x; force = true, recursive = true), tmp_objects)
     return url_success
 end
 

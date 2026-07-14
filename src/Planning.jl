@@ -212,23 +212,23 @@ project_uuid(env::Environment) =
     something(env.project.uuid, Base.dummy_uuid(env.project_file))
 
 # Several workspace projects may declare the same dep in `[sources]`; only
-# one entry can win, so they must all agree (paths compared after rebasing
-# to manifest-relative).
+# one entry can win, so the complete specs must agree field for field — a
+# rev/subdir present in one project but missing in another is as much a
+# conflict as two differing values (paths compared after rebasing to
+# manifest-relative).
 function assert_no_conflicting_sources(name::String, sources::Vector{SourceSpec})
     length(sources) < 2 && return
-    paths = Set(s.path for s in sources if s.path !== nothing)
-    urls = Set(s.url for s in sources if s.url !== nothing)
-    revs = Set(s.rev for s in sources if s.rev !== nothing)
-    subdirs = Set(s.subdir for s in sources if s.subdir !== nothing)
+    allequal(sources) && return
     conflicts = String[]
-    if !isempty(paths) && (!isempty(urls) || !isempty(revs))
+    if any(s.path !== nothing for s in sources) &&
+            any(s.url !== nothing || s.rev !== nothing for s in sources)
         push!(conflicts, "both a path and a url/rev")
     end
-    length(paths) > 1 && push!(conflicts, "paths: " * join(sort!(collect(paths)), ", "))
-    length(urls) > 1 && push!(conflicts, "urls: " * join(sort!(collect(urls)), ", "))
-    length(revs) > 1 && push!(conflicts, "revs: " * join(sort!(collect(revs)), ", "))
-    length(subdirs) > 1 && push!(conflicts, "subdirs: " * join(sort!(collect(subdirs)), ", "))
-    isempty(conflicts) && return
+    describe(x) = something(x, "(not specified)")
+    for (field, label) in ((:path, "paths"), (:url, "urls"), (:rev, "revs"), (:subdir, "subdirs"))
+        vals = unique(getfield(s, field) for s in sources)
+        length(vals) > 1 && push!(conflicts, label * ": " * join(sort!(map(describe, vals)), ", "))
+    end
     pkgerror(
         "Package $(name) has conflicting sources specified by different projects " *
             "in the workspace: $(join(conflicts, "; ")).\n" *
@@ -1541,7 +1541,8 @@ function plan_rm(env::Environment, requests::Vector{PackageRequest}; mode::Symbo
     )
     sources = Dict{String, SourceSpec}(
         name => src for (name, src) in env.project.sources if
-            haskey(new_deps, name) || haskey(env.project.extras, name)
+            haskey(new_deps, name) || haskey(env.project.extras, name) ||
+            haskey(env.project.weakdeps, name)
     )
     targets = Dict{String, Vector{String}}()
     for (target, target_deps) in env.project.targets

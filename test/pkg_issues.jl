@@ -5674,3 +5674,110 @@ end
         end
     end
 end
+
+@testset "Pkg.jl#708 add git repo containing a submodule" begin
+    Git = VibePkg.Git
+    LibGit2 = VibePkg.Git.LibGit2
+    SUBMOD_UUID = UUID("70808080-0708-0708-0708-070870870870")
+
+    mktempdir() do dir
+        dir = realpath(dir)
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # A second local git repo, to be embedded as a submodule.
+        subrepo = joinpath(dir, "SubDep")
+        mkpath(subrepo)
+        write(joinpath(subrepo, "README.md"), "submodule content\n")
+        let repo = LibGit2.init(subrepo)
+            LibGit2.add!(repo, ".")
+            sig = LibGit2.Signature("tester", "tester@example.com")
+            LibGit2.commit(repo, "sub initial"; author = sig, committer = sig)
+            LibGit2.close(repo)
+        end
+
+        # The package repo: a valid Julia package that also carries a genuine
+        # git submodule (a .gitmodules file + a gitlink tree entry). LibGit2's
+        # Julia API cannot add submodules, so the CLI git does the setup;
+        # protocol.file.allow=always permits a local-path submodule source.
+        src = joinpath(dir, "SubModPkg")
+        mkpath(joinpath(src, "src"))
+        write(
+            joinpath(src, "Project.toml"), """
+            name = "SubModPkg"
+            uuid = "$SUBMOD_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(src, "src", "SubModPkg.jl"), "module SubModPkg end\n")
+        run(pipeline(`git -C $src init -q`; stdout = devnull, stderr = devnull))
+        run(pipeline(`git -C $src -c protocol.file.allow=always submodule add $subrepo vendor/sub`; stdout = devnull, stderr = devnull))
+        run(pipeline(`git -C $src -c user.name=tester -c user.email=t@e.com add -A`; stdout = devnull, stderr = devnull))
+        run(pipeline(`git -C $src -c user.name=tester -c user.email=t@e.com commit -q -m initial`; stdout = devnull, stderr = devnull))
+
+        # Precondition: the repo really contains a submodule.
+        @test isfile(joinpath(src, ".gitmodules"))
+
+        # Adding a git package that contains a submodule succeeds: the
+        # force-checkout of a tree carrying a submodule gitlink out of the
+        # bare clone cache used to throw `GitError(Class:Submodule, cannot
+        # get submodules without a working tree)`.
+        rp = Git.materialize_repo_package!(depots, src; io = devnull)
+        @test rp.name == "SubModPkg"
+        @test rp.uuid == SUBMOD_UUID
+        @test isdir(rp.path)
+    end
+end
+
+@testset "Pkg.jl#3326 Manifest of a symlinked Project.toml reachable by loader" begin
+    if Sys.iswindows()
+        # symlinks require privileges on Windows; skip there
+        @test_skip true
+    else
+        mktempdir() do depot
+            make_test_registry(depot)
+            depots = depot_stack([depot])
+            regs = reachable_registries(depots)
+            mktempdir() do dir
+                dir = realpath(dir)
+                # the REAL project lives in realdir/Project.toml
+                realdir = joinpath(dir, "myproj")
+                mkpath(realdir)
+                write(
+                    joinpath(realdir, "Project.toml"), """
+                    [deps]
+                    Example = "$EXAMPLE_UUID"
+                    """
+                )
+
+                # linkdir/Project.toml is a SYMLINK to ../myproj/Project.toml —
+                # the scenario from the report (activate the symlinked project).
+                linkdir = joinpath(dir, "myprojlink")
+                mkpath(linkdir)
+                link_project = joinpath(linkdir, "Project.toml")
+                symlink(joinpath("..", "myproj", "Project.toml"), link_project)
+                @test islink(link_project)
+
+                # activate + instantiate the symlinked project: plan_add(Example)
+                # and persist the resulting Manifest.
+                env = load_environment(link_project; depots)
+                planned = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+                write_environment(env, planned)
+
+                # The environment's identity is the path the user activated:
+                # the final project-file symlink is preserved (only its parent
+                # directory is canonicalized), so the Manifest lands beside
+                # the symlink (linkdir), NOT beside the symlink target.
+                @test env.manifest_file == joinpath(linkdir, "Manifest.toml")
+                @test isfile(joinpath(linkdir, "Manifest.toml"))
+                @test !isfile(joinpath(realdir, "Manifest.toml"))
+
+                # Julia's own loader activates project files by path with NO
+                # realpath (abspath(dirname(project_file)) only), so with the
+                # Manifest beside the symlink `using Example` resolves.
+                @test Base.project_file_manifest_path(link_project) ==
+                    joinpath(linkdir, "Manifest.toml")
+            end
+        end
+    end
+end

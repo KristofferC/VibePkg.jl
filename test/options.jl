@@ -396,6 +396,39 @@ end
     end
 end
 
+# Config env-var validation: JULIA_PKG_CONCURRENT_DOWNLOADS must be a positive
+# integer (Pkg parity: error on zero/negative/garbage instead of clamping),
+# JULIA_PKG_DEVDIR overrides the first-depot default
+@testset "Config environment variables" begin
+    mktempdir() do depot
+        depot = realpath(depot)
+        depots = depot_stack([depot])
+        withenv("JULIA_PKG_CONCURRENT_DOWNLOADS" => nothing) do
+            @test Config(depots).concurrency == 8
+        end
+        withenv("JULIA_PKG_CONCURRENT_DOWNLOADS" => "3") do
+            @test Config(depots).concurrency == 3
+        end
+        for bad in ("0", "-2", "garbage", "")
+            withenv("JULIA_PKG_CONCURRENT_DOWNLOADS" => bad) do
+                err = try
+                    Config(depots)
+                catch e
+                    e
+                end
+                @test err isa PkgError
+                @test occursin("JULIA_PKG_CONCURRENT_DOWNLOADS", sprint(showerror, err))
+            end
+        end
+        withenv("JULIA_PKG_DEVDIR" => joinpath(depot, "mydev")) do
+            @test Config(depots).devdir == joinpath(depot, "mydev")
+        end
+        withenv("JULIA_PKG_DEVDIR" => nothing) do
+            @test Config(depots).devdir == joinpath(depot, "dev")
+        end
+    end
+end
+
 # Cpt at 0.1.0/0.2.0/0.3.0: enough versions for the docs' compat-conflict
 # walkthrough (conflicting entry → error, widened entry → up lands in range)
 const CPT_UUID = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")

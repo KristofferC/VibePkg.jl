@@ -60,41 +60,45 @@ function run_build(
         depots::DepotStack; io::IO, verbose::Bool = false,
     )
     printpkgstyle(io, :Building, verbose ? entry.name : "$(entry.name) → $(pathrepr(log_file))")
-    # isolated build sandbox: the package plus its dependency closure
-    sandbox = mktempdir()
-    project = with_project(EnvFiles.Project(); deps = Dict{String, UUID}(entry.name => entry.uuid))
-    manifest = sandbox_manifest(env, depots, entry.uuid)
-    sandbox_env = Environment(
-        joinpath(sandbox, "Project.toml"), joinpath(sandbox, "Manifest.toml"),
-        project, manifest,
-    )
-    empty_env = Environment(
-        sandbox_env.project_file, sandbox_env.manifest_file,
-        EnvFiles.Project(), EnvFiles.Manifest(),
-    )
-    write_environment(empty_env, sandbox_env)
-    # preferences travel into the build sandbox pre-merged (Pkg parity):
-    # anchored at deps/ if it has its own project, else at the package's
-    # project, with the parent environment behind it
-    deps_project = EnvFiles.projectfile_path(joinpath(source, "deps"); strict = true)
-    prefs_primary = something(deps_project, EnvFiles.projectfile_path(source))
-    write_sandbox_preferences(sandbox, sandbox_preferences(env, prefs_primary))
-    code = """
-    using Pkg
-    cd($(repr(source)))
-    include($(repr(build_file(source))))
-    """
-    cmd = addenv(
-        `$(joinpath(Sys.BINDIR, "julia")) -O0 --color=no --history-file=no --startup-file=no --project=$sandbox --eval $code`,
-        "JULIA_LOAD_PATH" => "@$(Sys.iswindows() ? ';' : ':')@stdlib",
-        "JULIA_PROJECT" => nothing,
-    )
-    ok = if verbose
-        # `verbose`: build output goes to the callers streams, not the log
-        success(pipeline(cmd; stdout = stdout, stderr = stderr))
-    else
-        open(log_file, "w") do log
-            success(pipeline(cmd; stdout = log, stderr = log))
+    # isolated build sandbox: the package plus its dependency closure;
+    # mktempdir-do removes it as soon as the build subprocess has finished
+    ok = mktempdir() do sandbox
+        project = with_project(EnvFiles.Project(); deps = Dict{String, UUID}(entry.name => entry.uuid))
+        manifest = sandbox_manifest(env, depots, entry.uuid)
+        sandbox_env = Environment(
+            joinpath(sandbox, "Project.toml"), joinpath(sandbox, "Manifest.toml"),
+            project, manifest,
+        )
+        empty_env = Environment(
+            sandbox_env.project_file, sandbox_env.manifest_file,
+            EnvFiles.Project(), EnvFiles.Manifest(),
+        )
+        write_environment(empty_env, sandbox_env)
+        # preferences travel into the build sandbox pre-merged (Pkg parity):
+        # anchored at deps/ if it has its own project, else at the package's
+        # project, with the parent environment behind it
+        deps_project = EnvFiles.projectfile_path(joinpath(source, "deps"); strict = true)
+        prefs_primary = something(deps_project, EnvFiles.projectfile_path(source))
+        write_sandbox_preferences(sandbox, sandbox_preferences(env, prefs_primary))
+        code = """
+        using Pkg
+        cd($(repr(source)))
+        include($(repr(build_file(source))))
+        """
+        cmd = addenv(
+            `$(joinpath(Sys.BINDIR, "julia")) -O0 --color=no --history-file=no --startup-file=no --project=$sandbox --eval $code`,
+            "JULIA_LOAD_PATH" => "@$(Sys.iswindows() ? ';' : ':')@stdlib",
+            "JULIA_PROJECT" => nothing,
+        )
+        if verbose
+            # `verbose`: build output goes to the op's io, not the log
+            # (unwrapping the IOContext hands the child the real stream)
+            out = io isa IOContext ? io.io : io
+            success(pipeline(cmd; stdout = out, stderr = out))
+        else
+            open(log_file, "w") do log
+                success(pipeline(cmd; stdout = log, stderr = log))
+            end
         end
     end
     if !ok && verbose
@@ -114,7 +118,7 @@ end
 
 Build the given packages (deps-first) if they have a `deps/build.jl`.
 With an empty `uuids`, builds the project's direct dependencies that need it.
-`verbose` sends build output to `stdout`/`stderr` instead of the log file.
+`verbose` sends build output to `io` instead of the log file.
 """
 @timeit TIMER "build packages" function build!(
         env::Environment, depots::DepotStack, uuids::Vector{UUID} = UUID[];

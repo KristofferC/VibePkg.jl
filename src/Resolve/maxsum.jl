@@ -58,7 +58,10 @@ mutable struct Messages
         pdict = graph.data.pdict
 
         ## generate wveights (v0 == spp[p0] is the "uninstalled" state)
-        vweight = [[VersionWeight(v0 < spp[p0] ? pvers[p0][v0] : v"0") for v0 in 1:spp[p0]] for p0 in 1:np]
+        # pvers[p0] is sorted, so v0 doubles as the version's rank within the
+        # package: it breaks ties between versions that differ only in
+        # prerelease/build metadata (which VersionWeight otherwise discards)
+        vweight = [[v0 < spp[p0] ? VersionWeight(pvers[p0][v0], v0) : VersionWeight(v"0") for v0 in 1:spp[p0]] for p0 in 1:np]
         preferred_versions = graph.preferred_versions
         if !isempty(preferred_versions)
             pkgs = graph.data.pkgs
@@ -351,13 +354,23 @@ function maxsum(graph::Graph)
     strace = SolutionTrace(graph)
     msgs = Messages(graph)
 
+    entry_depth = length(graph.solve_stack)
     push_snapshot!(graph)
     # gconstr_sav = graph.gconstr
     # ignored_sav = graph.ignored
-    result = converge!(graph, msgs, strace, perm, params, timer)
+    result = try
+        converge!(graph, msgs, strace, perm, params, timer)
+    finally
+        # make sure the timeout timer is released and the snapshot is popped
+        # even if convergence throws (including any nested snapshots converge!
+        # may have left behind when unwinding)
+        close(timer)
+        while length(graph.solve_stack) > entry_depth
+            pop_snapshot!(graph)
+        end
+    end
     # @assert graph.gconstr ≡ gconstr_sav
     # @assert graph.ignored ≡ ignored_sav
-    pop_snapshot!(graph)
     if result == :ok
         @assert strace.best == strace.solution
         @assert strace.num_nondecimated == 0

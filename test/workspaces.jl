@@ -576,6 +576,54 @@ end
         @test occursin("conflicting sources", err.msg)
     end
 
+    # a rev present in one member and missing in the other is a conflict
+    # too (missing means "default branch", not "whatever the sibling says")
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        root = make_workspace(
+            dir,
+            "{url = \"https://example.com/SharedDep.jl.git\", rev = \"v1\"}",
+            "{url = \"https://example.com/SharedDep.jl.git\"}",
+        )
+        env = load_environment(joinpath(root, "A"); depots)
+        err = try
+            plan_resolve(env, regs, Config(depots))
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test occursin("conflicting sources", err.msg)
+        @test occursin("revs", err.msg)
+        @test occursin("not specified", err.msg)
+    end
+
+    # likewise a subdir present in only one member
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        root = make_workspace(
+            dir,
+            "{url = \"https://example.com/SharedDep.jl.git\", subdir = \"sub\"}",
+            "{url = \"https://example.com/SharedDep.jl.git\"}",
+        )
+        env = load_environment(joinpath(root, "A"); depots)
+        err = try
+            plan_resolve(env, regs, Config(depots))
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test occursin("conflicting sources", err.msg)
+        @test occursin("subdirs", err.msg)
+    end
+
     # control: agreeing sources (same location, spelled from each member's
     # own project — rebasing makes them comparable) still resolve
     mktempdir() do dir

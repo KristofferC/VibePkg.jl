@@ -8,6 +8,7 @@ LocalPkgServer.isolate!()
 using Test
 using LibGit2
 using Base: UUID
+import VibePkg
 using VibePkg.Depots: depot_stack
 using VibePkg.Configs: Config
 using VibePkg.Registries: RegistryInstance, reachable_registries
@@ -105,6 +106,13 @@ end
         out = run_shim(shim, "--threads=2", "--", "a", "b")
         @test occursin("app says: a+b", out)
 
+        # literal '!' in arguments survives the shim (on Windows, delayed
+        # expansion would corrupt it — the .bat keeps it disabled throughout)
+        out = run_shim(shim, "a!b", "!c!")
+        @test occursin("app says: a!b+!c!", out)
+        out = run_shim(shim, "--threads=2", "--", "a!b")
+        @test occursin("app says: a!b", out)
+
         # the windows flavor renders a .bat with the same protocol
         bat = AppsOps.shim_contents(
             entry.apps["hello"], depot, "environments/apps/AppPkg";
@@ -114,6 +122,11 @@ end
         @test occursin("set \"JULIA_LOAD_PATH=%depot%\\environments\\apps\\AppPkg\"", bat)
         @test occursin("-m \"AppPkg\"", bat)
         @test occursin(":__next", bat) && occursin(":__done", bat)
+        # delayed expansion must never be enabled: it would eat literal '!'
+        # characters while the arguments are captured and forwarded
+        @test occursin("DisableDelayedExpansion", bat)
+        @test !occursin("EnableDelayedExpansion", bat)
+        @test !occursin("!julia_args!", bat) && !occursin("!app_args!", bat)
 
         # status lists it; rm removes shim + entry
         @test occursin("hello", sprint(io -> AppsOps.app_status(depots; io)))
@@ -591,5 +604,34 @@ end
         recorded = entry_path(entry)
         @test isabspath(recorded)
         @test realpath(recorded) == realpath(pkg)
+    end
+end
+
+# `Apps.rm` and `Apps.status` are local-only: they must operate on the
+# ambient depot stack directly, never through an OpContext (which would
+# bootstrap the default registries into a fresh depot over the network)
+@testset "apps: compat rm/status never bootstrap registries" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        saved_stack = copy(Base.DEPOT_PATH)
+        saved_env = get(ENV, "JULIA_DEPOT_PATH", nothing)
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            ENV["JULIA_DEPOT_PATH"] = depot
+            # status on a fresh depot prints an empty app list, no registry
+            # bootstrap (which would fail against the dead test proxy anyway)
+            out = sprint(io -> VibePkg.Apps.status(; io))
+            @test occursin("Status", out)
+            @test occursin("AppManifest.toml", out)
+            @test !isdir(joinpath(depot, "registries"))
+            # rm of an unknown app errors locally, likewise without touching
+            # registries
+            @test_throws PkgError VibePkg.Apps.rm("NoSuchApp"; io = devnull)
+            @test !isdir(joinpath(depot, "registries"))
+        finally
+            append!(empty!(Base.DEPOT_PATH), saved_stack)
+            saved_env === nothing ? delete!(ENV, "JULIA_DEPOT_PATH") :
+                (ENV["JULIA_DEPOT_PATH"] = saved_env)
+        end
     end
 end

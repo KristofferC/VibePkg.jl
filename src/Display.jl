@@ -355,6 +355,7 @@ function status_compat_info(
             reg_pkg = get(reg, dep_uuid, nothing)
             reg_pkg === nothing && continue
             info = Registries.registry_info(reg, reg_pkg)
+            haskey(info.version_info, dv) || continue   # same precedence rule
             spec = Registries.query_compat_for_version(info, dv, uuid)
             spec === nothing && continue
             if !(max_version in spec)
@@ -363,12 +364,17 @@ function status_compat_info(
         end
     end
 
-    # held back by julia compat
+    # held back by julia compat: only registries that actually ship
+    # `max_version` get a vote — compat queries work on compressed version
+    # ranges, so a registry lacking the version would otherwise answer for
+    # it (typically with `nothing`, i.e. "compatible") using metadata that
+    # belongs to a different registry's version
     julia_compatible = false
     for reg in registries
         reg_pkg = get(reg, uuid, nothing)
         reg_pkg === nothing && continue
         info = Registries.registry_info(reg, reg_pkg)
+        haskey(info.version_info, max_version) || continue
         spec = Registries.query_compat_for_version(info, max_version, Registries.JULIA_UUID)
         if spec === nothing || VERSION in spec
             julia_compatible = true

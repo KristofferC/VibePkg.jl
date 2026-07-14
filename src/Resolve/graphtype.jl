@@ -669,19 +669,26 @@ Finds a minimal collection of ranges as a `VersionSpec`, that permits everything
 """
 function range_compressed_versionspec(pool, subset = pool)
     length(subset) == 1 && return VersionSpec(only(subset))
+    ranges = _contiguous_ranges(pool, subset)
+    return VersionSpec([VersionRange(lo, hi) for (lo, hi) in ranges])
+end
+
+# shared helper: the (first, last) version pairs of the maximal runs of
+# `subset` that are contiguous within `pool`
+function _contiguous_ranges(pool, subset)
     # PREM-OPT: we keep re-sorting these, probably not required.
     sort!(pool)
     sort!(subset)
     @assert subset ⊆ pool
 
-    contiguous_subsets = VersionRange[]
+    contiguous_subsets = Tuple{VersionNumber, VersionNumber}[]
 
     range_start = first(subset)
     pool_ii = something(findfirst(isequal(range_start), pool)) + 1  # skip-forward til we have started
     for s in @view subset[2:end]
         if s != pool[pool_ii]
             range_end = pool[pool_ii - 1]  # previous element was last in this range
-            push!(contiguous_subsets, VersionRange(range_start, range_end))
+            push!(contiguous_subsets, (range_start, range_end))
             range_start = s  # start a new range
             while (s != pool[pool_ii])  # advance til time to start
                 pool_ii += 1
@@ -689,9 +696,28 @@ function range_compressed_versionspec(pool, subset = pool)
         end
         pool_ii += 1
     end
-    push!(contiguous_subsets, VersionRange(range_start, last(subset)))
+    push!(contiguous_subsets, (range_start, last(subset)))
 
-    return VersionSpec(contiguous_subsets)
+    return contiguous_subsets
+end
+
+"""
+    compressed_versions_string(pool, subset = pool)
+
+Render the same compressed ranges as `range_compressed_versionspec`, but for
+diagnostics: `VersionRange`/`VersionSpec` only track major.minor.patch, so
+versions that differ only in prerelease/build metadata (e.g. the distinct JLL
+builds 1.2.3+0 and 1.2.3+1) would render identically through them. Here
+singleton ranges are rendered as the full `VersionNumber` instead, which
+preserves the metadata; genuine ranges keep the compact `lo - hi` form.
+"""
+function compressed_versions_string(pool, subset = pool)
+    length(subset) == 1 && return string(only(subset))
+    ranges = _contiguous_ranges(pool, subset)
+    parts = [lo == hi ? string(lo) : string(VersionRange(lo, hi)) for (lo, hi) in ranges]
+    # mirror the VersionSpec printing so metadata-free output is unchanged
+    length(parts) == 1 && return only(parts)
+    return string("[", join(parts, ", "), "]")
 end
 
 function init_log!(data::GraphData)
@@ -706,8 +732,7 @@ function init_log!(data::GraphData)
         if isempty(versions)
             msg = "$(logstr(id)) has no known versions!" # This shouldn't happen?
         else
-            vspec = range_compressed_versionspec(versions)
-            vers = logstr(id, vspec)
+            vers = logstr(id, compressed_versions_string(versions))
             uuid = data.pkgs[p0]
             name = data.uuid_to_name[uuid]
             pkgid = Base.PkgId(uuid, name)
@@ -739,8 +764,7 @@ end
 
 function _vs_string(p0::Int, vmask::BitVector, id::String, pvers::Vector{Vector{VersionNumber}})
     if any(vmask[1:(end - 1)])
-        vspec = range_compressed_versionspec(pvers[p0], pvers[p0][vmask[1:(end - 1)]])
-        vns = logstr(id, vspec)
+        vns = logstr(id, compressed_versions_string(pvers[p0], pvers[p0][vmask[1:(end - 1)]]))
         vmask[end] && (vns *= " or uninstalled")
     else
         @assert vmask[end]
@@ -974,8 +998,7 @@ function log_event_eq_classes!(graph::Graph, p0::Int)
     msg = "versions reduced by equivalence to: "
 
     if any(gconstr[p0][1:(end - 1)])
-        vspec = range_compressed_versionspec(pvers[p0], pvers[p0][gconstr[p0][1:(end - 1)]])
-        msg *= logstr(id, vspec)
+        msg *= logstr(id, compressed_versions_string(pvers[p0], pvers[p0][gconstr[p0][1:(end - 1)]]))
         gconstr[p0][end] && (msg *= " or uninstalled")
     elseif gconstr[p0][end]
         msg *= "uninstalled"

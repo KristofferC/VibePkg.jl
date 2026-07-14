@@ -441,3 +441,108 @@ end
         @test Base.ispublic(VibePkg, name)
     end
 end
+
+# src/VibePkg.jl keeps three parallel lists (alias consts, `export`s, `public`
+# declarations); these structural invariants catch drift between them without
+# maintaining a fourth list here.
+@testset "alias/export/public list consistency" begin
+    # every exported or `public` name resolves to a real binding
+    for n in names(VibePkg)          # includes `public` names
+        @test isdefined(VibePkg, n)
+    end
+    # every alias const re-exposing an API/Git function or type is part of
+    # the public surface (exported or marked `public`)
+    checked = 0
+    for source in (VibePkg.API, VibePkg.Git)
+        for n in names(VibePkg; all = true)
+            startswith(String(n), "#") && continue
+            (isdefined(VibePkg, n) && isdefined(source, n)) || continue
+            val = getglobal(VibePkg, n)
+            val isa Module && continue
+            val === getglobal(source, n) || continue
+            checked += 1
+            @test Base.ispublic(VibePkg, n)
+        end
+    end
+    @test checked >= 27              # the alias block (aliases can share targets)
+end
+
+# status_compat_info must not mix metadata across registries: only registries
+# that actually ship `max_version` may vote on its julia compatibility (compat
+# queries work on compressed ranges, so a registry lacking the version would
+# otherwise answer `nothing`, i.e. "compatible", for it)
+@testset "status_compat_info julia compat across registries" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        function write_reg(name, reg_uuid, versions_toml, compat_toml)
+            reg = joinpath(depot, "registries", name)
+            pkg = joinpath(reg, "E", "Example")
+            mkpath(pkg)
+            write(
+                joinpath(reg, "Registry.toml"), """
+                name = "$name"
+                uuid = "$reg_uuid"
+                repo = "https://example.com/$name.git"
+
+                [packages]
+                7876af07-990d-54b4-ab0e-23690620f79a = { name = "Example", path = "E/Example" }
+                """
+            )
+            write(
+                joinpath(pkg, "Package.toml"), """
+                name = "Example"
+                uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+                repo = "https://example.com/Example.jl.git"
+                """
+            )
+            write(joinpath(pkg, "Versions.toml"), versions_toml)
+            write(joinpath(pkg, "Compat.toml"), compat_toml)
+            return
+        end
+        # RegA ships 0.5.0 and 0.9.0; 0.9.0 needs a future julia
+        write_reg(
+            "RegA", "aaaaaaaa-aafe-5451-b93e-139f81909106",
+            """
+            ["0.5.0"]
+            git-tree-sha1 = "1111111111111111111111111111111111111111"
+
+            ["0.9.0"]
+            git-tree-sha1 = "2222222222222222222222222222222222222222"
+            """,
+            """
+            ["0.5"]
+            julia = "1"
+
+            ["0.9"]
+            julia = "2"
+            """
+        )
+        # RegB ships only 0.5.0: it must get no vote on 0.9.0's julia compat
+        write_reg(
+            "RegB", "bbbbbbbb-aafe-5451-b93e-139f81909106",
+            """
+            ["0.5.0"]
+            git-tree-sha1 = "1111111111111111111111111111111111111111"
+            """,
+            """
+            ["0.5"]
+            julia = "1"
+            """
+        )
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        @test length(regs) == 2
+        proj = mkpath(joinpath(dir, "proj"))
+        env = load_environment(proj; depots)
+        planned = Planning.plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+        write_environment(env, planned)
+        env = load_environment(proj; depots)
+        entry = env.manifest[EXAMPLE_UUID]
+        @test entry_version(entry) == v"0.5.0"    # 0.9.0 excluded by julia compat
+        cinfo = VibePkg.Display.status_compat_info(env, EXAMPLE_UUID, entry, regs)
+        @test cinfo !== nothing
+        holding, maxv, _ = cinfo
+        @test maxv == v"0.9.0"
+        @test "julia" in holding                  # RegB must not vouch for 0.9.0
+    end
+end

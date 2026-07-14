@@ -227,3 +227,31 @@ end
         @test isfile(joinpath(pkgdir, "src", "Example.jl"))
     end
 end
+
+if !@isdefined(make_test_registry)
+    include("testhelpers.jl")
+end
+
+# Regression: pkg_may_have_extensions must be conservative — it may return
+# false only when a registry that knows the exact version affirmatively
+# records no weakdeps for it. Otherwise (package or version unknown to every
+# registry) selective instantiate could skip a real extension provider.
+@testset "pkg_may_have_extensions is conservative" begin
+    mktempdir() do depot
+        make_test_registry(depot)   # Example: 0.5.0, 0.5.1, 1.0.0; WeakDeps for "1"
+        regs = reachable_registries(depot_stack([depot]))
+        may = VibePkg.Execution.pkg_may_have_extensions
+        # registry records weakdeps covering 1.0.0
+        @test may(regs, EXAMPLE_UUID, v"1.0.0")
+        # registry knows 0.5.0 and no weakdeps range covers it
+        @test !may(regs, EXAMPLE_UUID, v"0.5.0")
+        # version unknown to every registry → nothing rules extensions out
+        @test may(regs, EXAMPLE_UUID, v"0.6.0")
+        # package unknown to every registry → nothing rules extensions out
+        @test may(regs, UUID("deadbeef-dead-beef-dead-beefdeadbeef"), v"1.0.0")
+        # non-concrete version → always possible
+        @test may(regs, EXAMPLE_UUID, nothing)
+        # no registries at all → nothing rules extensions out
+        @test may(VibePkg.Registries.RegistryInstance[], EXAMPLE_UUID, v"1.0.0")
+    end
+end

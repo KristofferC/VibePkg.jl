@@ -133,7 +133,7 @@ function try_install_from(
         progress_header::Union{Nothing, String} = nothing,
     )
     tarball = tempname()
-    try
+    return try
         try
             Fetch.download(url, tarball; io, depots, progress_header)
         catch err
@@ -147,29 +147,43 @@ function try_install_from(
         # unpack on the same filesystem as the destination for atomic rename
         temp_root = mkpath(joinpath(dirname(dest), "temp"))
         temp = mktempdir(temp_root)
+        # own `temp` with try/finally: interrupts, hashing failures, and rename
+        # failures must not leave partial trees in the GC-exempt temp directory
+        # (after a successful rename `temp` is gone and the rm is a no-op)
         try
-            Fetch.unpack(tarball, temp)
-        catch err
-            err isa InterruptException && rethrow()
-            @warn "failed to extract artifact archive" url
-            Base.rm(temp; force = true, recursive = true)
-            return false
-        end
-        computed = SHA1(TreeHash.tree_hash(temp))
-        legacy_matches = computed != hash &&
-            SHA1(TreeHash.tree_hash(temp; legacy_symlink_size = true)) == hash
-        if computed != hash && !legacy_matches
-            if ignore_hashes(dirname(dest))
-                @error "artifact content does not match its tree hash; " *
-                    "ignoring the mismatch and installing anyway" url expected = hash computed
-            else
-                @warn "artifact content does not match its tree hash; skipping this source" url expected = hash computed
-                Base.rm(temp; force = true, recursive = true)
+            try
+                Fetch.unpack(tarball, temp)
+            catch err
+                err isa InterruptException && rethrow()
+                @warn "failed to extract artifact archive" url
                 return false
             end
+            # tree_hash throws on unreadable content; treat that like any
+            # other bad download and fall through to the next source
+            computed, legacy_matches = try
+                c = SHA1(TreeHash.tree_hash(temp))
+                lm = c != hash &&
+                    SHA1(TreeHash.tree_hash(temp; legacy_symlink_size = true)) == hash
+                c, lm
+            catch err
+                err isa InterruptException && rethrow()
+                @warn "failed to verify unpacked artifact; skipping this source" url err
+                return false
+            end
+            if computed != hash && !legacy_matches
+                if ignore_hashes(dirname(dest))
+                    @error "artifact content does not match its tree hash; " *
+                        "ignoring the mismatch and installing anyway" url expected = hash computed
+                else
+                    @warn "artifact content does not match its tree hash; skipping this source" url expected = hash computed
+                    return false
+                end
+            end
+            mv_temp_dir_retries(temp, dest; set_permissions = true)   # artifacts are read-only
+            return true
+        finally
+            Base.rm(temp; force = true, recursive = true)
         end
-        mv_temp_dir_retries(temp, dest; set_permissions = true)   # artifacts are read-only
-        return true
     finally
         Base.rm(tarball; force = true)
     end

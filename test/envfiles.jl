@@ -517,6 +517,90 @@ end
     @test rt[d1].julia_syntax_version == v"1.13.0"
 end
 
+# Project [apps] must serialize from the typed field: a functional update
+# (add/remove/change) must reach the written file instead of the stale raw
+# table surviving unchanged.
+@testset "project [apps] serialization from typed field" begin
+    raw = """
+    name = "AppPkg"
+    uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+
+    [apps.main]
+    submodule = "CLI"
+    julia_flags = ["--threads=2"]
+    custom_key = "kept"
+
+    [apps.plain]
+    """
+    p = parse_project(TOML.parse(raw))
+    out = TOML.parse(render_project(p))
+    @test out["apps"]["main"]["submodule"] == "CLI"
+    @test out["apps"]["main"]["julia_flags"] == ["--threads=2"]
+    @test out["apps"]["main"]["custom_key"] == "kept"   # unknown keys survive
+    @test haskey(out["apps"], "plain")
+    @test parse_project(TOML.parse(render_project(p))) == p
+
+    # removing an app through a functional update removes it on write
+    p2 = with_project(p; apps = Dict("main" => p.apps["main"]))
+    @test !haskey(TOML.parse(render_project(p2))["apps"], "plain")
+
+    # a freshly added app is written
+    extra = AppInfo("extra", nothing, "Sub", ["--startup-file=no"], Dict{String, Any}())
+    p3 = with_project(p; apps = merge(p.apps, Dict("extra" => extra)))
+    out3 = TOML.parse(render_project(p3))["apps"]["extra"]
+    @test out3["submodule"] == "Sub" && out3["julia_flags"] == ["--startup-file=no"]
+
+    # clearing every app drops the section entirely
+    p4 = with_project(p; apps = Dict{String, AppInfo}())
+    @test !haskey(TOML.parse(render_project(p4)), "apps")
+
+    # cleared typed fields disappear from the app's raw table too
+    changed = AppInfo("main", nothing, nothing, String[], p.apps["main"].raw)
+    p5 = with_project(p; apps = Dict("main" => changed, "plain" => p.apps["plain"]))
+    out5 = TOML.parse(render_project(p5))["apps"]["main"]
+    @test !haskey(out5, "submodule") && !haskey(out5, "julia_flags")
+    @test out5["custom_key"] == "kept"
+end
+
+# workspace `projects` straight from TOML must be validated as a vector of
+# strings before being iterated (a scalar or non-string entry is a user
+# error, not a crash)
+@testset "workspace projects validation" begin
+    @test parse_project(TOML.parse("[workspace]\nprojects = [\"sub\"]")).workspace["projects"] == ["sub"]
+    # empty TOML arrays parse as Vector{Any} but are valid
+    @test isempty(parse_project(TOML.parse("[workspace]\nprojects = []")).workspace["projects"])
+    @test_throws PkgError parse_project(TOML.parse("[workspace]\nprojects = \"sub\""))
+    @test_throws PkgError parse_project(TOML.parse("[workspace]\nprojects = 1"))
+    @test_throws PkgError parse_project(TOML.parse("[workspace]\nprojects = [1, \"sub\"]"))
+    @test_throws PkgError parse_project(TOML.parse("[workspace]\nother = [\"x\"]"))
+end
+
+# a symlinked Project.toml keeps the environment's identity at the link:
+# only the parent directory is canonicalized, so the manifest lands beside
+# the link rather than beside its target
+@testset "find_project_file preserves a project-file symlink" begin
+    if !Sys.iswindows()     # symlink creation may need privileges on Windows
+        mktempdir() do dir
+            target_dir = mkpath(joinpath(dir, "target"))
+            target = joinpath(target_dir, "Project.toml")
+            write(target, "name = \"Linked\"\n")
+            envdir = mkpath(joinpath(dir, "env"))
+            link = joinpath(envdir, "Project.toml")
+            symlink(target, link)
+
+            pf = VibePkg.Environments.find_project_file(link)
+            @test pf == joinpath(realpath(envdir), "Project.toml")
+            @test islink(pf)
+            # the directory form resolves to the same place
+            @test VibePkg.Environments.find_project_file(envdir) == pf
+
+            env = VibePkg.Environments.load_environment(envdir; depots = VibePkg.Depots.depot_stack())
+            @test env.project.name == "Linked"                     # reads through the link
+            @test dirname(env.manifest_file) == realpath(envdir)   # manifest beside the link
+        end
+    end
+end
+
 # Pkg.jl#4720: reverse-dependency edges built in one pass
 @testset "manifest_dependents_map" begin
     u = i -> UUID(UInt128(i))

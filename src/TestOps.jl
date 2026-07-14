@@ -184,7 +184,7 @@ function test_subprocess_flags(
         --code-coverage=$(coverage_arg)
         --color=$(Base.have_color === nothing ? "auto" : Base.have_color ? "yes" : "no")
         --warn-overwrite=$(Base.JLOptions().warn_overwrite == 1 ? "yes" : "no")
-        --depwarn=$(Base.JLOptions().depwarn == 2 ? "error" : "yes")
+        --depwarn=$(("no", "yes", "error")[Base.JLOptions().depwarn + 1])
         --inline=$(Bool(Base.JLOptions().can_inline) ? "yes" : "no")
         --startup-file=$(Base.JLOptions().startupfile == 1 ? "yes" : "no")
         --track-allocation=$(("none", "user", "all")[Base.JLOptions().malloc_log + 1])
@@ -332,74 +332,77 @@ function test!(
         return run_test_process(name, test_dir, runtests, source; coverage, julia_args, test_args, autoprecompile, io)
     end
 
-    sandbox = mktempdir()
-    project = sandbox_project(source, name, pkg_uuid, env.project)
-    # preferences travel into the sandbox pre-merged (Pkg parity): the
-    # cascade is anchored at the test project (the package's own project
-    # for the legacy [targets] path), so test-level preferences win over
-    # the parent environment's
-    prefs_primary = isfile(joinpath(source, "test", "Project.toml")) ?
-        joinpath(source, "test") : EnvFiles.projectfile_path(source)
-    Execution.write_sandbox_preferences(sandbox, Execution.sandbox_preferences(env, prefs_primary))
-    if force_latest_compatible_version
-        project = force_latest_compat(
-            project, pkg_uuid, registries;
-            allow_earlier_backwards_compatible_versions,
-        )
-    end
-    # the slice must keep the test project's own deps too (Pkg's
-    # `sandbox_preserve`): a repo-tracked test dep needs its manifest pin
-    # to resolve without fetching
-    manifest = sliced_manifest(env, depots, [pkg_uuid; collect(values(project.deps))])
-    manifest = merge_test_manifest(manifest, source)
-    # the tested package tracks its source tree
-    version = entry === nothing ? env.project.version : EnvFiles.entry_version(entry)
-    manifest = with_manifest(
-        manifest;
-        deps = merge(
-            manifest.deps, Dict(
-                pkg_uuid => ManifestEntry(
-                    name, pkg_uuid, PathTracked(source, version), false,
-                    haskey(manifest, pkg_uuid) ? manifest[pkg_uuid].deps : Dict{String, UUID}(),
-                    Dict{String, UUID}(), Dict{String, Union{String, Vector{String}}}(),
-                    Dict{String, EnvFiles.AppInfo}(), nothing, nothing, Dict{String, Any}(),
-                )
+    # the sandbox is scoped to the run: mktempdir-do removes it as soon as
+    # the test subprocess has finished (not at process exit)
+    return mktempdir() do sandbox
+        project = sandbox_project(source, name, pkg_uuid, env.project)
+        # preferences travel into the sandbox pre-merged (Pkg parity): the
+        # cascade is anchored at the test project (the package's own project
+        # for the legacy [targets] path), so test-level preferences win over
+        # the parent environment's
+        prefs_primary = isfile(joinpath(source, "test", "Project.toml")) ?
+            joinpath(source, "test") : EnvFiles.projectfile_path(source)
+        Execution.write_sandbox_preferences(sandbox, Execution.sandbox_preferences(env, prefs_primary))
+        if force_latest_compatible_version
+            project = force_latest_compat(
+                project, pkg_uuid, registries;
+                allow_earlier_backwards_compatible_versions,
             )
-        ),
-    )
-    sandbox_env = Environment(
-        joinpath(sandbox, "Project.toml"), joinpath(sandbox, "Manifest.toml"),
-        project, manifest,
-    )
-    empty_env = Environment(
-        sandbox_env.project_file, sandbox_env.manifest_file, Project(), Manifest(),
-    )
-    write_environment(empty_env, sandbox_env)
-    # resolve + install the test-only dependencies through the normal pipeline
-    loaded = Environments.load_environment_from(sandbox_env.project_file; depots)
-    printpkgstyle(io, :Resolving, "package versions...")
-    planned = try
-        plan_resolve(loaded, registries, config)
-    catch err
-        (err isa Resolve.ResolverError && allow_reresolve) || rethrow()
-        printpkgstyle(
-            io, :Test,
-            string(
-                "Could not use exact versions of packages in manifest, re-resolving. ",
-                "Note: if you do not check your manifest file into source control, ",
-                "then you can probably ignore this message. ",
-                "However, if you do check your manifest file into source control, ",
-                "then you probably want to pass the `allow_reresolve = false` kwarg ",
-                "when calling the `Pkg.test` function.",
+        end
+        # the slice must keep the test project's own deps too (Pkg's
+        # `sandbox_preserve`): a repo-tracked test dep needs its manifest pin
+        # to resolve without fetching
+        manifest = sliced_manifest(env, depots, [pkg_uuid; collect(values(project.deps))])
+        manifest = merge_test_manifest(manifest, source)
+        # the tested package tracks its source tree
+        version = entry === nothing ? env.project.version : EnvFiles.entry_version(entry)
+        manifest = with_manifest(
+            manifest;
+            deps = merge(
+                manifest.deps, Dict(
+                    pkg_uuid => ManifestEntry(
+                        name, pkg_uuid, PathTracked(source, version), false,
+                        haskey(manifest, pkg_uuid) ? manifest[pkg_uuid].deps : Dict{String, UUID}(),
+                        Dict{String, UUID}(), Dict{String, Union{String, Vector{String}}}(),
+                        Dict{String, EnvFiles.AppInfo}(), nothing, nothing, Dict{String, Any}(),
+                    )
+                )
             ),
-            color = Base.warn_color(),
         )
-        reresolved = plan_up(loaded, registries, config, PackageRequest[])
-        printpkgstyle(io, :Test, "Successfully re-resolved")
-        reresolved
+        sandbox_env = Environment(
+            joinpath(sandbox, "Project.toml"), joinpath(sandbox, "Manifest.toml"),
+            project, manifest,
+        )
+        empty_env = Environment(
+            sandbox_env.project_file, sandbox_env.manifest_file, Project(), Manifest(),
+        )
+        write_environment(empty_env, sandbox_env)
+        # resolve + install the test-only dependencies through the normal pipeline
+        loaded = Environments.load_environment_from(sandbox_env.project_file; depots)
+        printpkgstyle(io, :Resolving, "package versions...")
+        planned = try
+            plan_resolve(loaded, registries, config)
+        catch err
+            (err isa Resolve.ResolverError && allow_reresolve) || rethrow()
+            printpkgstyle(
+                io, :Test,
+                string(
+                    "Could not use exact versions of packages in manifest, re-resolving. ",
+                    "Note: if you do not check your manifest file into source control, ",
+                    "then you can probably ignore this message. ",
+                    "However, if you do check your manifest file into source control, ",
+                    "then you probably want to pass the `allow_reresolve = false` kwarg ",
+                    "when calling the `Pkg.test` function.",
+                ),
+                color = Base.warn_color(),
+            )
+            reresolved = plan_up(loaded, registries, config, PackageRequest[])
+            printpkgstyle(io, :Test, "Successfully re-resolved")
+            reresolved
+        end
+        Execution.apply!(loaded, planned, registries, config; io)
+        run_test_process(name, sandbox, runtests, source; coverage, julia_args, test_args, autoprecompile, io)
     end
-    Execution.apply!(loaded, planned, registries, config; io)
-    return run_test_process(name, sandbox, runtests, source; coverage, julia_args, test_args, autoprecompile, io)
 end
 
 # TODO: Should be included in Base

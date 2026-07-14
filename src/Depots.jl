@@ -11,6 +11,7 @@ using TOML: TOML
 using FileWatching: mkpidlock
 
 using ..Errors: pkgerror
+using ..Utils: atomic_toml_write
 
 export DepotStack, depot_stack, depots, depots1, logdir,
     packages_dir, clones_dir, registries_dir, artifacts_dir,
@@ -55,30 +56,10 @@ function find_installed(d::DepotStack, name::String, uuid::UUID, tree_hash::SHA1
     for depot in depots(d)
         for slug in (slug_default, Base.version_slug(uuid, tree_hash, 4))
             path = abspath(packages_dir(depot), name, slug)
-            ispath(path) && return path, true
+            isdir(path) && return path, true
         end
     end
     return abspath(packages_dir(depots1(d)), name, slug_default), false
-end
-
-"""
-    atomic_toml_write(path, data; kws...)
-
-Write TOML data via a temporary file + rename, preventing torn writes.
-"""
-function atomic_toml_write(path::String, data; kws...)
-    dir = dirname(path)
-    isempty(dir) && (dir = pwd())
-    temp_path, temp_io = mktemp(dir)
-    return try
-        TOML.print(temp_io, data; kws...)
-        close(temp_io)
-        mv(temp_path, path; force = true)
-    catch
-        close(temp_io)
-        rm(temp_path; force = true)
-        rethrow()
-    end
 end
 
 """
@@ -190,8 +171,11 @@ function log_scratch_usage(d::DepotStack, scratch_dir::AbstractString, parent_pr
                     e isa AbstractDict || continue
                     t = get(e, "time", nothing)
                     t isa Union{Dates.Date, Dates.DateTime} && push!(times, Dates.DateTime(t))
-                    for p in get(e, "parent_projects", String[])
-                        p isa String && push!(parents, p)
+                    pps = get(e, "parent_projects", nothing)
+                    if pps isa Vector
+                        for p in pps
+                            p isa String && push!(parents, p)
+                        end
                     end
                 end
             end

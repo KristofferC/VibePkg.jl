@@ -38,8 +38,19 @@ should_print_timings() =
     const TIMER = TimerOutput()
     disable_timer!(TIMER)   # only running while an operation is in flight
 
-    # operations never cross task boundaries, so a depth counter suffices
-    const OP_DEPTH = Ref(0)
+    # Independent tasks may each start a top-level operation: the single
+    # global TIMER is protected by a lock held for the whole outermost
+    # operation, serializing timed top-level operations across tasks. The
+    # depth counter is a ScopedValue, not task-local storage: tasks spawned
+    # inside an in-flight operation inherit its depth, so an entry point
+    # reached from such a task counts as nested and never blocks on the
+    # lock its spawner is holding (task-local depth would restart at 0
+    # there and deadlock as soon as the spawner waits on the task).
+    const TIMER_LOCK = ReentrantLock()
+
+    const OP_DEPTH = Base.ScopedValues.ScopedValue(0)
+
+    op_depth() = OP_DEPTH[]::Int
 
     function maybe_print_timings()
         should_print_timings() || return
@@ -64,19 +75,22 @@ should_print_timings() =
         Meta.isexpr(fdef, :function) && length(fdef.args) == 2 ||
             error("@operation expects a `function ... end` definition")
         body = quote
-            local outermost = OP_DEPTH[] == 0
-            if outermost
-                reset_timer!(TIMER)
-                enable_timer!(TIMER)
-            end
-            OP_DEPTH[] += 1
+            local depth = op_depth()
+            local outermost = depth == 0
+            outermost && lock(TIMER_LOCK)
             try
-                @timeit TIMER $label $(esc(fdef.args[2]))
+                if outermost
+                    reset_timer!(TIMER)
+                    enable_timer!(TIMER)
+                end
+                Base.ScopedValues.@with OP_DEPTH => depth + 1 begin
+                    @timeit TIMER $label $(esc(fdef.args[2]))
+                end
             finally
-                OP_DEPTH[] -= 1
                 if outermost
                     disable_timer!(TIMER)
                     maybe_print_timings()
+                    unlock(TIMER_LOCK)
                 end
             end
         end

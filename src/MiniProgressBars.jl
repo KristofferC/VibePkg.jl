@@ -99,8 +99,12 @@ function show_progress(io::IO, p::MiniProgressBar; termwidth = nothing, carriage
         p.prev_lines > 1 && print(io, "\e[", p.prev_lines - 1, "A")
         print(io, "\e[2K", " "^p.indent)
         if p.main
-            printstyled(io, headers[1], " "; color = :green, bold = true)
-            length(headers) > 1 && printstyled(io, join(headers[2:end], ' '), " ")
+            # an empty header (the `MiniProgressBar()` default) splits to
+            # no words at all — print nothing rather than index headers[1]
+            if !isempty(headers)
+                printstyled(io, headers[1], " "; color = :green, bold = true)
+                length(headers) > 1 && printstyled(io, join(headers[2:end], ' '), " ")
+            end
         else
             print(io, p.header, " ")
         end

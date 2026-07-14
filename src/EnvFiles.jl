@@ -511,9 +511,9 @@ function read_project_workspace(raw::Dict)
     workspace_table = Dict{String, Any}()
     for (key, val) in raw
         if key == "projects"
-            for path in val
-                path isa String || pkgerror("Expected entry in `projects` to be strings")
-            end
+            # an empty or heterogeneous TOML array parses as Vector{Any}
+            val isa Vector && all(x -> x isa String, val) ||
+                pkgerror("Expected `projects` in the `workspace` section to be a list of strings")
         else
             pkgerror("Invalid key `$key` in `workspace`")
         end
@@ -673,6 +673,18 @@ function destructure_project(project::Project)::Dict{String, Any}
     entry!("extras", project.extras)
     entry!("compat", Dict(name => x.str for (name, x) in project.compat))
     entry!("targets", project.targets)
+    appdict = Dict{String, Any}()
+    for (appname, appinfo) in project.apps
+        # start from the app's raw table so unrecognized keys survive; the
+        # typed fields overwrite (or remove) their raw counterparts
+        app_dict = Dict{String, Any}(appinfo.raw)
+        appinfo.submodule === nothing ? delete!(app_dict, "submodule") :
+            (app_dict["submodule"] = appinfo.submodule)
+        isempty(appinfo.julia_flags) ? delete!(app_dict, "julia_flags") :
+            (app_dict["julia_flags"] = appinfo.julia_flags)
+        appdict[appname] = app_dict
+    end
+    entry!("apps", appdict)
     entry!(
         "syntax", project.julia_syntax_version === nothing ? nothing :
             Dict("julia_version" => string(project.julia_syntax_version))

@@ -331,6 +331,38 @@ end
     end
 end
 
+# rm must retain [sources] entries of surviving weak dependencies, like the
+# compat entries above (the sources filter used to check only deps/extras)
+@testset "rm keeps [sources] of weakdeps" begin
+    mktempdir() do dir
+        write(
+            joinpath(dir, "Project.toml"), """
+            [deps]
+            Example = "$EXAMPLE_UUID"
+
+            [weakdeps]
+            SHA = "$SHA_UUID"
+            """
+        )
+        depot = mkpath(joinpath(dir, "depot"))
+        env = load_environment(dir; depots = depot_stack([depot]))
+        # the reader limits [sources] to deps/extras, so a weak dep's entry
+        # only arises in memory; attach one before planning the rm
+        project = VibePkg.EnvFiles.with_project(
+            env.project;
+            sources = Dict(
+                "SHA" => VibePkg.EnvFiles.SourceSpec(
+                    nothing, "https://example.com/SHA.jl.git", "main", nothing
+                ),
+            ),
+        )
+        env = Environment(env.project_file, env.manifest_file, project, env.manifest, env.workspace)
+        env2 = plan_rm(env, [PackageRequest("Example")])
+        @test !haskey(env2.project.deps, "Example")
+        @test haskey(env2.project.sources, "SHA")
+    end
+end
+
 # Pkg.jl#3814 — a [weakdeps] entry of the project with a [compat] bound
 # constrains the version when something else pulls the package in, and the
 # weakdep alone does not put it in the manifest

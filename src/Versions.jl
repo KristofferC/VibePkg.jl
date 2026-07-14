@@ -110,6 +110,7 @@ end
 function VersionBound(s::AbstractString)
     s = strip(s)
     s == "*" && return VersionBound()
+    isempty(s) && throw(ArgumentError("invalid VersionBound string $(repr(s))"))
     first(s) == 'v' && (s = SubString(s, 2))
     l = lastindex(s)
 
@@ -169,7 +170,7 @@ const VersionRange_1 = VersionRange(VersionBound("1"), VersionBound("1"))
 function VersionRange(s::AbstractString)
     s == "1" && return VersionRange_1
     p = split(s, "-")
-    if length(p) != 1 && length(p) != 2
+    if (length(p) != 1 && length(p) != 2) || any(x -> isempty(strip(x)), p)
         throw(ArgumentError("invalid version range: $(repr(s))"))
     end
     lower = VersionBound(p[1])

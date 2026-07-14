@@ -1496,3 +1496,88 @@ end
         end
     end
 end
+
+# develop must honor PackageSpec.subdir for path and url requests: the
+# tracked project is the one under `subdir`, not the repository root
+@testset "develop honors subdir" begin
+    LibGit2 = VibePkg.Git.LibGit2
+    sub_uuid = Base.UUID("5abd1e00-1111-4111-8111-111111111111")
+    root_uuid = Base.UUID("400f0000-2222-4222-8222-222222222222")
+    mktempdir() do depot
+        make_test_registry(depot)
+        mktempdir() do dir
+            # a monorepo: a decoy package at the root and the real one below
+            repo_dir = joinpath(dir, "Mono")
+            mkpath(joinpath(repo_dir, "src"))
+            write(
+                joinpath(repo_dir, "Project.toml"), """
+                name = "RootPkg"
+                uuid = "$root_uuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(repo_dir, "src", "RootPkg.jl"), "module RootPkg end\n")
+            subpkg = joinpath(repo_dir, "SubPkg")
+            mkpath(joinpath(subpkg, "src"))
+            write(
+                joinpath(subpkg, "Project.toml"), """
+                name = "SubPkg"
+                uuid = "$sub_uuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(subpkg, "src", "SubPkg.jl"), "module SubPkg end\n")
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            old_devdir = get(ENV, "JULIA_PKG_DEVDIR", nothing)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                ENV["JULIA_PKG_DEVDIR"] = joinpath(dir, "devdir")
+
+                # path + subdir tracks the subproject, not the root project
+                envdir = mkpath(joinpath(dir, "env-path"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                VibePkg.develop(VibePkg.PackageSpec(path = repo_dir, subdir = "SubPkg"); io = devnull)
+                env = load_environment(envdir; depots = depot_stack([depot]))
+                @test haskey(env.manifest, sub_uuid)
+                @test !haskey(env.manifest, root_uuid)
+                @test VibePkg.EnvFiles.entry_path(env.manifest[sub_uuid]) == subpkg
+
+                # a nonexistent subdir errors before anything is written
+                envdir2 = mkpath(joinpath(dir, "env-bad"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir2, "Project.toml")
+                @test_throws PkgError VibePkg.develop(
+                    VibePkg.PackageSpec(path = repo_dir, subdir = "NoSuchDir"); io = devnull
+                )
+                @test !isfile(joinpath(envdir2, "Manifest.toml"))
+
+                # url + subdir: the clone is tracked at its subdirectory
+                gitrepo = LibGit2.init(repo_dir)
+                try
+                    LibGit2.add!(gitrepo, "Project.toml", joinpath("src", "RootPkg.jl"))
+                    LibGit2.add!(gitrepo, joinpath("SubPkg", "Project.toml"), joinpath("SubPkg", "src", "SubPkg.jl"))
+                    sig = LibGit2.Signature("vibepkg-test", "test@example.com")
+                    LibGit2.commit(gitrepo, "init"; author = sig, committer = sig)
+                finally
+                    close(gitrepo)
+                end
+                envdir3 = mkpath(joinpath(dir, "env-url"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir3, "Project.toml")
+                VibePkg.develop(VibePkg.PackageSpec(url = repo_dir, subdir = "SubPkg"); io = devnull)
+                env3 = load_environment(envdir3; depots = depot_stack([depot]))
+                @test haskey(env3.manifest, sub_uuid)
+                @test !haskey(env3.manifest, root_uuid)
+                @test VibePkg.EnvFiles.entry_path(env3.manifest[sub_uuid]) ==
+                    joinpath(dir, "devdir", "Mono", "SubPkg")
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+                old_devdir === nothing ? delete!(ENV, "JULIA_PKG_DEVDIR") : (ENV["JULIA_PKG_DEVDIR"] = old_devdir)
+            end
+        end
+    end
+end

@@ -42,6 +42,15 @@ end
         path2, installed2 = find_installed(d, "Example", uuid, sha)
         @test installed2 && path2 == abspath(legacy)
 
+        # a stray regular file at the slug path is not an installation
+        sha_f = Base.SHA1("ffffffffffffffffffffffffffffffffffffffff")
+        stray = joinpath(depot, "packages", "Example", Base.version_slug(uuid, sha_f))
+        mkpath(dirname(stray))
+        write(stray, "not a package tree")
+        path3, installed3 = find_installed(d, "Example", uuid, sha_f)
+        @test !installed3
+        @test path3 == abspath(stray)
+
         # usage log: append + compaction to one entry per key
         f = joinpath(depot, "something", "Manifest.toml")
         mkpath(dirname(f)); write(f, "")
@@ -50,6 +59,41 @@ end
         usage = TOML.parsefile(joinpath(depot, "logs", "manifest_usage.toml"))
         @test length(usage[f]) == 1
         @test haskey(usage[f][1], "time")
+    end
+end
+
+# scratch usage log: parent_projects survive compaction; malformed
+# pre-existing data from foreign writers is tolerated, well-formed
+# parents are kept
+@testset "scratch usage log" begin
+    mktempdir() do depot
+        d = depot_stack([depot])
+        log_scratch_usage(d, "/scr/space", "/proj/A/Project.toml")
+        log_scratch_usage(d, "/scr/space", "/proj/B/Project.toml")
+        usage_file = joinpath(depot, "logs", "scratch_usage.toml")
+        usage = TOML.parsefile(usage_file)
+        @test length(usage["/scr/space"]) == 1
+        @test sort(usage["/scr/space"][1]["parent_projects"]) ==
+            ["/proj/A/Project.toml", "/proj/B/Project.toml"]
+
+        # a foreign writer left malformed parent_projects (a scalar, and a
+        # vector with non-string members): compaction must not throw and
+        # must keep the well-formed parents of co-resident entries
+        write(
+            usage_file, """
+            [["/scr/other"]]
+            time = 2020-01-01T00:00:00
+            parent_projects = 2020-01-01T00:00:00
+
+            [["/scr/other"]]
+            time = 2020-01-02T00:00:00
+            parent_projects = ["/proj/C/Project.toml", 42]
+            """
+        )
+        log_scratch_usage(d, "/scr/space", "/proj/A/Project.toml")
+        usage2 = TOML.parsefile(usage_file)
+        @test usage2["/scr/other"][1]["parent_projects"] == ["/proj/C/Project.toml"]
+        @test usage2["/scr/space"][1]["parent_projects"] == ["/proj/A/Project.toml"]
     end
 end
 
@@ -216,6 +260,30 @@ end
     @test_throws PkgError get_last_stdlibs(nothing)
     # jll-ish stdlibs are versioned, plain ones are not
     @test stdlib_version(dates_uuid, VERSION) isa Union{Nothing, VersionNumber}
+end
+
+# UPGRADABLE_STDLIBS_UUIDS carries fixed identities and must hold them
+# before any stdlib_infos() call (no call-order dependence): a fresh
+# process consults the set first thing, with the lazy cache still empty
+@testset "upgradable stdlib uuids are eager" begin
+    delim_uuid = UUID("8bb1440f-4735-579b-a4ab-409b98df4dab")   # DelimitedFiles
+    stats_uuid = UUID("10745b16-79ce-11e8-11f9-7d13ad32a3b2")   # Statistics
+    @test Stdlibs.UPGRADABLE_STDLIBS_UUIDS == Set([delim_uuid, stats_uuid])
+    code = """
+    using VibePkg
+    using Base: UUID
+    ok = VibePkg.Stdlibs.STDLIB[] === nothing &&
+        UUID("$delim_uuid") in VibePkg.Stdlibs.UPGRADABLE_STDLIBS_UUIDS &&
+        UUID("$stats_uuid") in VibePkg.Stdlibs.UPGRADABLE_STDLIBS_UUIDS
+    exit(ok ? 0 : 1)
+    """
+    # boot the worker on the loose stack so VibePkg's dependency sources
+    # (user depot) resolve; the set must be populated at load, eagerly
+    cmd = addenv(
+        `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $code`,
+        "JULIA_DEPOT_PATH" => LocalPkgServer.worker_depot_path(),
+    )
+    @test success(cmd)
 end
 
 # Pkg.jl resolve.jl "Stdlib resolve smoketest" — every standard library must be

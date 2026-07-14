@@ -8,7 +8,8 @@ LocalPkgServer.isolate!()
 using Test
 using Sockets
 using LibGit2
-using Base: UUID
+import Dates
+using Base: UUID, SHA1
 using VibePkg
 using VibePkg.Configs: Config
 using VibePkg.Depots: depot_stack
@@ -260,8 +261,11 @@ end
         general = findfirst(r -> registry_name(r) == "General", regs)
         @test general !== nothing
         @test !isempty(Registries.uuids_from_name(regs[general], "Example"))
-        # already current: named and unrestricted updates are both no-ops
+        # already current: named and unrestricted updates are both no-ops,
+        # but the successful check is stamped in the update log (unpacked form)
         @test isempty(Registries.update_registries!(depots; io = devnull))
+        log = Registries.read_registry_update_log(depot)
+        @test get(log, LocalPkgServer.GENERAL_UUID, nothing) isa Dates.DateTime
         @test isempty(Registries.update_registries!(depots; names = ["General"], io = devnull))
     end
 end
@@ -330,7 +334,16 @@ end
                 VibePkg.add("Example"; io = devnull)
                 @test hits[] == first_op_hits
 
-                # reopening the gate makes the next op update again
+                # reopening the gate alone is not enough: the first op's
+                # already-current check stamped the persisted update log, so
+                # the one-day auto-update cooldown suppresses the server query
+                VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+                VibePkg.add("Example"; io = devnull)
+                @test VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+                @test hits[] == first_op_hits
+
+                # with the cooldown stamp cleared, a fresh session updates again
+                Registries.save_registry_update_log(depot, Dict{String, Any}())
                 VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
                 VibePkg.add("Example"; io = devnull)
                 @test VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
@@ -421,6 +434,10 @@ end
                 LocalPkgServer.gzip_tarball(regdir, joinpath(files, "registry", LocalPkgServer.GENERAL_UUID, reg_hash))
                 write(joinpath(files, "registries"), "/registry/$(LocalPkgServer.GENERAL_UUID)/$reg_hash\n")
 
+                # clear the update-log stamp from the add's already-current
+                # check so up's ~1s explicit-update cooldown cannot race the
+                # publishing steps above
+                Registries.save_registry_update_log(depot, Dict{String, Any}())
                 # the op that updates the registry already resolves 0.5.6
                 VibePkg.up(; io = devnull)
                 env = load_environment(envdir; depots = depot_stack())
@@ -580,5 +597,108 @@ end
         VibePkg.Registry.rm("RegOne", "RegTwo"; io = devnull) # one call → both removed
         out2 = sprint(io -> VibePkg.Registry.status(; io))
         @test !occursin("RegOne", out2) && !occursin("RegTwo", out2)
+    end
+end
+
+# a registry tarball whose embedded Registry.toml declares a different uuid
+# than the one it was requested under must be rejected, not installed
+@testset "server registry with mismatched uuid is rejected" begin
+    state = LocalPkgServer.ensure!()
+    fixtures = ENV["VIBEPKG_TEST_FIXTURES"]
+    mktempdir() do dir
+        files = joinpath(dir, "files")
+        cp(joinpath(fixtures, "files"), files)
+        bogus = UUID("99999999-aafe-5451-b93e-139f81909106")
+        reg_hash = state.registry_hash
+        # advertise the General tarball (embedded uuid = GENERAL_UUID) under
+        # a different uuid
+        mkpath(joinpath(files, "registry", string(bogus)))
+        cp(
+            joinpath(files, "registry", LocalPkgServer.GENERAL_UUID, reg_hash),
+            joinpath(files, "registry", string(bogus), reg_hash),
+        )
+        write(joinpath(files, "registries"), "/registry/$bogus/$reg_hash\n")
+        srv = LocalPkgServer.start_server(files)
+        try
+            depot = mkpath(joinpath(dir, "depot"))
+            err = try
+                Registries.install_server_registry!(
+                    depot, srv.url, bogus, SHA1(reg_hash); io = devnull,
+                )
+                nothing
+            catch e
+                e
+            end
+            @test err isa PkgError
+            @test occursin(string(bogus), err.msg)
+            @test occursin("declares uuid", err.msg)
+            # nothing was installed
+            @test !isfile(joinpath(depot, "registries", "General.toml"))
+            @test !isfile(joinpath(depot, "registries", "General.tar.gz"))
+            @test !isdir(joinpath(depot, "registries", "General"))
+        finally
+            close(srv.server)
+        end
+    end
+end
+
+# an update that finds the registry already current must stamp the persisted
+# update log, so a later session inside the cooldown skips the server query
+@testset "already-current update stamps the cooldown log" begin
+    LocalPkgServer.ensure!()
+    files = joinpath(ENV["VIBEPKG_TEST_FIXTURES"], "files")
+    hits = Ref(0)
+    url, server = start_counting_server(files, hits)
+    try
+        mktempdir() do depot
+            depots = depot_stack([depot])
+            withenv("JULIA_PKG_SERVER" => url) do
+                Registries.add_default_registries!(depots; io = devnull)
+                @test !haskey(Registries.read_registry_update_log(depot), LocalPkgServer.GENERAL_UUID)
+                # explicit update: the server says "already current" — no
+                # update happens, but the successful check is stamped
+                @test isempty(Registries.update_registries!(depots; io = devnull))
+                log = Registries.read_registry_update_log(depot)
+                @test get(log, LocalPkgServer.GENERAL_UUID, nothing) isa Dates.DateTime
+                # a fresh "session" within the cooldown makes no server request
+                before = hits[]
+                @test isempty(
+                    Registries.update_registries!(
+                        depots; update_cooldown = Dates.Hour(1), io = devnull,
+                    )
+                )
+                @test hits[] == before
+            end
+        end
+    finally
+        close(server)
+    end
+end
+
+# a bare directory registry cannot be updated by `update_registries!`, so
+# status must not claim the server can update it, even for a tracked uuid
+@testset "status: no server update offer for bare registries" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        reg = mkpath(joinpath(depot, "registries", "General"))
+        write(
+            joinpath(reg, "Registry.toml"), """
+            name = "General"
+            uuid = "$(LocalPkgServer.GENERAL_UUID)"
+
+            [packages]
+            """
+        )
+        old_depots = copy(Base.DEPOT_PATH)
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            out = sprint(io -> VibePkg.Registry.status(; io))
+            @test occursin("bare registry", out)
+            @test !occursin("update available", out)
+            @test !occursin("served by", out)
+        finally
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+        end
     end
 end

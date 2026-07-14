@@ -69,8 +69,11 @@ function blob_hash(
             end
         end
     catch e
+        # Hashing is an integrity boundary: a digest of partial content would
+        # silently verify (or mis-verify) corrupt trees, so read failures
+        # must propagate rather than degrade to a warning.
         e isa InterruptException && rethrow()
-        @warn("Unable to open $(path) for hashing; git-tree-sha1 likely suspect")
+        error("failed to read $(repr(path)) while computing git-tree-sha1: $(sprint(showerror, e))")
     end
 
     return SHA.digest!(ctx)

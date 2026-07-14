@@ -7,7 +7,7 @@ LocalPkgServer.isolate!()
 
 using Test
 using Base: SHA1
-using Base.BinaryPlatforms: HostPlatform, os, arch, triplet
+using Base.BinaryPlatforms: HostPlatform, Platform, os, arch, triplet
 using VibePkg
 using VibePkg.Configs: Config
 import Tar
@@ -661,6 +661,76 @@ end
         tiny = joinpath(dir, "tiny")
         write(tiny, UInt8[0x28, 0xb5])
         @test occursin("7z", basename(VibePkg.Fetch.get_extract_cmd(tiny).exec[1]))
+    end
+end
+
+# try_install_from owns its extraction dir: no failure mode may leave a
+# partial tree in the GC-exempt `<artifacts>/temp` directory
+@testset "try_install_from cleans up its extraction dir" begin
+    mktempdir() do dir
+        art = make_gz_artifact(dir, "cleanup")
+        adir = mkpath(joinpath(dir, "artifacts"))
+        temp_root = joinpath(adir, "temp")
+        withenv("JULIA_PKG_IGNORE_HASHES" => nothing) do
+            # (a) tree-hash mismatch: the source is rejected and the unpacked
+            # tree is removed
+            dest = joinpath(adir, "0"^40)
+            quietly() do
+                @test !ArtifactOps.try_install_from(
+                    file_url(art.gz), art.sha, SHA1("0"^40), dest; io = devnull,
+                )
+            end
+            @test !isdir(dest)
+            @test isempty(readdir(temp_root))
+            # (b) rename failure: a file squatting on the destination makes the
+            # final rename throw — the extraction dir must still be cleaned up
+            dest2 = joinpath(adir, string(art.hash))
+            write(dest2, "in the way")
+            @test_throws Base.IOError ArtifactOps.try_install_from(
+                file_url(art.gz), art.sha, art.hash, dest2; io = devnull,
+            )
+            @test isempty(readdir(temp_root))
+        end
+    end
+end
+
+# bind/unbind treat semantically equivalent platforms (platforms_match, where
+# a missing tag is a wildcard) as the same entry, and leave no pidlock litter
+@testset "bind/unbind platforms_match + transaction hygiene" begin
+    mktempdir() do dir
+        A = VibePkg.Artifacts
+        toml = joinpath(dir, "Artifacts.toml")
+        h1 = SHA1("1"^40)
+        h2 = SHA1("2"^40)
+        base_plat = Platform("x86_64", "linux")
+        tagged = Platform("x86_64", "linux"; libgfortran_version = v"4")
+        A.bind_artifact!(toml, "plat", h1; platform = base_plat)
+        # an equivalent (matching) platform is a rebind: refused without force…
+        @test_throws PkgError A.bind_artifact!(toml, "plat", h2; platform = tagged)
+        # …and with force it REPLACES the matching entry instead of
+        # accumulating a second one for the same platform
+        A.bind_artifact!(toml, "plat", h2; platform = tagged, force = true)
+        entries = TOML.parsefile(toml)["plat"]
+        @test entries isa Vector && length(entries) == 1
+        @test entries[1]["git-tree-sha1"] == string(h2)
+        # unbind with an equivalent platform removes the entry too
+        A.unbind_artifact!(toml, "plat"; platform = base_plat)
+        @test isempty(TOML.parsefile(toml)["plat"])
+        # a genuinely different platform is a separate entry
+        A.bind_artifact!(toml, "plat", h1; platform = Platform("aarch64", "macos"), force = true)
+        A.bind_artifact!(toml, "plat", h2; platform = base_plat)
+        @test length(TOML.parsefile(toml)["plat"]) == 2
+        # the pidlock protecting the transaction does not linger
+        @test !isfile(toml * ".pid")
+
+        # concurrent binds to one file serialize; every mapping survives
+        toml2 = joinpath(dir, "Concurrent.toml")
+        @sync for i in 1:8
+            @async A.bind_artifact!(toml2, "art$i", SHA1(string(i)^40))
+        end
+        parsed = TOML.parsefile(toml2)
+        @test all(haskey(parsed, "art$i") for i in 1:8)
+        @test !isfile(toml2 * ".pid")
     end
 end
 
