@@ -886,10 +886,10 @@ function resolve_versions(
                     deps_fixed[names[dep]] = dep
                 end
                 deps_fixed
-            elseif n.uuid in jll_build_pinned && haskey(env.manifest, n.uuid)
+            elseif n.uuid in jll_build_pinned && haskey(env.manifest, n.uuid::UUID)
                 # keep the pinned build's recorded deps (Pkg.jl#3795)
                 d = Dict{String, UUID}()
-                for (dep_name, dep_uuid) in env.manifest[n.uuid].deps
+                for (dep_name, dep_uuid) in env.manifest[n.uuid::UUID].deps
                     dep_uuid in pkgs_uuids || continue
                     d[dep_name] = dep_uuid
                 end
