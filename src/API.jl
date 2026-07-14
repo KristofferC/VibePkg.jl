@@ -202,14 +202,18 @@ end
 function run_plan(
         ctx::OpContext, env::Environment, planned::Environment;
         autoprecompile::Bool = true, precompile_pkgs::Vector{String} = String[],
+        build_uuids::Vector{UUID} = UUID[],
     )
     io = ctx.config.io
     result = Execution.apply!(env, planned, ctx.registries, ctx.config; io)
     print_env_diff(io, env, result.env; registries = ctx.registries, depots = ctx.config.depots)
     record_undo!(env, result.env)
-    # newly installed packages with a deps/build.jl get built
-    if !isempty(result.installed)
-        BuildOps.build!(result.env, ctx.config.depots, [i.uuid for i in result.installed]; io)
+    # newly installed packages with a deps/build.jl get built; repo packages
+    # (materialized on disk before resolve, so never counted as newly
+    # installed) are built too when the caller passes their uuids
+    to_build = union(UUID[i.uuid for i in result.installed], build_uuids)
+    if !isempty(to_build)
+        BuildOps.build!(result.env, ctx.config.depots, to_build; io)
     end
     autoprecompile && _auto_precompile(ctx, precompile_pkgs)
     return nothing
@@ -432,7 +436,7 @@ function add(
         name === nothing || push!(added_names, name)
     end
     planned, compat_added = compat_on_add(planned, added_names)
-    run_plan(ctx, env, planned; precompile_pkgs = added_names)
+    run_plan(ctx, env, planned; precompile_pkgs = added_names, build_uuids = UUID[r.uuid for r in repos])
     isempty(compat_added) ||
         printpkgstyle(io, :Compat, "entries added for $(join(compat_added, ", "))")
     return nothing

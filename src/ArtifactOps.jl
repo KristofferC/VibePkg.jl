@@ -252,7 +252,17 @@ function selected_artifacts(pkg_root::String, artifacts_toml::String, platform::
         end
         return artifacts
     end
-    return ArtifactsStdlib.select_downloadable_artifacts(artifacts_toml; platform, include_lazy)
+    # A platform-specific entry missing a required key (`os`/`arch`) makes the
+    # Artifacts stdlib's `unpack_platform` return `nothing`, which it then
+    # typeasserts to `Platform` — a raw `TypeError` that would otherwise leak
+    # out uncaught. Surface it as a graceful PkgError naming the bad file.
+    return try
+        ArtifactsStdlib.select_downloadable_artifacts(artifacts_toml; platform, include_lazy)
+    catch err
+        err isa InterruptException && rethrow()
+        err isa TypeError && err.expected === Base.BinaryPlatforms.Platform || rethrow()
+        pkgerror("malformed platform-specific entry in `$artifacts_toml` (a required `os`/`arch` key is missing)")
+    end
 end
 
 """

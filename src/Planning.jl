@@ -329,6 +329,10 @@ function collect_developed!(env::Environment, n::Node, developed::Vector{Node}, 
             # normalize the path to be relative to *our* manifest
             dep_source = source_path(source_env.manifest_file, dep, depots)
             dep_source === nothing && continue
+            # a dev'd dep's own [sources] pointing at an absent path is not a
+            # developed dep: skip it here so it resolves from the registry
+            # instead of surfacing as an "expected to exist at path" error
+            isdir(dep_source) || continue
             dep.path = relpath(dep_source, dirname(env.manifest_file))
             push!(developed, dep)
             collect_developed!(env, dep, developed, depots)

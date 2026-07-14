@@ -513,7 +513,7 @@ function print_status(
         cinfo = (isempty(registries) || is_stdlib(uuid)) ? nothing :
             status_compat_info(env, uuid, e, registries)
         outdated && cinfo === nothing && continue
-        glyph = if cinfo === nothing || is_repo_tracked(e) || is_path_tracked(e)
+        glyph = if cinfo === nothing || is_repo_tracked(e) || is_path_tracked(e) || e.pinned
             nothing
         else
             isempty(cinfo[1]) ? "⌃" : "⌅"

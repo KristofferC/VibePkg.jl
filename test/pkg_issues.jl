@@ -4519,3 +4519,341 @@ end
         end
     end
 end
+
+@testset "Pkg.jl#4705 dev'd dep [sources] to absent path leaks" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            # LeakyPkg depends on Example (registered), but carries its OWN
+            # [sources] entry pointing Example at ../Example, which does NOT
+            # exist. When LeakyPkg is used as a *developed dep*, its private
+            # [sources] must be ignored and Example resolved from the registry.
+            leakydir = joinpath(dir, "LeakyPkg")
+            mkpath(joinpath(leakydir, "src"))
+            leaky_uuid = UUID("22222222-2222-2222-2222-222222222222")
+            write(
+                joinpath(leakydir, "Project.toml"), """
+                name = "LeakyPkg"
+                uuid = "$leaky_uuid"
+                version = "0.1.0"
+
+                [deps]
+                Example = "$EXAMPLE_UUID"
+
+                [sources]
+                Example = {path = "../Example"}
+                """
+            )
+            write(joinpath(leakydir, "src", "LeakyPkg.jl"), "module LeakyPkg\nend\n")
+            # ../Example deliberately absent
+
+            envdir = mkpath(joinpath(dir, "env"))
+            env0 = load_environment(envdir; depots)
+
+            # Correct behavior: developing LeakyPkg must NOT throw an
+            # "expected package Example to exist at path" error, and Example
+            # must resolve from the registry at 0.5.1.
+            local ex_version = nothing
+            @test begin
+                planned = plan_develop(env0, regs, cfg, leakydir)
+                ex_version = entry_version(planned.manifest[EXAMPLE_UUID])
+                ex_version == v"0.5.1"
+            end
+        end
+    end
+end
+
+@testset "Pkg.jl#4006 ResolverError color baked at construction, not decided in showerror" begin
+    Resolve = VibePkg.Resolve
+    Versions = VibePkg.Versions
+    VersionSpec = Versions.VersionSpec
+    VersionRange = Versions.VersionRange
+    Requires = Resolve.Requires
+    Fixed = Resolve.Fixed
+    ResolverError = Resolve.ResolverError
+
+    uA = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    uB = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    uC = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+
+    # synthetic A/B/C graph (mirrors test/resolve.jl `solve`): requiring A=2 and
+    # B=1 is unsatisfiable (A@2 needs B@2) -> Resolve.ResolverError
+    function solve(reqs)
+        vr(s) = VersionRange(s)
+        deps = Dict{UUID, Vector{Dict{VersionRange, Set{UUID}}}}(
+            uA => [Dict(vr("1") => Set([uB]), vr("2") => Set([uB]))],
+            uB => [Dict{VersionRange, Set{UUID}}()],
+            uC => [Dict{VersionRange, Set{UUID}}()],
+        )
+        compat = Dict{UUID, Vector{Dict{VersionRange, Dict{UUID, VersionSpec}}}}(
+            uA => [Dict(vr("1") => Dict(uB => VersionSpec("1")), vr("2") => Dict(uB => VersionSpec("2")))],
+            uB => [Dict{VersionRange, Dict{UUID, VersionSpec}}()],
+            uC => [Dict{VersionRange, Dict{UUID, VersionSpec}}()],
+        )
+        weak_deps = Dict{UUID, Vector{Dict{VersionRange, Set{UUID}}}}(
+            uA => [Dict{VersionRange, Set{UUID}}()],
+            uB => [Dict{VersionRange, Set{UUID}}()],
+            uC => [Dict{VersionRange, Set{UUID}}()],
+        )
+        weak_compat = Dict{UUID, Vector{Dict{VersionRange, Dict{UUID, VersionSpec}}}}(
+            uA => [Dict{VersionRange, Dict{UUID, VersionSpec}}()],
+            uB => [Dict{VersionRange, Dict{UUID, VersionSpec}}()],
+            uC => [Dict{VersionRange, Dict{UUID, VersionSpec}}()],
+        )
+        versions = Dict{UUID, Vector{VersionNumber}}(
+            uA => [v"1.0.0", v"1.1.0", v"2.0.0"],
+            uB => [v"1.0.0", v"2.0.0"],
+            uC => [v"1.0.0"],
+        )
+        versions_per_registry = Dict{UUID, Vector{Set{VersionNumber}}}(
+            u => [Set(vs)] for (u, vs) in versions
+        )
+        names = Dict{UUID, String}(uA => "A", uB => "B", uC => "C")
+        graph = Resolve.Graph(
+            deps, compat, weak_deps, weak_compat, versions, versions_per_registry,
+            names, reqs, Dict{UUID, Fixed}(), false, VERSION, Dict{UUID, VersionNumber}(),
+        )
+        Resolve.simplify_graph!(graph)
+        return Resolve.resolve(graph)
+    end
+
+    # Build the ResolverError while the process stderr reports color support.
+    # `logstr` (Resolve/graphtype.jl) bakes ANSI codes into the message based on
+    # `stderr`'s color at *construction* time.
+    err = nothing
+    pipe = Pipe()
+    old_stderr = stderr
+    try
+        redirect_stderr(IOContext(pipe, :color => true))
+        err = try
+            solve(Requires(uA => VersionSpec("2"), uB => VersionSpec("1")))
+        catch e
+            e
+        end
+    finally
+        redirect_stderr(old_stderr)
+        close(pipe)
+    end
+
+    # preconditions that DO hold today (the buggy state)
+    @test err isa ResolverError
+    @test occursin("\e[", err.msg)   # ANSI escapes hardcoded into the stored message
+
+    # CRUX: color should be decided by showerror's target IO. Rendering to an IO
+    # with color disabled must yield NO ANSI escapes. Today the stored msg leaks
+    # its baked-in escapes, so this is false -> Broken (flips to pass once fixed).
+    plain = sprint(io -> showerror(io, err); context = :color => false)
+    @test !occursin("\e[", plain)
+end
+
+@testset "Pkg.jl#3420 Registry.rm rejects SubString/AbstractString" begin
+    # Precondition (holds today): the positional method exists for String,
+    # establishing the buggy state where only concrete String is accepted.
+    @test hasmethod(VibePkg.Registry.rm, Tuple{String})
+
+    # Correct behavior: Registry.rm should accept any AbstractString (e.g. a
+    # SubString) rather than throwing a MethodError. Today the signature is
+    # typed `String...`, so a SubString matches no method — this is @test.
+    @test hasmethod(VibePkg.Registry.rm, Tuple{SubString{String}})
+
+    # Behavioral crux: calling rm with a SubString should NOT throw a
+    # MethodError (it should reach the normal code path and, for a missing
+    # registry, raise a PkgError). Currently it throws MethodError -> the
+    # `!(e isa MethodError)` predicate is false -> records Broken.
+    @test try
+        VibePkg.Registry.rm(SubString("NoSuchRegistry3420", 1))
+        true
+    catch e
+        !(e isa MethodError)
+    end
+end
+
+@testset "Pkg.jl#3365 tree_hash ENOTDIRs on a non-directory special file" begin
+    # `/dev/null` is a character device present on macOS/Linux without root.
+    devnode = "/dev/null"
+
+    # Preconditions (hold today): the path exists but is not a directory — this
+    # is exactly the shape that trips the unguarded top-level `readdir(root)` in
+    # TreeHash.tree_hash (src/TreeHash.jl:106).
+    @test ispath(devnode)
+    @test !isdir(devnode)
+
+    # CORRECT behavior: hashing a non-directory root must be handled gracefully —
+    # either return a valid hash (treating a non-dir root the way git does) or
+    # throw a clean VibePkg ArgumentError. It must NOT surface a raw Base.IOError
+    # (ENOTDIR) from an unguarded readdir. Today it throws that IOError, so this
+    # records Broken; it flips to an Unexpected Pass once tree_hash guards the
+    # root. The op is inside the try so the file never crashes.
+    graceful = try
+        VibePkg.TreeHash.tree_hash(devnode)
+        true
+    catch e
+        e isa ArgumentError
+    end
+    @test graceful
+end
+
+@testset "Pkg.jl#3150 pinned pkg wrongly marked upgradable (⌃)" begin
+    print_status = VibePkg.Display.print_status
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        cfg = Config(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env0 = load_environment(envdir; depots)
+
+            # add Example@0.5.0 (registry also ships 0.5.1; 1.0.0 is yanked) and
+            # pin it there, then persist + reload.
+            added = plan_add(env0, regs, cfg, [PackageRequest("Example", nothing, "0.5.0")])
+            pinned = plan_pin(added, regs, cfg, [PackageRequest("Example")])
+            write_environment(env0, pinned)
+            env = load_environment(envdir; depots)
+
+            # Example is pinned at 0.5.0; a newer registry version (0.5.1) exists
+            # but `up` cannot move a pin, so status must NOT flag it upgradable.
+            @test env.manifest[EXAMPLE_UUID].pinned
+            @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.0"
+            s = sprint(io -> print_status(io, env; registries = regs))
+            @test !occursin("⌃", s)   # fixed: pinned entry gets no ⌃ gutter
+
+            # ...but `up` cannot move a pinned package (both targeted and whole-env).
+            pu = plan_up(env, regs, cfg, [PackageRequest("Example")])
+            puall = plan_up(env, regs, cfg)
+            up_moved = entry_version(pu.manifest[EXAMPLE_UUID]) != v"0.5.0" ||
+                entry_version(puall.manifest[EXAMPLE_UUID]) != v"0.5.0"
+            @test !up_moved   # up correctly refuses to move the pin
+
+            # CORRECT behavior: the ⌃ marker must only appear when up can actually
+            # install a newer version (⌃ ⇒ up upgrades). For a pinned package up
+            # can't move, so ⌃ should be suppressed. Today it is shown though up
+            # does nothing -> the invariant is false -> Broken. Flips to a pass
+            # once print_status stops flagging pinned entries.
+            @test (!occursin("⌃", s)) || up_moved
+        end
+    end
+end
+
+@testset "Pkg.jl#2894 setprotocol! drops non-standard SSH port" begin
+    # Pure/offline: exercise the URL rewriter directly. After
+    # setprotocol!(domain="domain", protocol="ssh"), an scp-style URL that
+    # carries an explicit SSH port must have that port preserved in the
+    # emitted ssh:// URL, not folded into the path.
+    setproto = VibePkg.Git.setprotocol!
+    normalize = VibePkg.Git.normalize_url
+
+    setproto(; domain = "domain", protocol = "ssh")
+
+    input = "user@domain:2222/git-server/repos/ARTime.git"
+    got = normalize(input)
+
+    # It becomes an ssh:// URL with the git user, and (fixed) the non-standard
+    # port 2222 is preserved as a real port component, not swallowed into the path.
+    @test got == "ssh://git@domain:2222/git-server/repos/ARTime.git"
+end
+
+@testset "Pkg.jl#1657 malformed platform Artifacts.toml entry throws TypeError not PkgError" begin
+    ArtifactOps = VibePkg.ArtifactOps
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # A synthetic package whose Artifacts.toml has a PLATFORM-SPECIFIC entry
+        # (a `[[MyArtifact]]` array element carrying platform keys) that declares
+        # `os` but OMITS the required `arch` key. The Artifacts stdlib's
+        # `unpack_platform` returns `nothing` for such an entry, which is then
+        # typeasserted to `Platform` during selection.
+        pkgroot = joinpath(dir, "Foo")
+        mkpath(joinpath(pkgroot, "src"))
+        write(joinpath(pkgroot, "src", "Foo.jl"), "module Foo end\n")
+        write(
+            joinpath(pkgroot, "Artifacts.toml"), """
+            [[MyArtifact]]
+            git-tree-sha1 = "0000000000000000000000000000000000000000"
+            os = "windows"
+            """
+        )
+
+        # Precondition (holds today): the malformed Artifacts.toml is on disk.
+        @test isfile(joinpath(pkgroot, "Artifacts.toml"))
+
+        # CORRECT behavior: collecting artifact installs over a malformed
+        # Artifacts.toml must surface a graceful VibePkg PkgError naming the bad
+        # entry, NOT a raw `TypeError: expected Platform, got Nothing` typeassert
+        # leaking from the artifact-selection internals. Today it throws that
+        # TypeError, so `threw_pkgerror` is false -> Broken (flips to Unexpected
+        # Pass once the malformed entry is reported gracefully). The op is inside
+        # the try so the file never crashes.
+        threw_pkgerror = try
+            ArtifactOps.collect_artifact_installs(depots, pkgroot)
+            false   # wrongly succeeded (no error at all)
+        catch e
+            e isa PkgError
+        end
+        @test threw_pkgerror
+    end
+end
+
+@testset "Pkg.jl#1236 successful add of a repo package skips deps/build.jl" begin
+    LibGit2 = VibePkg.Git.LibGit2
+    mktempdir() do dir
+        # A local git-repo package that ships deps/build.jl (no deps, so no
+        # registry/server is needed). build.jl writes an absolute marker file
+        # whose presence proves the build step actually ran.
+        repo = mkpath(joinpath(dir, "BuildDep"))
+        mkpath(joinpath(repo, "src"))
+        mkpath(joinpath(repo, "deps"))
+        uuid = UUID("aaaa1236-1111-2222-3333-444444444444")
+        marker = joinpath(dir, "BUILD_RAN.txt")
+        write(
+            joinpath(repo, "Project.toml"), """
+            name = "BuildDep"
+            uuid = "$uuid"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(repo, "src", "BuildDep.jl"), "module BuildDep\nend\n")
+        write(joinpath(repo, "deps", "build.jl"), "write($(repr(marker)), \"built\")\n")
+
+        gr = LibGit2.init(repo)
+        LibGit2.add!(gr, ".")
+        sig = LibGit2.Signature("tester", "tester@example.com")
+        LibGit2.commit(gr, "initial"; author = sig, committer = sig)
+        LibGit2.branch!(gr, "main")
+        LibGit2.close(gr)
+
+        # with_api_env-style isolation: fresh depot + activated empty project,
+        # registry-update gate held so the offline add never touches the net.
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        depot = mkpath(joinpath(dir, "depot"))
+        # a registry must exist so the offline `add` doesn't attempt a
+        # (network) registry update and fail for an unrelated reason
+        make_test_registry(depot)
+        proj = mkpath(joinpath(dir, "proj"))
+        try
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            copy!(Base.DEPOT_PATH, [depot])
+            Base.ACTIVE_PROJECT[] = joinpath(proj, "Project.toml")
+
+            # #1236 desired behavior: a successful `add` always runs the newly
+            # added package's deps/build.jl. VibePkg materializes the repo tree
+            # on disk *before* resolve/apply, so the package is never counted
+            # as "newly installed" and its build step is skipped -> marker
+            # absent -> Broken today; flips to a pass once add builds it.
+            @test begin
+                VibePkg.add(VibePkg.PackageSpec(path = repo, rev = "main"); io = devnull)
+                isfile(marker)
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end

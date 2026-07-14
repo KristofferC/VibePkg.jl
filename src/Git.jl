@@ -73,7 +73,7 @@ end
 is_local_repo(url::AbstractString) = ispath(url) || startswith(url, "file://")
 
 const GIT_REGEX =
-    r"^(?:(?<proto>git|ssh|https)://)?(?:[\w\.\+\-:]+@)?(?<hostname>.+?)(?(<proto>)/|:)(?<path>.+?)(?:\.git)?$"
+    r"^(?:(?<proto>git|ssh|https)://)?(?:[\w\.\+\-:]+@)?(?<hostname>.+?)(?(<proto>)/|:(?:(?<port>\d+)/)?)(?<path>.+?)(?:\.git)?$"
 const GIT_PROTOCOLS = Dict{String, Union{Nothing, String}}()
 const GIT_USERS = Dict{String, Union{Nothing, String}}()
 
@@ -100,7 +100,8 @@ function normalize_url(url::AbstractString)
     else
         user = get(GIT_USERS, lowercase(host), nothing)
         user = user === nothing ? "" : "$user@"
-        "$proto://$user$host/$path"
+        port = m[:port] === nothing ? "" : ":$(m[:port])"
+        "$proto://$user$host$port/$path"
     end
 end
 
