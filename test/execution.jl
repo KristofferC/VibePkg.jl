@@ -51,6 +51,33 @@ const EXAMPLE = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
             symlink("plain-target", joinpath(dir, "link"))
             @test tree_hash(dir) == tree_hash(dir; legacy_symlink_size = true)
         end
+        # git records only the user-executable bit (mode 100755 vs 100644);
+        # group/other exec bits are ignored, so they must not change the hash.
+        mktempdir() do dir
+            f = joinpath(dir, "script.sh")
+            write(f, "#!/bin/sh\n")
+            chmod(f, 0o644)
+            h_plain = tree_hash(dir)
+            chmod(f, 0o755)                     # user-exec set -> 100755
+            h_exec = tree_hash(dir)
+            @test h_exec != h_plain
+            chmod(f, 0o744)                     # still user-exec -> same 100755
+            @test tree_hash(dir) == h_exec
+            chmod(f, 0o645)                     # only group/other exec -> back to 100644
+            @test tree_hash(dir) == h_plain
+        end
+        # A `.git` *subdirectory* is excluded, so a tree with one hashes the
+        # same as the identical tree without it (Foo == FooGit, Pkg.jl).
+        mktempdir() do dir
+            foo = mkpath(joinpath(dir, "Foo"))
+            write(joinpath(foo, "a.txt"), "x\n")
+            h_foo = tree_hash(foo)
+            foogit = mkpath(joinpath(dir, "FooGit"))
+            write(joinpath(foogit, "a.txt"), "x\n")
+            mkpath(joinpath(foogit, ".git"))
+            write(joinpath(foogit, ".git", "config"), "junk")
+            @test tree_hash(foogit) == h_foo
+        end
     end
 end
 
@@ -80,6 +107,8 @@ end
                     @test isfile(joinpath(path, "src", "Example.jl"))
                     @test SHA1(tree_hash(path)) == hash          # verified content
                     @test isfile(joinpath(dir, "Manifest.toml"))
+                    # Pkg.jl#4438 — the packages cache dir is tagged for backup tools
+                    @test isfile(joinpath(tmpdepot, "packages", "CACHEDIR.TAG"))
 
                     # instantiate into a second fresh depot from the written env
                     mktempdir() do tmpdepot2
@@ -160,5 +189,41 @@ end
         installed = instantiate!(env, regs, Config(depots); io = devnull)
         @test any(i -> i.uuid == EXAMPLE, installed)
         @test isfile(joinpath(depot, "packages", "Example", Base.version_slug(EXAMPLE, SHA1(hash)), "src", "Example.jl"))
+    end
+end
+
+# Pkg.jl new.jl "Issue #2931" — a registry-tracked manifest entry that records
+# a tree hash but no version still resolves and materializes; after its install
+# directory is deleted, a re-instantiate downloads it again.
+@testset "instantiate a versionless entry and re-download (#2931)" begin
+    fx = LocalPkgServer.ensure!()
+    h = fx.version_hashes["0.5.5"]
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        VibePkg.Registries.add_default_registries!(depots; io = devnull)
+        regs = reachable_registries(depots; read_from_tarball = true)
+        envdir = mkpath(joinpath(dir, "env"))
+        write(joinpath(envdir, "Project.toml"), "[deps]\nExample = \"$EXAMPLE\"\n")
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.Example]]
+            uuid = "$EXAMPLE"
+            git-tree-sha1 = "$h"
+            """
+        )
+        env = load_environment(envdir; depots)
+        pkgdir = joinpath(depot, "packages", "Example", Base.version_slug(EXAMPLE, SHA1(h)))
+
+        @test any(i -> i.uuid == EXAMPLE, instantiate!(env, regs, Config(depots); io = devnull))
+        @test isfile(joinpath(pkgdir, "src", "Example.jl"))
+
+        # delete the install dir → a fresh instantiate re-materializes it
+        Base.rm(pkgdir; recursive = true, force = true)
+        @test any(i -> i.uuid == EXAMPLE, instantiate!(env, regs, Config(depots); io = devnull))
+        @test isfile(joinpath(pkgdir, "src", "Example.jl"))
     end
 end

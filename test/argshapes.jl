@@ -21,6 +21,17 @@ using VibePkg.Errors: PkgError
         UUID("7876af07-990d-54b4-ab0e-23690620f79a")
     @test PackageSpec(; name = "Foo", version = "0.5").version == "0.5"
 
+    # Pkg.jl#2587: uuid accepts a UUID, a String, or any AbstractString
+    # (SubString), and defaults to nothing.
+    let u = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+        @test PackageSpec(; uuid = u).uuid === u
+        @test PackageSpec(; uuid = "7876af07-990d-54b4-ab0e-23690620f79a").uuid == u
+        @test PackageSpec(; uuid = SubString("x7876af07-990d-54b4-ab0e-23690620f79a", 2)).uuid == u
+        @test PackageSpec(; uuid = UUID(0)).uuid == UUID(0)
+    end
+    @test PackageSpec().uuid === nothing
+    @test PackageSpec(; uuid = nothing).uuid === nothing
+
     # Pkg.jl#4211: hash agrees with ==, so `unique` collapses equal specs
     let a = PackageSpec(; path = "foo"), b = PackageSpec(; path = "foo")
         @test a == b && hash(a) == hash(b)

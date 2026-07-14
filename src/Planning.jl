@@ -1157,7 +1157,10 @@ function resolve_request(env::Environment, registries::Vector{RegistryInstance},
             end
         end
         if uuid === nothing
-            manifest_matches = [u for (u, e) in env.manifest if e.name == name]
+            manifest_matches = UUID[]
+            for (u, e) in env.manifest
+                e.name == name && push!(manifest_matches, u)
+            end
             if length(manifest_matches) == 1
                 uuid = manifest_matches[1]
             elseif length(manifest_matches) > 1
@@ -1366,6 +1369,39 @@ Remove dependencies. `:project` mode removes direct dependencies and prunes
 the now-unreachable manifest closure; `:manifest` mode removes the packages
 and every package that (transitively) depends on them.
 """
+# manifest-mode rm: drop the requested packages plus their reverse-dependency
+# closure from `new_deps` and the manifest. A standalone function so `targets`
+# is an unconditional local (a conditionally-assigned capture would box).
+function rm_manifest!(manifest, new_deps, requests)
+    targets = Set{UUID}()
+    for r in requests
+        found = false
+        for (uuid, entry) in manifest
+            if (r.uuid !== nothing && uuid == r.uuid) || (r.name !== nothing && entry.name == r.name)
+                push!(targets, uuid)
+                found = true
+            end
+        end
+        found || @warn("`$(something(r.name, r.uuid))` not in manifest, ignoring")
+    end
+    while true
+        grew = false
+        for (uuid, entry) in manifest
+            uuid in targets && continue
+            if any(in(targets), values(entry.deps))
+                push!(targets, uuid)
+                grew = true
+            end
+        end
+        grew || break
+    end
+    filter!(p -> !(p.second in targets), new_deps)
+    return with_manifest(
+        manifest;
+        deps = Dict(uuid => e for (uuid, e) in manifest.deps if !(uuid in targets)),
+    )
+end
+
 function plan_rm(env::Environment, requests::Vector{PackageRequest}; mode::Symbol = :project)
     isempty(requests) && pkgerror("rm requires at least one package")
     new_deps = Dict{String, UUID}(env.project.deps)
@@ -1386,34 +1422,7 @@ function plan_rm(env::Environment, requests::Vector{PackageRequest}; mode::Symbo
         end
         manifest = prune_manifest(manifest, Set{UUID}(values(new_deps)))
     elseif mode === :manifest
-        # remove targets plus their reverse-dependency closure
-        targets = Set{UUID}()
-        for r in requests
-            found = false
-            for (uuid, entry) in manifest
-                if (r.uuid !== nothing && uuid == r.uuid) || (r.name !== nothing && entry.name == r.name)
-                    push!(targets, uuid)
-                    found = true
-                end
-            end
-            found || @warn("`$(something(r.name, r.uuid))` not in manifest, ignoring")
-        end
-        while true
-            grew = false
-            for (uuid, entry) in manifest
-                uuid in targets && continue
-                if any(dep -> dep in targets, values(entry.deps))
-                    push!(targets, uuid)
-                    grew = true
-                end
-            end
-            grew || break
-        end
-        filter!(p -> !(p.second in targets), new_deps)
-        manifest = with_manifest(
-            manifest;
-            deps = Dict(uuid => e for (uuid, e) in manifest.deps if !(uuid in targets)),
-        )
+        manifest = rm_manifest!(manifest, new_deps, requests)
     else
         pkgerror("unknown rm mode `$mode`")
     end

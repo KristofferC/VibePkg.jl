@@ -94,6 +94,18 @@ end
         @test installed
         @test read(joinpath(path, "data.txt"), String) == "artifact payload\n"
         @test SHA1(tree_hash(path)) == hash
+        # Pkg.jl#4438 — the artifacts cache dir is tagged for backup tools
+        @test isfile(joinpath(depot, "artifacts", "CACHEDIR.TAG"))
+        # Pkg.jl artifacts.jl "File permissions" — an installed artifact tree is
+        # read-only: files lose their write bits, executables keep the exec bit,
+        # and directories stay traversable.
+        if !Sys.iswindows()
+            @test filemode(joinpath(path, "data.txt")) & 0o222 == 0     # no write bits
+            tool = joinpath(path, "bin", "tool")
+            @test Sys.isexecutable(tool)                                # exec bit kept
+            @test filemode(tool) & 0o222 == 0                           # but read-only
+            @test isdir(joinpath(path, "bin"))                          # dir traversable
+        end
         # usage logged for gc
         @test isfile(joinpath(depot, "logs", "artifact_usage.toml"))
         # idempotent
@@ -514,6 +526,14 @@ end
         server_dir = basename(dirname(path))
         @test server_dir == "localhost_8888"
         @test !occursin(':', server_dir)
+
+        # Pkg.jl#4641 — a file:// local-path pkg-server URL also produces a
+        # filesystem-safe (colon/slash-free) server dir. NOTE: VibePkg sanitizes
+        # the whole URL rather than using the path basename like Pkg does.
+        fpath = VibePkg.Fetch.auth_file_path(d, "file:///some/local/path")
+        fdir = basename(dirname(fpath))
+        @test !occursin(':', fdir) && !occursin('/', fdir)
+        @test !isempty(fdir)
     end
 end
 
@@ -592,6 +612,12 @@ end
             @test get_tok() == "tok-fresh"
             saved = TOML.parsefile(authfile)
             @test saved["access_token"] == "tok-fresh"
+            # Pkg.jl#4689 (JLSEC-2026-610) — the refreshed token is written
+            # through a private (0o600) temp file, so the saved auth.toml is not
+            # group/other-readable.
+            if !Sys.iswindows()
+                @test filemode(authfile) & 0o077 == 0
+            end
             # expires_in from the served file was converted to expires_at
             @test saved["expires_at"] >= floor(Int, time()) + 90_000
 

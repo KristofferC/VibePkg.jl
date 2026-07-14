@@ -451,19 +451,23 @@ function ensure_package_installed!(
 
     urls = package_archive_urls(uuid, tree_hash, repo_urls; server)
     mkpath(dirname(path))
+    # `already` distinguishes "another process installed the tree while we
+    # blocked on the pidlock" from "we installed it": only the latter is `new`.
+    already = Ref(false)
     success = mkpidlock(path * ".pid", stale_age = 10) do
-        isdir(path) && return true
+        isdir(path) && (already[] = true; return true)
         isempty(urls) ? false : install_archive(urls, tree_hash, path; name, depots, io)
     end
     if !success
         # archives failed (or none available): fall back to git
         mkpidlock(path * ".pid", stale_age = 10) do
-            isdir(path) && return
+            isdir(path) && (already[] = true; return)
             Git.install_tree_from_git!(depots, io, uuid, name, tree_hash, repo_urls, path)
         end
     end
-    readonly && set_readonly(path)
-    return path, true
+    new = !already[]
+    readonly && new && set_readonly(path)
+    return path, new
 end
 
 end # module

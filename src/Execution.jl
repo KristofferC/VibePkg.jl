@@ -141,17 +141,17 @@ directory (shared by the build and test sandboxes).
 """
 sandbox_manifest(env::Environment, depots::DepotStack, root::UUID) =
     sandbox_manifest(env, depots, [root])
+function sandbox_visit!(keep, manifest, uuid)
+    uuid in keep && return
+    push!(keep, uuid)
+    entry = get(manifest, uuid, nothing)
+    entry === nothing && return
+    foreach(u -> sandbox_visit!(keep, manifest, u), values(entry.deps))
+    return
+end
 function sandbox_manifest(env::Environment, depots::DepotStack, roots::Vector{UUID})
     keep = Set{UUID}()
-    function visit(uuid)
-        uuid in keep && return
-        push!(keep, uuid)
-        entry = get(env.manifest, uuid, nothing)
-        entry === nothing && return
-        foreach(visit, values(entry.deps))
-        return
-    end
-    foreach(visit, roots)
+    foreach(u -> sandbox_visit!(keep, env.manifest, u), roots)
     entries = Dict{UUID, ManifestEntry}()
     for (uuid, entry) in env.manifest
         uuid in keep || continue

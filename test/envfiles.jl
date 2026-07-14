@@ -435,3 +435,84 @@ end
     m = read_manifest(IOBuffer(manifest))
     @test haskey(m, UUID("7876af07-990d-54b4-ab0e-23690620f79a"))
 end
+
+# Pkg.jl manifests.jl "v3.0: unknown format, warn" — a manifest declaring a
+# major format outside 1:2 still parses, but warns that behavior is undefined.
+@testset "unknown manifest format warns" begin
+    text = """
+    julia_version = "$(VERSION)"
+    manifest_format = "3.0"
+
+    [[deps.Example]]
+    git-tree-sha1 = "1111111111111111111111111111111111111111"
+    uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+    version = "0.5.1"
+    """
+    # use the IO form so the warning isn't maxlog-suppressed across runs
+    local m
+    @test_logs (:warn,) match_mode = :any begin
+        m = parse_manifest(TOML.parse(text), IOBuffer())
+    end
+    @test haskey(m, UUID("7876af07-990d-54b4-ab0e-23690620f79a"))
+end
+
+# Pkg.jl manifests.jl "instantiate manifest from different julia_version" /
+# "manifest from a different julia minor version" — the manifest's recorded
+# julia version is checked against the running one: a mismatch (or a missing
+# entry / pre-v2 format) warns by default and errors under
+# julia_version_strict; a matching minor is silent; an empty manifest is exempt.
+@testset "manifest julia_version compatibility" begin
+    body(jv) = """
+    julia_version = "$jv"
+    manifest_format = "2.0"
+
+    [[deps.Example]]
+    git-tree-sha1 = "1111111111111111111111111111111111111111"
+    uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+    version = "0.5.1"
+    """
+    mk(text) = parse_manifest(TOML.parse(text), "jvtest")
+    cur = VersionNumber(VERSION.major, VERSION.minor, 0)
+    other = VersionNumber(VERSION.major, VERSION.minor == 0 ? 99 : VERSION.minor - 1, 0)
+
+    # matching minor: no warning, no error
+    @test_logs check_manifest_julia_version_compat(mk(body(cur)), "f") === nothing
+
+    # different minor: warns by default, errors when strict
+    m_diff = mk(body(other))
+    @test_logs (:warn,) match_mode = :any check_manifest_julia_version_compat(m_diff, "f")
+    @test_throws PkgError check_manifest_julia_version_compat(m_diff, "f"; julia_version_strict = true)
+
+    # missing julia_version entry: same warn / strict-error split
+    m_nojv = mk(replace(body(cur), "julia_version = \"$cur\"\n" => ""))
+    @test_logs (:warn,) match_mode = :any check_manifest_julia_version_compat(m_nojv, "f")
+    @test_throws PkgError check_manifest_julia_version_compat(m_nojv, "f"; julia_version_strict = true)
+
+    # a manifest with no deps is never flagged
+    @test check_manifest_julia_version_compat(Manifest(), "f") === nothing
+end
+
+# Pkg.jl#4091 — an empty/`touch`ed Manifest.toml is treated as the current (v2)
+# format, so activating and adding to it doesn't choke on a missing format line.
+@testset "empty manifest reads as v2 format" begin
+    mktempdir() do dir
+        mf = joinpath(dir, "Manifest.toml")
+        touch(mf)
+        m = read_manifest(mf)
+        @test m.manifest_format == v"2.0.0"
+        @test isempty(m.deps)
+    end
+end
+
+# Pkg.jl#3520 — a manifest's per-dependency `syntax.julia_version` (Julia 1.13+)
+# is parsed and round-trips through render.
+@testset "per-dep syntax.julia_version round trip" begin
+    m = read_manifest(joinpath(MANIFEST_FIXTURES, "good", "withversion.toml"))
+    d1 = UUID("f08855a0-36cb-4a32-8ae5-a227b709c612")
+    d2 = UUID("e127e659-a899-4a00-b565-5b74face18ba")
+    @test m[d1].julia_syntax_version == v"1.13.0"
+    @test m[d2].julia_syntax_version == v"1.14.0"
+    rt = parse_manifest(TOML.parse(manifest_body(render_manifest(m))), "roundtrip")
+    @test rt == m
+    @test rt[d1].julia_syntax_version == v"1.13.0"
+end

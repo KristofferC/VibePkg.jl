@@ -225,3 +225,21 @@ end
         @test isfile(joinpath(depot, "packages", ".DS_Store"))   # ignored, not fatal
     end
 end
+
+# Pkg.jl registry.jl "gc runs git gc on registries" — VibePkg's gc does not run
+# git gc on registries, but (the important half) it must never remove or corrupt
+# an installed registry while collecting unused packages/artifacts.
+@testset "gc leaves registries intact" begin
+    if !@isdefined(make_test_registry)
+        include("testhelpers.jl")
+    end
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        reg = make_test_registry(depot)
+        depots = depot_stack([depot])
+        @test isfile(joinpath(reg, "Registry.toml"))
+        GCOps.gc(depots; io = devnull)              # must not error or delete it
+        @test isfile(joinpath(reg, "Registry.toml"))
+        @test isfile(joinpath(reg, "E", "Example", "Package.toml"))
+    end
+end

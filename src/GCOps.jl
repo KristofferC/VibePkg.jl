@@ -63,6 +63,16 @@ function condense_usage!(usage_file::String)
     return collect(keys(usage))
 end
 
+# top-level recursion so `hashes` isn't captured by a boxed self-referential closure
+artifact_walk!(hashes, ::Any) = nothing
+artifact_walk!(hashes, v::Vector) = foreach(x -> artifact_walk!(hashes, x), v)
+function artifact_walk!(hashes, d::Dict)
+    h = get(d, "git-tree-sha1", nothing)
+    h isa String && push!(hashes, h)
+    foreach(x -> artifact_walk!(hashes, x), values(d))
+    return
+end
+
 # Every git-tree-sha1 mentioned in an Artifacts.toml (all platforms).
 function artifact_hashes(artifacts_toml::String)
     hashes = String[]
@@ -71,15 +81,7 @@ function artifact_hashes(artifacts_toml::String)
     catch
         return hashes
     end
-    walk(x) = nothing
-    function walk(d::Dict)
-        h = get(d, "git-tree-sha1", nothing)
-        h isa String && push!(hashes, h)
-        foreach(walk, values(d))
-        return
-    end
-    walk(v::Vector) = foreach(walk, v)
-    walk(raw)
+    artifact_walk!(hashes, raw)
     return hashes
 end
 

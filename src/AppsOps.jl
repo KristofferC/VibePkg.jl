@@ -405,16 +405,18 @@ function app_add(config::Config, registries::Vector{RegistryInstance}, request::
         # download, or metadata check must leave the currently installed app
         # runnable.
         env_dir = joinpath(apps_dir(d), name)
+        # inner locals are distinct names so they don't collide with the outer
+        # destructuring (a shared binding assigned in both scopes would box)
         entry, apps = mktempdir(apps_dir(d); prefix = ".install-") do staging
             env = Environments.load_environment_from(joinpath(staging, "Project.toml"); depots = d)
             planned = plan_add(env, registries, config, [request])
             result = Execution.apply!(env, planned, registries, config; io)
-            entry = result.env.manifest[uuid]
-            source = Execution.entry_source_path(result.env.manifest_file, entry, d)
-            apps = declared_apps(source, name)
-            validate_app_collisions(read_app_manifest(d), uuid, apps)
+            ent = result.env.manifest[uuid]
+            source = Execution.entry_source_path(result.env.manifest_file, ent, d)
+            aps = declared_apps(source, name)
+            validate_app_collisions(read_app_manifest(d), uuid, aps)
             replace_app_environment!(staging, env_dir)
-            (entry, apps)
+            (ent, aps)
         end
         record_app_package!(d, with_entry(entry; apps))
         for app in values(apps)

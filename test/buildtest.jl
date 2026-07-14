@@ -89,8 +89,14 @@ end
         @test isfile(joinpath(pkg, "deps", "built.txt"))
         @test isfile(joinpath(pkg, "deps", "build.log"))
 
-        # test: sandbox resolve + subprocess run
-        TestOps.test!(env, RegistryInstance[], Config(depots), BT_UUID; test_args = ["extra"], io = devnull)
+        # test: sandbox resolve + subprocess run.
+        # Pkg.jl new.jl "test: printing" — the run prints a "Testing" banner
+        # and a "<pkg> tests passed" line on success.
+        testio = IOBuffer()
+        TestOps.test!(env, RegistryInstance[], Config(depots), BT_UUID; test_args = ["extra"], io = testio)
+        testout = String(take!(testio))
+        @test occursin("Running tests...", testout)
+        @test occursin("BTPkg tests passed", testout)
 
         # a failing test returns (name, process); the report helper raises
         # the pinned message (bare for exit code 1, annotated otherwise)
@@ -586,4 +592,36 @@ end
         )
         @test read(cmd, String) == joinpath(proj, "Project.toml")
     end
+end
+
+# Pkg.jl new.jl "test/threads" — the thread spec passed to the test subprocess
+# honors JULIA_NUM_THREADS verbatim (including the "n,m" default,interactive
+# form) and otherwise reflects the current process's thread pools.
+@testset "test thread spec" begin
+    tspec() = withenv(() -> TestOps.test_threads_spec(), "JULIA_NUM_THREADS" => nothing)
+    # explicit values pass straight through
+    for v in ("1", "2", "4", "2,0", "3,1", "auto")
+        @test withenv(() -> TestOps.test_threads_spec(), "JULIA_NUM_THREADS" => v) == v
+    end
+    # unset: reflects the running thread pools; interactive pool → "n,m"
+    s = tspec()
+    if Threads.nthreads(:interactive) > 0
+        @test s == "$(Threads.nthreads(:default)),$(Threads.nthreads(:interactive))"
+    else
+        @test s == "$(Threads.nthreads(:default))"
+    end
+end
+
+# Pkg.jl pkg.jl "coverage specific path" — the test subprocess coverage flag
+# accepts a bare bool (tracked at the package source, or off) or a string that
+# is passed through verbatim as the --code-coverage argument (e.g. a tracefile).
+@testset "test coverage flag" begin
+    flag(cov) = begin
+        m = match(r"--code-coverage=(\S+)", string(TestOps.test_subprocess_flags("/proj"; coverage = cov, julia_args = String[])))
+        m === nothing ? nothing : m.captures[1]
+    end
+    @test flag(false) == "none"
+    @test flag(true) == "@/proj"                    # tracked at the package source
+    @test flag("/tmp/trace.info") == "/tmp/trace.info"   # explicit path passthrough
+    @test flag("user") == "user"
 end

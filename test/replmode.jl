@@ -131,6 +131,10 @@ using VibePkg.Errors: PkgError
         @test api === VibePkg.API.status && opts[:mode] === :manifest
         api, _, opts = capture("up --minor")
         @test api === VibePkg.API.up && opts[:level] == UPLEVEL_MINOR
+        # Pkg.jl repl.jl rejects conflicting level flags; VibePkg instead takes
+        # the last one given (last-wins), so `up --major --minor` == `up --minor`.
+        api, _, opts = capture("up --major --minor")
+        @test api === VibePkg.API.up && opts[:level] == UPLEVEL_MINOR
         api, _, opts = capture("gc --verbose")
         @test api === VibePkg.API.gc && opts[:verbose] === true
         api, _, opts = capture("gc -v")
@@ -263,6 +267,16 @@ using VibePkg.Errors: PkgError
         # Pkg.jl#1336 — malformed option must not crash completions
         cands, _ = REPLMode.completions_for("rm -rf ")
         @test cands isa Vector
+
+        # Pkg.jl#4418 / julia#59829 — a command with a trailing space completes
+        # its first (package) argument without crashing
+        @test REPLMode.completions_for("rm ")[1] isa Vector
+        @test REPLMode.completions_for("add ")[1] isa Vector
+
+        # a non-ASCII package name parses as a name (no BoundsError from the
+        # Windows drive-letter string-indexing path)
+        api, args, _ = capture("add ÖÖÖ")
+        @test api === VibePkg.API.add && args[1][1].name == "ÖÖÖ"
 
         # Pkg.jl#658 — stdlib names complete after add/dev
         cands, _ = REPLMode.completions_for("add LinearAlg")
@@ -415,4 +429,49 @@ end
 
     @test mode isa REPL.LineEdit.Prompt
     @test mode.hist === repl.interface.modes[1].hist
+end
+
+# Pkg.jl repl.jl "unit test for REPLMode.promptf" + JuliaLang/julia #55850 —
+# the interactive prompt reflects the active project's name, marks a shared
+# `@vX.Y` environment, appends `[offline]`, and is cached until invalidated.
+@testset "REPL prompt (promptf)" begin
+    ext = Base.get_extension(VibePkg, :REPLExt)
+    old = Base.ACTIVE_PROJECT[]
+    try
+        mktempdir() do d
+            # a named project → "(Name) vpkg> "
+            proj = joinpath(d, "MyProj", "Project.toml")
+            mkpath(dirname(proj))
+            touch(proj)
+            Base.ACTIVE_PROJECT[] = proj
+            ext.invalidate_prompt!()
+            @test ext.promptf() == "(MyProj) vpkg> "
+
+            # a shared vX.Y environment → "(@vX.Y) vpkg> " (#55850)
+            vname = "v$(VERSION.major).$(VERSION.minor)"
+            venv = joinpath(d, vname, "Project.toml")
+            mkpath(dirname(venv))
+            touch(venv)
+            Base.ACTIVE_PROJECT[] = venv
+            ext.invalidate_prompt!()
+            @test ext.promptf() == "(@$vname) vpkg> "
+
+            # caching: the prompt is not recomputed until invalidated
+            Base.ACTIVE_PROJECT[] = proj
+            ext.invalidate_prompt!()
+            p1 = ext.promptf()
+            VibePkg.API.OFFLINE_MODE[] = true
+            try
+                @test ext.promptf() == p1                 # still the cached value
+                ext.invalidate_prompt!()
+                @test ext.promptf() == "(MyProj) [offline] vpkg> "
+            finally
+                VibePkg.API.OFFLINE_MODE[] = false
+                ext.invalidate_prompt!()
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old
+        ext.invalidate_prompt!()
+    end
 end

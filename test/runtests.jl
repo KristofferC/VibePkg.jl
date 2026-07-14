@@ -16,7 +16,7 @@ include("local_pkg_server.jl")
 LocalPkgServer.ensure!()
 
 # every test file is standalone; these are support files, not tests
-const NOT_TESTS = ("explicit_imports", "jet", "local_pkg_server", "testhelpers")
+const NOT_TESTS = ("explicit_imports", "jet", "aqua", "local_pkg_server", "testhelpers", "resolve_utils", "NastyGenerator")
 
 testsuite = find_tests(@__DIR__)
 filter!(tc -> tc.name ∉ NOT_TESTS, testsuite)
