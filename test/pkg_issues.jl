@@ -1677,3 +1677,587 @@ end
         end
     end
 end
+
+
+@testset "Pkg.jl#4063 version with build number rejected cleanly" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            cfg = Config(depots)
+
+            # The reported symptom was a raw `ArgumentError: invalid base 10
+            # digit '+'` leaking out of the public add API. The guard in
+            # request_version_spec must convert that into a clean PkgError.
+            err = try
+                plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1+0")])
+                nothing
+            catch e
+                e
+            end
+            @test err isa PkgError
+            @test !(err isa ArgumentError)
+            @test occursin("invalid version specifier", sprint(showerror, err))
+
+            # Control: the same spec without the build tag resolves fine.
+            env2 = plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
+            @test entry_version(env2.manifest[EXAMPLE_UUID]) == v"0.5.1"
+        end
+    end
+end
+
+@testset "Pkg.jl#3996 progress bar honors displaysize width" begin
+    using VibePkg.MiniProgressBars: MiniProgressBar, show_progress
+
+    render(dsize) = begin
+        bar = MiniProgressBar(
+            header = "Updating", mode = :percentage,
+            width = 1000, current = 50, max = 100,
+            always_reprint = true
+        )
+        io = IOContext(IOBuffer(), :color => true, :displaysize => dsize)
+        show_progress(io, bar)
+        String(take!(io.io))
+    end
+
+    out80 = render((24, 80))
+    out200 = render((24, 200))
+
+    n80 = count(==('━'), out80)
+    n200 = count(==('━'), out200)
+
+    # The bar sizes to displaysize(io)[2], not a hardcoded 80: a wider terminal
+    # yields strictly more glyphs.
+    @test n200 > n80
+    # And the 80-col render stays well under 80 (terminal width is the binding
+    # constraint here, since p.width = 1000).
+    @test n80 < 80
+    @test n80 > 0
+
+    # Explicit termwidth kwarg overrides displaysize and drives the width.
+    bar = MiniProgressBar(
+        header = "Updating", mode = :percentage,
+        width = 1000, current = 50, max = 100,
+        always_reprint = true
+    )
+    io = IOContext(IOBuffer(), :color => true, :displaysize => (24, 80))
+    show_progress(io, bar; termwidth = 200)
+    n_explicit = count(==('━'), String(take!(io.io)))
+    @test n_explicit == n200
+end
+
+@testset "Pkg.jl#3991 devved dependency is used when testing" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+
+        # A dev'd Example whose source carries a marker the *registered*
+        # Example (0.5.x/1.0.0) does not have. Its directory name contains
+        # "ExampleDev" so the test can assert the loaded source path.
+        exdev = mkpath(joinpath(dir, "ExampleDev"))
+        write(
+            joinpath(exdev, "Project.toml"),
+            """
+            name = "Example"
+            uuid = "$(EXAMPLE_UUID)"
+            version = "0.5.1"
+            """,
+        )
+        mkpath(joinpath(exdev, "src"))
+        write(
+            joinpath(exdev, "src", "Example.jl"),
+            "module Example\nconst DEVMARKER = 424242\nend\n",
+        )
+
+        # The package under test: depends on Example, and its tests assert
+        # that the *dev'd* Example source is the one that loads.
+        puuid = "aaaaaaaa-1111-2222-3333-444444444444"
+        pdir = mkpath(joinpath(dir, "P"))
+        write(
+            joinpath(pdir, "Project.toml"),
+            """
+            name = "P"
+            uuid = "$puuid"
+            version = "0.1.0"
+
+            [deps]
+            Example = "$(EXAMPLE_UUID)"
+            """,
+        )
+        mkpath(joinpath(pdir, "src"))
+        write(joinpath(pdir, "src", "P.jl"), "module P\nusing Example\nend\n")
+        mkpath(joinpath(pdir, "test"))
+        write(
+            joinpath(pdir, "test", "Project.toml"),
+            """
+            [deps]
+            Example = "$(EXAMPLE_UUID)"
+            Test = "$(TEST_UUID)"
+            """,
+        )
+        write(
+            joinpath(pdir, "test", "runtests.jl"),
+            """
+            using Example, Test
+            @testset "devved dep is used" begin
+                @test isdefined(Example, :DEVMARKER)
+                @test Example.DEVMARKER == 424242
+                @test occursin("ExampleDev", pathof(Example))
+            end
+            """,
+        )
+
+        projfile = joinpath(mkpath(joinpath(dir, "proj")), "Project.toml")
+
+        old = copy(Base.DEPOT_PATH)
+        oldp = Base.ACTIVE_PROJECT[]
+        oldg = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            copy!(Base.DEPOT_PATH, [depot])
+            Base.ACTIVE_PROJECT[] = projfile
+
+            # Dev the dependency first, then the package that tests it. Both
+            # are path-tracked, so the test sandbox resolves entirely offline.
+            VibePkg.develop(; path = exdev, io = devnull)
+            VibePkg.develop(; path = pdir, io = devnull)
+
+            env = load_environment(; depots = depot_stack([depot]))
+            @test is_path_tracked(env.manifest[EXAMPLE_UUID])
+
+            # The fixed behavior: Pkg.test's sandbox loads the dev'd Example
+            # source (with DEVMARKER), not a registered version. If the bug
+            # were present the subprocess assertions would fail and `test`
+            # would throw.
+            @test VibePkg.test(["P"]; io = devnull) === nothing
+        finally
+            copy!(Base.DEPOT_PATH, old)
+            Base.ACTIVE_PROJECT[] = oldp
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = oldg
+        end
+    end
+end
+
+@testset "Pkg.jl#3947 status with non-weakdep extension trigger" begin
+    host_uuid = UUID("ee44ee44-ee44-4e44-8e44-ee44ee44ee44")
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            # Dev host whose extension trigger is a *strong* dep (in [deps],
+            # with NO [weakdeps] table at all) — the exact #3947 shape.
+            host = joinpath(dir, "ExtHost")
+            mkpath(joinpath(host, "src"))
+            write(
+                joinpath(host, "Project.toml"), """
+                name = "ExtHost"
+                uuid = "$host_uuid"
+                version = "0.1.0"
+
+                [deps]
+                Example = "$EXAMPLE_UUID"
+
+                [extensions]
+                ExampleExt = "Example"
+
+                [compat]
+                Example = "0.5"
+                """
+            )
+            write(joinpath(host, "src", "ExtHost.jl"), "module ExtHost end\n")
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            write_environment(env, plan_develop(env, regs, Config(depots), host))
+            env = load_environment(envdir; depots)
+            # record the extension (dev'd project is readable) into the manifest
+            manifest = VibePkg.Execution.fixups_from_projectfile(env, depots)
+            env = VibePkg.Environments.Environment(
+                env.project_file, env.manifest_file, env.project, manifest, env.workspace
+            )
+            entry = env.manifest[host_uuid]
+            # extension present, trigger is a strong dep, weakdeps genuinely empty
+            @test entry.exts == Dict("ExampleExt" => "Example")
+            @test isempty(entry.weakdeps)
+            @test haskey(entry.deps, "Example")
+
+            # #3947: status must NOT throw a KeyError on the non-weakdep trigger
+            s = sprint(io -> VibePkg.Display.print_status(io, env; extensions = true))
+            @test s isa String
+            @test occursin("ExampleExt", s)
+
+            # the info helper resolves the uuid via [deps] fallback, not weakdeps[extdep]
+            info = VibePkg.Display.status_ext_info(host_uuid, entry)
+            @test info !== nothing
+            @test info[1].weakdeps == [("Example", info[1].weakdeps[1][2])]
+        end
+    end
+end
+
+@testset "Pkg.jl#3937 SHA stdlib stays bundled, not upgraded from registry" begin
+    local stdlib_version = VibePkg.Stdlibs.stdlib_version
+    local entry_tree_hash = VibePkg.EnvFiles.entry_tree_hash
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        reg = make_test_registry(depot)
+
+        # Inject a competing *registered* SHA advertising only v1.6.7 (far newer
+        # than the stdlib bundled with this Julia). This is the CI/Documenter
+        # shape from the report, where a registry offered a high SHA version.
+        shapkg = mkpath(joinpath(reg, "S", "SHA"))
+        write(
+            joinpath(shapkg, "Package.toml"), """
+            name = "SHA"
+            uuid = "$SHA_UUID"
+            repo = "https://example.com/SHA.jl.git"
+            """
+        )
+        write(
+            joinpath(shapkg, "Versions.toml"), """
+            ["1.6.7"]
+            git-tree-sha1 = "1111111111111111111111111111111111111111"
+            """
+        )
+        # Register SHA alongside Example in the registry index.
+        write(
+            joinpath(reg, "Registry.toml"), """
+            name = "TestRegistry"
+            uuid = "23338594-aafe-5451-b93e-139f81909106"
+            repo = "https://example.com/TestRegistry.git"
+
+            [packages]
+            7876af07-990d-54b4-ab0e-23690620f79a = { name = "Example", path = "E/Example" }
+            $SHA_UUID = { name = "SHA", path = "S/SHA" }
+            """
+        )
+
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do envroot
+            envdir = mkpath(joinpath(envroot, "env"))
+            env = load_environment(envdir; depots)
+            planned = plan_add(env, regs, Config(depots), [PackageRequest("SHA", nothing, nothing)])
+
+            entry = planned.manifest[SHA_UUID]
+            # FIXED: SHA resolves to the stdlib version bundled with this Julia
+            # (e.g. 0.7.0), NOT the registry's v1.6.7 — the #3937 bad upgrade.
+            @test entry_version(entry) == stdlib_version(SHA_UUID, VERSION)
+            @test entry_version(entry) != v"1.6.7"
+            # A stdlib entry is not path-tracked and carries no tree-hash: it is
+            # served from the Julia install, not fetched from the registry.
+            @test !is_path_tracked(entry)
+            @test entry_tree_hash(entry) === nothing
+        end
+    end
+end
+
+@testset "Pkg.jl#3918 registry add URL#branch errors clearly, no silent wrong-branch" begin
+    # Build a local git registry repo with a `foo` branch off the default branch.
+    mktempdir() do repo
+        function git(args...)
+            run(pipeline(`git -C $repo $args`; stdout = devnull, stderr = devnull))
+        end
+        write(
+            joinpath(repo, "Registry.toml"), """
+            name = "MyReg"
+            uuid = "11111111-2222-3333-4444-555555555555"
+            repo = "$(("file://" * repo))"
+
+            [packages]
+            """
+        )
+        git("init", "-q")
+        git("config", "user.email", "t@t.t")
+        git("config", "user.name", "t")
+        git("add", "-A")
+        git("commit", "-q", "-m", "init")
+        git("branch", "foo")
+
+        mktempdir() do depot
+            depots = depot_stack([depot])
+            # A branch-qualified registry URL must error clearly (no `#rev` parsing;
+            # the whole spec is handed to git clone and fails loudly) rather than
+            # silently landing on the wrong branch or writing a broken refspec.
+            spec = "file://" * repo * "#foo"
+            @test_throws PkgError VibePkg.Registries.add_registry!(depots, spec)
+            # Nothing was installed.
+            @test isempty(reachable_registries(depots))
+
+            # Sanity: the same repo without the `#foo` suffix installs cleanly,
+            # proving the error above is specifically about the branch suffix.
+            name = VibePkg.Registries.add_registry!(depots, "file://" * repo)
+            @test name == "MyReg"
+            @test !isempty(reachable_registries(depots))
+        end
+    end
+end
+
+@testset "Pkg.jl#3914 tilde-path completion offset" begin
+    mktempdir() do tmphome
+        # Create subdirs whose names share the typed 'jul' prefix.
+        mkpath(joinpath(tmphome, "julcode"))
+        mkpath(joinpath(tmphome, "juldocuments"))
+        mkpath(joinpath(tmphome, "other"))
+
+        # Sanity: expanduser('~') must be materially longer than the typed '~'
+        # (the Pkg #3914 bug was the offset computed against the EXPANDED path).
+        withenv("HOME" => tmphome) do
+            @test length(expanduser("~")) > 1
+
+            cands, word = VibePkg.REPLMode.completions_for("activate ~/jul")
+
+            # Fixed behavior: the word-to-replace is the RAW typed fragment,
+            # NOT the expanduser-expanded path. This keeps the LineEdit offset
+            # correct.
+            @test word == "~/jul"
+            @test word == String(match(r"[^\s]*$", "activate ~/jul").match)
+
+            # Candidates preserve the tilde and match the raw fragment, so the
+            # replaced buffer range lines up with what the user typed.
+            @test !isempty(cands)
+            @test all(c -> startswith(c, "~/"), cands)
+            @test all(c -> startswith(c, word), cands)
+            @test "~/julcode" in cands
+            @test "~/juldocuments" in cands
+            @test !("~/other" in cands)
+        end
+    end
+end
+
+@testset "Pkg.jl#3908 expanduser tab-completion stays graceful" begin
+    using VibePkg.REPLMode: completions_for
+    # `~.` is a `~user` form that `expanduser` cannot expand: it throws a bare
+    # ArgumentError. Tab-completion must swallow that and return empty candidates
+    # rather than crashing the REPL (the original Pkg.jl#3908 bug).
+    for partial in ("activate ~.", "dev ~.", "develop ~.", "add ~.")
+        local cands, word
+        @test begin
+            cands, word = completions_for(partial)  # never throws
+            true
+        end
+        @test isempty(cands)
+        @test word == "~."
+    end
+    # The plain path-completion form must also not blow up.
+    @test isempty(completions_for("activate ~.")[1])
+end
+
+@testset "Pkg.jl#3902 jll build number preserved when registry build superseded" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        jll_uuid = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+        pkg = mkpath(joinpath(depot, "registries", "JllRegistry", "D", "Dummy_jll"))
+        write(
+            joinpath(depot, "registries", "JllRegistry", "Registry.toml"), """
+            name = "JllRegistry"
+            uuid = "33338594-aafe-5451-b93e-139f81909106"
+
+            [packages]
+            $jll_uuid = { name = "Dummy_jll", path = "D/Dummy_jll" }
+            """
+        )
+        write(
+            joinpath(pkg, "Package.toml"), """
+            name = "Dummy_jll"
+            uuid = "$jll_uuid"
+            repo = "https://example.com/Dummy_jll.git"
+            """
+        )
+        # Registry carries ONLY 1.0.0+2 — the build (+1) the manifest is pinned
+        # to has been superseded and is no longer registered.
+        write(
+            joinpath(pkg, "Versions.toml"), """
+            ["1.0.0+2"]
+            git-tree-sha1 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            """
+        )
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        envdir = mkpath(joinpath(dir, "env"))
+        write(
+            joinpath(envdir, "Project.toml"), """
+            [deps]
+            Dummy_jll = "$jll_uuid"
+            """
+        )
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.Dummy_jll]]
+            git-tree-sha1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            uuid = "$jll_uuid"
+            version = "1.0.0+1"
+            """
+        )
+        env = load_environment(envdir; depots)
+        # The reported bug (Pkg.jl#3902) surfaced as an Unsatisfiable/ResolverError
+        # here; the fix (jll_fix in resolve_versions) must keep the resolve GREEN
+        # and hold the manifest's build number instead of moving to +2.
+        local plan
+        @test (plan = plan_resolve(env, regs, Config(depots)); true)
+        entry = plan.manifest[jll_uuid]
+        @test entry_version(entry) == v"1.0.0+1"
+    end
+end
+
+@testset "Pkg.jl#3892 dev .. relative path parses without a case/existence check" begin
+    # Root cause of the original bug: Pkg's REPL parser gated `.`/`..`/path
+    # words behind `casesensitive_isdir(expanduser(word))`, which walks each
+    # path component and compares it case-sensitively against the parent's
+    # readdir listing. On Windows, cd'ing with wrong case made pwd() (hence the
+    # absolute form of `..`) carry wrong-case components, so the check returned
+    # false and `pkg> dev ..` aborted with "`..` appears to be a local path,
+    # but directory does not exist" — even though Pkg.develop(path="..") worked.
+    #
+    # VibePkg's identifier_fields must classify `.`/`..` (and dotted relative
+    # paths) as a path spec purely lexically, never touching the filesystem.
+    @test VibePkg.REPLMode.identifier_fields("..") == (; path = "..")
+    @test VibePkg.REPLMode.identifier_fields(".") == (; path = ".")
+    @test VibePkg.REPLMode.identifier_fields("../MyPackage") == (; path = "../MyPackage")
+
+    # The classification must be independent of the process's cwd and of any
+    # (wrong-case) directory on disk: run from a temp dir whose real name has a
+    # different case than what we would type, and confirm the parse is
+    # unchanged. On a case-insensitive FS this is exactly the Windows scenario.
+    mktempdir() do dir
+        realsub = mkpath(joinpath(dir, "MyPackage"))
+        old = pwd()
+        try
+            cd(realsub)
+            # `..` still resolves to a pure path spec regardless of cwd casing.
+            @test VibePkg.REPLMode.identifier_fields("..") == (; path = "..")
+            # A wrong-case sibling reference that does NOT exist on disk still
+            # parses as a path (no existence check) — the fixed behavior.
+            @test VibePkg.REPLMode.identifier_fields("../nosuchdir") ==
+                (; path = "../nosuchdir")
+        finally
+            cd(old)
+        end
+    end
+
+    # End-to-end at the parser boundary: `dev ..` produces a develop spec whose
+    # path is the untouched `..`, matching Pkg.develop(path="..").
+    specs = VibePkg.REPLMode.parse_package_word("..")
+    @test specs.path == ".."
+end
+
+@testset "Pkg.jl#3891 workspace member manifest diff shows change not spurious add" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+
+        # workspace root with a `test` member; both declare Example.
+        root = mkpath(joinpath(dir, "root"))
+        write(
+            joinpath(root, "Project.toml"), """
+            [workspace]
+            projects = ["test"]
+
+            [deps]
+            Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+            """
+        )
+        member = mkpath(joinpath(root, "test"))
+        mkpath(joinpath(member, "src"))
+        write(
+            joinpath(member, "Project.toml"), """
+            name = "TestMember"
+            uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+            version = "0.1.0"
+
+            [deps]
+            Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+            """
+        )
+        write(joinpath(member, "src", "TestMember.jl"), "module TestMember end\n")
+
+        # a local checkout of Example to develop at a version above the registry
+        devex = joinpath(dir, "ExampleDev")
+        mkpath(joinpath(devex, "src"))
+        write(
+            joinpath(devex, "Project.toml"), """
+            name = "Example"
+            uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+            version = "0.5.4"
+            """
+        )
+        write(joinpath(devex, "src", "Example.jl"), "module Example end\n")
+
+        # load the member: it resolves the shared ROOT manifest
+        env = load_environment(member; depots)
+        @test env.manifest_file == joinpath(realpath(root), "Manifest.toml")
+
+        # develop Example (path-tracked v0.5.4) into the shared manifest, persist
+        write_environment(env, plan_develop(env, regs, Config(depots), devex))
+
+        # reload the member's env: its OLD state must see the pre-existing
+        # shared-manifest entry (path-tracked v0.5.4), NOT an empty manifest.
+        old_env = load_environment(member; depots)
+        old_entry = get(old_env.manifest, EXAMPLE_UUID, nothing)
+        @test old_entry !== nothing
+        @test is_path_tracked(old_entry)
+        @test entry_version(old_entry) == v"0.5.4"
+
+        # free Example in the member -> off the path, back to registry tracking
+        freed = plan_free(old_env, regs, Config(depots), [PackageRequest("Example")])
+        @test is_registry_tracked(freed.manifest[EXAMPLE_UUID])
+        @test !is_path_tracked(freed.manifest[EXAMPLE_UUID])
+
+        # #3891: the manifest diff must render the real change of the
+        # pre-existing v0.5.4 entry (a `~ ... ⇒` modification), NOT a
+        # misleading `+ Example` add line (the bug loaded the member's OLD
+        # env with an empty manifest, so it never saw the shared entry).
+        out = sprint(
+            io -> VibePkg.Display.print_env_diff(io, old_env, freed; registries = regs, depots)
+        )
+        @test occursin("~ Example v0.5.4", out)
+        @test occursin("⇒", out)
+        @test !occursin("+ Example", out)
+    end
+end
+
+@testset "Pkg.jl#1249 yanked manifest version re-resolves for test deps" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot]); regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            write(
+                joinpath(envdir, "Project.toml"), """
+                [deps]
+                Example = "$EXAMPLE_UUID"
+                """
+            )
+            # Manifest pins Example to the now-yanked 1.0.0 (git-tree-sha1 3333…)
+            write(
+                joinpath(envdir, "Manifest.toml"), """
+                julia_version = "$VERSION"
+                manifest_format = "2.0"
+
+                [[deps.Example]]
+                git-tree-sha1 = "3333333333333333333333333333333333333333"
+                uuid = "$EXAMPLE_UUID"
+                version = "1.0.0"
+                """
+            )
+            env = load_environment(envdir; depots)
+
+            # Tier 1 (PRESERVE_ALL / Pkg.resolve): the yanked, explicitly-pinned
+            # manifest version leaves no candidate, so the resolver errors — this
+            # is the exact failure the reporter hit.
+            @test_throws VibePkg.Resolve.ResolverError plan_resolve(env, regs, Config(depots))
+
+            # Tier 2 (recovery / re-resolve, what Pkg.test falls back to): must
+            # succeed and move Example off the yanked 1.0.0 to the latest
+            # resolvable 0.5.1.
+            recovered = plan_up(env, regs, Config(depots), PackageRequest[])
+            @test entry_version(recovered.manifest[EXAMPLE_UUID]) == v"0.5.1"
+        end
+    end
+end

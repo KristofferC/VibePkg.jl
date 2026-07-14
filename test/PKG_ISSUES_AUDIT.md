@@ -23,9 +23,9 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–6 (of ~40). **In-scope bugs:** 40 → **31 FIXED, 9 PERSISTS, 0 N/A**. Non-bugs skipped: ~76.
-- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **29 FIXED** (pages 1–6) → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
-- **The 9 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
+- **Pages covered:** 1–8 (of ~40). **In-scope bugs:** 59 → **43 FIXED, 15 PERSISTS, 1 N/A**. Non-bugs skipped: ~112.
+- **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **41 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each, all green, auto-discovered by `runtests.jl`).
+- **The 15 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); #4705 is the page-1 one.
 - Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
 
 ---
@@ -178,3 +178,68 @@ Test column: file + testset that pins the behavior, or `—`.
 | 2688 | A way to list environments | feature | SKIP | Feature request for an env-listing command. |
 | 2640 | API to activate first parent dir with Project.toml | feature | SKIP | Feature request for search_parents option on activate. |
 | 1415 | Make `activate` instantiate by default | feature | SKIP | Speculative design/feature request to auto-instantiate on activate. |
+
+## Page 7
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 4074 | dev gives confusing error on stdlibs | feature | SKIP | Asks to improve the (correct) error-message wording when dev'ing an stdlib by name; error  |
+| 4068 | When dev'ing a cloned repository Pkg.build is not triggered | bug | **PERSISTS** | Ran a Level-2 API repro in the r4068 --test daemon: created a synthetic local dev package BuildMe with deps/build.jl that writes a sentinel file deps/BUILD_RAN, set DEPOT_PATH/ACTIVE_PROJECT per with_api_env. Output: "sentinel exi… |
+| 4063 | ArgumentError when adding packages with "+" in version | bug | **FIXED** | Ran plan_add offline against the Example fixture. plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "2024.2.0+0")]) yields `VibePkg.Errors.PkgError :: invalid version specifier "2024.2.0+0" for package `Example``; same… |
+| 4059 | Show manifest julia version in `status` | feature | SKIP | Enhancement to display the manifest's julia version inside `status` output. |
+| 4043 | Prioritize higher versions of direct dependencies over indirect depend | rfc | SKIP | Resolver design proposal to weight direct deps over transitive deps; no incorrect behavior |
+| 4021 | Intermittent failure in Julia's CI `Being precompiled by another proce | bug | SKIP | Flaky test in Pkg's own CI suite; intermittent, no deterministic user-facing MWE. |
+| 4019 | Restrict the resolver to only consider the latest patch version per ma | rfc | SKIP | Resolver policy proposal to enable compat fixes via patch releases; design discussion, no  |
+| 4012 | Strange output with Pkg add on 1.11.0-rc3, after "failed Task notice;  | bug | SKIP | REPLExt error-cascade producing garbage output after precompile failures; environment/REPL |
+| 4006 | `ResolverError` coloring should be decided in `showerror`, not on cons | bug | **PERSISTS** | Ran a Level-1 resolver-conflict repro in the r4006 --test daemon (synthetic A/B/C graph copied from test/resolve.jl `solve`; requiring A=2 and B=1 is unsatisfiable -> VibePkg.Resolve.ResolverError). Two runs:  (1) Constructed the… |
+| 3996 | Progress bar thinks displaysize width is always 80 | bug | **FIXED** | Ran show_progress via the r3996 daemon against IOContexts reporting displaysize widths 80/120/200 (with p.width raised so termwidth is the binding constraint). The rendered bar's glyph count scaled 50/90/170, proving the bar sizes… |
+| 3991 | Fix devved packages actually being used when testing them | bug | **FIXED** | Ran a live Level-2 API repro in the r3991 --test daemon. Setup (all offline, tempdirs): a dev'd `Example` at path `.../ExampleDev` (Project.toml uuid 7876af07..., version 0.5.1) whose src defines a distinctive `const DEVMARKER = 4… |
+| 3969 | Pkg CI does a lot of re-precompiling stdlibs | bug | SKIP | Observation about Pkg's own CI re-precompiling stdlibs (likely DEPOT_PATH overloading); no |
+| 3947 | `status` can error when the RHS in `[extensions]` does not map to a we | bug | **FIXED** | Ran an API-level repro (jld --test) building the exact #3947 shape: a dev package Foo with Project.toml [deps] Test = "8dfed614-..." (a normal dep) and [extensions] TestExt = "Test" and NO [weakdeps] table. After develop+instantia… |
+| 3942 | Dont overload `zero` for `VersionWeight` | other | SKIP | Internal code-cleanup request (avoid overloading Base.zero for VersionWeight); no user-fac |
+| 3798 | Feature Request: Option to Exclude Non-Essential Directories on Packag | feature | SKIP | Feature request to let authors exclude test/docs/examples dirs from installs to save disk. |
+| 3718 | Allow optional commit and tag metadata in Manifests and registries | feature | SKIP | Proposal to add optional git-commit/tag metadata fields to Manifest/registry format. |
+| 3649 | Can we automatically run `registry update` if resolve errors with `Uns | feature | SKIP | Proposal to auto-run registry update on resolve failure; a behavior-change request, not a  |
+| 3557 | Extension module is missing from the cache | bug | SKIP | Precompilation/loading warning (__precompile__(false) during precompile) surfacing from Ba |
+| 3553 | Weak dep is required, but not installed message | bug | SKIP | Confusing 'required but does not seem to be installed' message on `using` a weakdep origin |
+| 3549 | Make `add --weak` automatically create extension entries | feature | SKIP | Enhancement to have `add --weak` also write [extensions] entries. |
+| 3389 | [Preferences] Test ignores preferences that are not explicitly listed  | feature | SKIP | Request to make `] test` respect JULIA_LOAD_PATH / propagate global preferences; a design/ |
+| 3341 | is there a way to Pkg.add that doesn’t precompile the added Pkgs? | question | SKIP | Support question / request to expose an allow_autoprecomp-style kwarg on Pkg.add; not a wr |
+| 2303 | Unsatisfiable requirements when changing compat versions of dependenci | bug | **PERSISTS** | Reproduced offline at plan level. Setup: synthetic dev pkg A (deps Example) developed while its compat pinned Example to =0.5.0, so the manifest recorded Example@0.5.0; then A's Project.toml compat was edited on disk to Example =… |
+| 1249 | yanked packages cause resolver problems when testing | bug | **FIXED** | Ran an offline repro in the r1249 --test daemon using the Example fixture (1.0.0 is yanked). Built an env whose Project depends on Example and whose Manifest pins the yanked Example 1.0.0. Step 1 — plan_resolve (PRESERVE_ALL, the… |
+| 819 | Better resolver failure messages | feature | SKIP | Labeled enhancement/resolver; asks for clearer unsatisfiable-requirements messages (e.g. s |
+| 659 | Support for bare git repositories | feature | SKIP | Requests new support (auto-clone) for bare git repos or a better error; primarily a featur |
+
+## Page 8
+
+| # | title | type | verdict | notes / evidence |
+|---|---|---|---|---|
+| 3937 | Bad resolution for SHA in manager | bug | **FIXED** | Ran a Level-1 offline repro: injected a competing registered SHA v1.6.7 into the make_test_registry fixture (tempdir only), then plan_add("SHA"). Output: registry offered only v1.6.7, but RESOLVED SHA version = 0.7.0 (the bundled… |
+| 3933 | very unsound assumptions about REPL state injection | bug | SKIP | Soundness/design concern about __init__ mutating REPL state on a thread; no concrete obser |
+| 3918 | `pkg> registry add https://github.com/staticfloat/General#sf/foo` does | bug | **FIXED** | Ran in isolated --test daemon: built a local git registry repo (Registry.toml with name+uuid) having a `main` and a `foo` branch, then called VibePkg.Registries.add_registry!. With the branch-qualified spec `add_registry!(depots,… |
+| 3914 | REPL completions with `~` have incorrect offset | bug | **FIXED** | Ran completions_for via the r3914 daemon with a fake HOME where expanduser('~') is 57 chars longer than the typed '~'. For the path-completing command, completions_for("activate ~/jul") returned word="~/jul" (exactly equal to the… |
+| 3908 | `expanduser` can fail causing a REPL error in completion | bug | **FIXED** | completions_for stays graceful on tilde inputs |
+| 3907 | More direct resolver error when julia compat is a factor | feature | SKIP | Request to improve/clarify resolver error message wording when julia compat is the cause;  |
+| 3902 | Pkg.test sandbox resolve merge doesn't respect JLL build numbers in ma | bug | **FIXED** | Built an offline synthetic registry with JLL package Foo_jll at build-numbered versions plus a manifest pinning Foo_jll=1.18.0+1, then ran plan_resolve (the same resolver entrypoint the test sandbox uses at src/TestOps.jl:344). Ob… |
+| 3901 | Resolver errors don't show build numbers | bug | **PERSISTS** | Ran the exact resolver message-formatting path in VibePkg via the jld --test daemon. `range_compressed_versionspec([v"1.18.0+1", v"1.18.0+2"])` prints "1.18.0" (build numbers dropped, both indistinguishable); the single-version pa… |
+| 3898 | Don't factor JLLs into the resolver decision when multiple update opti | feature | SKIP | Enhancement to resolver cost weighting for JLLs, a design change not an observable correct |
+| 3892 | dev .. : Relative directory failing under Windows when having cd'ed wi | bug | **FIXED** | The reported bad behavior does NOT reproduce in VibePkg. Root cause of the original Pkg bug: its REPL parser `parse_package_identifier` gated `.`/`..`/path words behind `casesensitive_isdir(expanduser(word))`, which walks each pat… |
+| 3891 | [workspace] Misleading printing of Manifest.toml change | bug | **FIXED** | Ran plan-level repro in the r3891 --test daemon with the offline Example fixture. Built the workspace analog: root Project.toml with [workspace] projects=["test"], a `test` member sharing the root manifest, Example path-tracked at… |
+| 3880 | proposal: distinguish explicitly vs implicitly added registries | rfc | SKIP | Design proposal for explicit vs implicit registry tracking. |
+| 3871 | Precompiling when using a single package causes unnecessary precompila | bug | N/A | The reported bug is in the precompilation-set/dependency-closure computation (deciding which packages get precompiled when using one package). That logic is not in VibePkg. Runtime check in the jld --test daemon: after `using Vibe… |
+| 3869 | Pkg tree hash issues on linux with CIFS mounted network file server | bug | SKIP | Filesystem-specific (CIFS) tree-hash mismatch; not plausibly reproducible/checkable, repor |
+| 3853 | Things get very confusing when putting the wrong name to a UUID in the | bug | **PERSISTS** | Level 1 plan-level repro on the offline Example fixture. Hand-wrote Project.toml with `ForwardDiff = "7876af07-990d-54b4-ab0e-23690620f79a"` (Example's UUID under the wrong name, analog of the report's ForwardDiff=WebIO-UUID). pla… |
+| 3845 | Specifying registries needed for a project in the Project file | feature | SKIP | Design/feature discussion on declaring registries in the Project file. |
+| 3808 | Make spinners spin more slowly | feature | SKIP | Feature request to make precompile spinner interval configurable. |
+| 3795 | Bad resolve if different build metadata versions have different depend | bug | **PERSISTS** | Ran a plan-level repro in the r3795 daemon with a synthetic registry mirroring Wayland_jll/EpollShim_jll: Foo_jll has build-metadata versions 1.21.0+0 and 1.21.0+1; its Deps.toml keys deps on major.minor.patch (["1.21.0"] -> Bar_j… |
+| 3781 | Move `Unregistered.jl` used in testing to `JuliaLang` org? | other | SKIP | Test-infrastructure hygiene request to relocate a test package. |
+| 3780 | Add back recurring precompile tests | other | SKIP | Test-infrastructure task to restore reverted precompile tests. |
+| 3774 | Base.runtests(["Pkg"]) hangs | bug | SKIP | Test-harness hang: Pkg tests prompt for git credentials when run single-worker with a tty  |
+| 3503 | switching between pkg servers with different registries | rfc | SKIP | Multi-case proposal/discussion about pkg-server registry handling; mixes enhancement and d |
+| 3453 | Simultaneous writing to manifest_usage on NFS crashes Julia | bug | SKIP | NFS-specific IO race in usage-log pidfile; not plausibly reproducible/checkable without an |
+| 3146 | Feature request: function to precompile all projects | feature | SKIP | Explicit feature request for a precompile-all-projects function. |
+| 3044 | LibGit2 Clone Fails: "Unable to exchange encryption keys" | bug | SKIP | SSH/libssh2 environment-specific clone failure against a private GitLab; not plausibly che |
+| 2679 | stop using libgit2 | rfc | SKIP | Design/strategy discussion to replace libgit2 with CLI git. |
+| 2549 | Unable to install JLL package from private repo | bug | SKIP | Private-repo/auth-specific artifact download failure; requires private credentials, not pl |
+| 1967 | proposal for package tags and descriptions in registry | feature | SKIP | Feature proposal to add tags/description fields to registry and Project.toml. |
+| 1062 | Introduce `down` as opposite of `up` | feature | SKIP | Feature request for a downgrade-to-oldest-compatible command. |
