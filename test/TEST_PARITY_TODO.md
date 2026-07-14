@@ -21,14 +21,55 @@ each agent read the reference test, then grepped/opened the VibePkg tests and
 
 | Verdict | Count |
 |---|---|
-| ✅ Covered | ~84 |
-| 🟡 Partial | ~120 |
+| ✅ Covered | ~118 |
+| 🟡 Partial | ~86 |
 | ❌ Missing | ~61 |
-| ⚪ N/A | ~34 |
+| ⚪ N/A | ~35 |
 
 Counts are approximate — some entries fold several sub-testsets together. Treat
 🟡 entries as partial gaps: the inline note says exactly what is not yet
 asserted, so many are cheap follow-ups rather than net-new test files.
+
+## PARTIAL → COVERED pass (test/parity_gaps.jl)
+
+A dedicated file, `test/parity_gaps.jl`, closes ~33 🟡 PARTIAL entries (fanned
+out one gap per agent, each verified standalone, then merged and run together —
+**39 testsets / 255 assertions green**, both standalone and through the parallel
+runner). Several entries surfaced documented divergences (`why: REPL`
+two-positional → 🟡→⚪; `#1066` name/uuid enforced at `validate_project`
+read-time; `update` targets registries by name only; inconsistent manifests
+rejected at load not instantiate; `status` emits no out-of-sync message) — all
+still asserted against VibePkg's actual behavior. Each detailed entry carries a
+`✔ parity_gaps.jl …` note.
+
+**Wave 6 added:** develop-overrides-existing-entry (count stays 1), nested-dev
+#1570 (no duplicate instances), mutual A↔B dev cycle, no-arg activate() clears
+ACTIVE_PROJECT, instantiate rejects an inconsistent manifest, and stale-manifest
+predicate flip (status stays silent).
+
+**Waves 4–5 added:** resolver-error-names-the-package (unsatisfiable version),
+invalid repo url / path add errors, add-doesn't-mutate-input, develop input
+checking, same-name/different-uuid registry conflict, requesting-a-yanked-version
+errors, fresh-add manifest_format v2.1, pin input checking, up-leaves-dev'd-
+untouched, colliding name/uuid, package-in-two-registries-records-both, registry
+rm/update by uuid & name=uuid, #3147 pin/track flag transitions, and pin+free of
+a repo-tracked package.
+
+**Waves 1–3 converted:**
+
+- pkg.jl "range_compressed_versionspec" (1044); "versionspec with v" (1067);
+  "PkgError printing" (769); "stdlib_resolve!" (662, via name↔uuid accessors);
+  "URL with trailing slash" (959); "adding nonexisting packages" (489);
+  "simple add… installed files read-only" (180, read-only piece);
+  "targets should survive add/rm" (724); "up in Project without manifest" (511);
+  "up should prune manifest" (857); "adding/upgrading versions" UPLEVEL (221).
+- misc.jl "hashing" (12); "PackageSpec version default" (50).
+- api.jl "issue #2587" PackageSpec uuid normalization (349).
+- manifests.jl "dropbuild" (202).
+- force_latest "get_earliest_backwards_compatible_version" (32).
+- sources.jl "path normalization in [sources]" (56).
+- new.jl "multiple registries overlapping version ranges" (3586);
+  "add: repo handling" is_instantiated toggling (1008, that piece).
 
 ---
 
@@ -248,7 +289,7 @@ VibePkg reproduces the REPL-parsing, input-validation, activate, and preserve/pi
 
 ### add: repo handling — line 1008
 - **Tests:** Absolute-path adds are stored absolute and survive moving the project (re-`instantiate` after deleting `packages`); relative-path adds are canonicalized relative to the project, `Operations.is_instantiated` flips true/false with the tree present/absent, and break if the relative position is destroyed; URL-added packages reuse the existing clone after deleting `packages`, and re-clone the remote after deleting both `packages` and `clones`.
-- **VibePkg:** 🟡 PARTIAL — ops.jl "absolute dev path stays absolute" and "relative sources path survives unrelated ops", plus git.jl "re-materialize keeps the installed tree intact" and "instantiate fetches repo package into a fresh depot" cover the underlying mechanics. Not directly asserted: `is_instantiated` toggling with a relative path, and the reuse-clone-then-re-clone escalation after deleting `packages`/`clones`.
+- **VibePkg:** 🟡 PARTIAL — ops.jl "absolute dev path stays absolute" and "relative sources path survives unrelated ops", plus git.jl "re-materialize keeps the installed tree intact" and "instantiate fetches repo package into a fresh depot" cover the underlying mechanics. is_instantiated toggling now asserted (✔ parity_gaps.jl "is_instantiated toggles with the install tree" via `Depots.find_installed`'s `installed::Bool`). Still open: the reuse-clone-then-re-clone escalation after deleting `packages`/`clones`.
 
 ### add: resolve tiers — line 1101
 - **Tests:** Against a pinned General commit, four fixtures (ShouldPreserveAll/Direct/Semver/None) verify that `add` with the default tiered resolver preserves as much of the existing graph as possible, downgrading only what's forced, and that semver-preserve keeps deps within their semver range while none-preserve makes breaking changes.
@@ -264,7 +305,7 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### develop: input checking — line 1516
 - **Tests:** Rejects invalid develop args: `julia`/`***`/`Foo Bar` names, URL/path-looking strings with a "did you mean url=/path=" hint, empty spec, `rev` given to develop, unregistered name, wrong/missing UUID, and duplicate specs.
-- **VibePkg:** 🟡 PARTIAL — argshapes.jl "pinned entry diagnostics" covers `julia`/`***`/URL-hint/empty-spec/`rev not supported`/dup-name/dup-UUID (validation code is shared with add). Missing for develop specifically: `./Foobar` path hint, `Foo Bar`, developing an unregistered name, and wrong-UUID / uuid-only-missing lookup errors.
+- **VibePkg:** ✅ COVERED — argshapes.jl "pinned entry diagnostics" covers the shared validation; ✔ parity_gaps.jl "develop input checking" adds the develop-specific cases: `Foo Bar`, `./Foobar` / URL hints naming `Pkg.develop`, and an unregistered valid name → "could not be resolved". (wrong-UUID lookup deep in resolve not separately driven — minor.)
 
 ### develop: changes to the active project — line 1558
 - **Tests:** develop by registered name / uuid / url / filesystem path, shared vs `shared=false` target dirs, recursive develop (a dev'd package's own `dev/` deps), and a relative primary depot.
@@ -280,7 +321,7 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### develop: package state changes — line 1778
 - **Tests:** develop overrides a package already tracking the registry, already tracking a repo, or already dev'd at a different path; develop resolves an existing manifest entry by name.
-- **VibePkg:** 🟡 PARTIAL — plan_develop over an existing env is exercised (ops.jl, pin@version, free dev'd registered), so override-by-develop works, but there is no explicit "add/dev-repo then develop overrides and count stays 1" or "develop resolves url-added package by name" assertion.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "develop overrides an existing entry (count stays 1)" (add Example → develop overrides to path-tracked, exactly one entry; re-develop at a new path overrides again). "develop resolves url-added package by name" (git materialization) remains a minor gap.
 
 ### develop: REPL — line 1829
 - **Tests:** REPL parses `develop Example`, uuid, `name=uuid`, `--local`/`--shared`, url, and `--preserve=none` into the right api/args/opts.
@@ -292,7 +333,7 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### instantiate: changes to the active project — line 1884
 - **Tests:** instantiate preserves the manifest tree hash for versioned and repo-tracked packages after deleting packages/clones; errors on an inconsistent dep graph; with `manifest=false` instantiates from direct deps; handles a lonely manifest, an old manifest, and duplicate names; verbose smoke test.
-- **VibePkg:** 🟡 PARTIAL — execution.jl and git.jl "instantiate fetches repo package into a fresh depot" cover installing at the manifest's tree hash from a clean depot (versioned + repo-tracked). Missing: inconsistent-dep-graph error, `manifest=false` (instantiate from direct deps), lonely-manifest / old-manifest / duplicate-name cases, and the verbose path.
+- **VibePkg:** 🟡 PARTIAL — execution.jl and git.jl "instantiate fetches repo package into a fresh depot" cover installing at the manifest's tree hash from a clean depot; the inconsistent-dep-graph error is now covered (✔ parity_gaps.jl "instantiate errors on an inconsistent manifest" — divergence: VibePkg rejects a dangling-dep manifest up front in parse_manifest, so it never loads, vs Pkg erroring at instantiate). Still open: `manifest=false` (instantiate from direct deps), lonely/old/duplicate-name cases, and the verbose path.
 
 ### instantiate: caching — line 1983
 - **Tests:** instantiate must not re-download or overwrite already-installed source (tree hash and mtime unchanged).
@@ -304,7 +345,7 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### why: REPL — line 2025
 - **Tests:** `why Foo` parses to `Pkg.why` with the package; `why Foo Bar` (two positionals) throws.
-- **VibePkg:** 🟡 PARTIAL — replmode.jl parses `why --workspace Foo` (api === why). The two-positional-args error case is not exercised.
+- **VibePkg:** ⚪ N/A — divergence: VibePkg's `why` REPL command takes `1:typemax(Int)` packages (`src/REPLMode.jl:189`; `API.why(::AbstractVector)` iterates), so `why Foo Bar` does NOT throw — it parses to two package args. Pkg's `1:1` two-positional-error case has no equivalent (verified empirically).
 
 ### why — line 2035
 - **Tests:** `why` prints the dependency paths from the roots to the queried package (e.g. multiple chains for LinearAlgebra).
@@ -320,7 +361,7 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### update: package state changes — line 2116
 - **Tests:** basic up bumps an old version; pinned packages are not updated; stdlib special-casing; up leaves dev'd packages untouched; up of repo-tracked packages is gated by UPLEVEL (only MAJOR re-fetches) and respects pins; targeted `update(name)` with PRESERVE_DIRECT/NONE preserves non-target state.
-- **VibePkg:** 🟡 PARTIAL — ops.jl "ops" (pinned holds through up, up moves within compat), git.jl "up with unregistered url-added deps" (repo stays repo-tracked through up), planning.jl "package→stdlib transition on up", and options.jl "up: named with preserve" (ALL/NONE/DIRECT) cover most. Missing: UPLEVEL gating specifically on repo-tracked packages (only MAJOR re-fetches) and an explicit "up doesn't touch dev'd package" assertion.
+- **VibePkg:** 🟡 PARTIAL — ops.jl "ops", git.jl "up with unregistered url-added deps", planning.jl "package→stdlib transition on up", and options.jl "up: named with preserve" cover most; the "up doesn't touch a dev'd package" assertion is now covered (✔ parity_gaps.jl "up leaves a dev'd package untouched"). Still open: UPLEVEL gating specifically on repo-tracked packages (only MAJOR re-fetches).
 
 ### update: REPL — line 2289
 - **Tests:** REPL parses bare `up` to `Pkg.update` with empty opts.
@@ -332,11 +373,11 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### pin: input checking — line 2313
 - **Tests:** pin errors when the package isn't in the dep graph; pinning an unregistered package to an arbitrary version errors; pinning to a non-existent version raises a ResolverError.
-- **VibePkg:** 🟡 PARTIAL — pins.jl "pinned diagnostics" covers unresolved-name and wrong-UUID/"to be registered" messages; options.jl uses ResolverError on plan_add. Missing: the specific "unable to pin unregistered package … to an arbitrary version" message and pin-to-nonexistent-version ResolverError.
+- **VibePkg:** ✅ COVERED — pins.jl "pinned diagnostics" covers unresolved-name / wrong-UUID; ✔ parity_gaps.jl "pin input checking" adds the "unable to pin unregistered package … to an arbitrary version" message and pin-to-nonexistent-version → ResolverError (plus pin of a package not in the graph → PkgError).
 
 ### pin: package state changes — line 2332
 - **Tests:** pin a regular registered package; pin a repo-tracked package (stays non-registry, becomes pinned); versioned pin to a different version; pin with an invalid version raises ResolverError.
-- **VibePkg:** 🟡 PARTIAL — ops.jl "ops" and "status and pin regressions" pin a registered package and pin@version to a specific version; ops.jl "pin@version re-tracks the registry" covers versioned pin off a dev'd entry. Missing: pinning a repo-tracked package, and the invalid-version ResolverError.
+- **VibePkg:** ✅ COVERED — ops.jl "ops"/"pin@version re-tracks the registry" cover registered + versioned pins; ✔ parity_gaps.jl "pin and free a repo-tracked package" covers pinning a repo-tracked package (stays repo-tracked, becomes pinned) and "pin input checking" covers the invalid-version ResolverError.
 
 ### free: input checking — line 2370
 - **Tests:** free errors on a package not in the graph; free of a registry-tracked, unpinned package errors with an "expected package … to be pinned, tracking a path, or tracking a repository" message.
@@ -344,7 +385,7 @@ VibePkg covers the argument-parsing and plan-level mechanics of these ops well, 
 
 ### free: package state changes — line 2387
 - **Tests:** free a pinned package (unpins); free a repo-tracked package back to registry; free a dev'd package back to registry; free of a package tracking an unregistered repo/dev errors.
-- **VibePkg:** 🟡 PARTIAL — ops.jl covers free of a pinned package (unpin in place), "free dev'd registered package" (dev → registry at latest non-yanked), and free of an unregistered dev'd package erroring. Missing: freeing a *repo/rev*-tracked registered package back to registry tracking.
+- **VibePkg:** ✅ COVERED — ops.jl covers free of a pinned/dev'd package; ✔ parity_gaps.jl "pin and free a repo-tracked package" covers freeing a repo/rev-tracked registered package back to registry tracking (unpinned, `[sources]` dropped).
 
 ### free: REPL — line 2430
 - **Tests:** REPL parses `free Example` to `Pkg.free` with the package spec.
@@ -412,7 +453,7 @@ VibePkg covers the bulk of the operation surface (test/rm/build/gc/precompile/st
 
 ### cycles — line 3412
 - **Tests:** Dev A→B and B→A mutually; the resulting `Cycle_B/Manifest.toml` contains A's uuid (with a `@test_broken` on B not appearing in its own manifest).
-- **VibePkg:** 🟡 PARTIAL — `ops.jl` "cyclic dep back onto the active project" verifies `plan_develop` of a package depending back on the active project does not `KeyError`; the mutual A↔B dev manifest-content assertion is not reproduced.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "mutual A<->B dev cycle resolves" (dev A which sources B and B sources A back — no error; both land path-tracked with the cross-references recorded in both directions, surviving write/reload). No `@test_broken` needed — VibePkg records both sides.
 
 ### downloads with JULIA_PKG_USE_CLI_GIT — line 3438
 - **Tests:** Under `JULIA_PKG_USE_CLI_GIT` unset/true: `add` by name/url with `use_git_for_all_downloads=true` installs read-only sources; bad urls throw for both `Pkg.add` and `Pkg.Registry.add`; `add` with `use_only_tarballs_for_downloads=true`.
@@ -420,11 +461,11 @@ VibePkg covers the bulk of the operation surface (test/rm/build/gc/precompile/st
 
 ### package name in resolver errors — line 3471
 - **Tests:** A resolver failure (`add Example@v55`) produces an error message that mentions the package name.
-- **VibePkg:** 🟡 PARTIAL — `argshapes.jl` asserts package names appear in validation error messages, but no test confirms a resolver/unsatisfiable-version error string names the offending package.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "resolver error names the package" (Example@99.0.0 → ResolverError "Unsatisfiable requirements detected for package …" naming Example).
 
 ### API details — line 3481
 - **Tests:** `Pkg.add(packages)` does not mutate the caller's `PackageSpec` vector; API accepts `AbstractString` args (`strip(...)`).
-- **VibePkg:** 🟡 PARTIAL — `argshapes.jl` covers `AbstractString`/`SubString` name dispatch (#901); the "API must not mutate the input `PackageSpec` vector" invariant is not tested.
+- **VibePkg:** ✅ COVERED — `argshapes.jl` covers `AbstractString`/`SubString` name dispatch (#901); ✔ parity_gaps.jl "add does not mutate the input spec vector" asserts `API.split_specs` builds fresh `PackageRequest`s and leaves the caller's vector unchanged (length/`==`/element identity).
 
 ### REPL error handling — line 3496
 - **Tests:** Malformed PackageSpec tokens (double `#rev`, double `@ver`, bare `#rev`/`@ver`), wrong argument counts, invalid options, and conflicting options each throw `PkgError`.
@@ -436,11 +477,11 @@ VibePkg covers the bulk of the operation surface (test/rm/build/gc/precompile/st
 
 ### multiple registries overlapping version ranges for different versions — line 3586
 - **Tests:** A second registry offering Example only at v0.99.99 with `julia="0.0"` compat must not cause a resolver error when the primary registry has a compatible version.
-- **VibePkg:** 🟡 PARTIAL — `registries.jl` "same version in multiple registries: first registry's compat wins" and "identical registry in two depots" cover multi-registry compat merging/dedup, but not the specific case of an incompatible-only version in a secondary registry being resolved around without error.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "secondary registry incompatible version is skipped" (a second registry's `julia="0.0"`-only 99.99.99 is resolved around to the primary's compatible 1.0.0, no error).
 
 ### not collecting multiple package instances #1570 — line 3631
 - **Tests:** Dev A into B, then in a third env dev both A and B (A already dev'd in B) — must not error from collecting multiple package instances.
-- **VibePkg:** 🟡 PARTIAL — `ops.jl` "cyclic dep back onto the active project" and "same-name different-uuid packages coexist" cover related multi-instance/self-reference collection paths, but not this exact nested-dev arrangement.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "nested dev does not collect duplicate instances (#1570)" (dev B [which sources A] then dev A directly — no multiple-instances error; A stays a single path-tracked entry across write/reload).
 
 ### cyclic dependency graph — line 3645
 - **Tests:** `add(path=A)` while B is active, where A dev-depends on B (and the #2302 variant with B added by path first) must not error despite the A→B→active cycle.
@@ -508,7 +549,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### simple add, remove and gc — line 180
 - **Tests:** add Example, installed files are read-only, rm, then `gc` reaps unused package dirs and unused git clones.
-- **VibePkg:** 🟡 PARTIAL — add/rm and gc-reaping-dead-packages covered (ops.jl, gc.jl "gc"); no assertion that installed package files are read-only, and clone-dir reaping isn't specifically exercised.
+- **VibePkg:** 🟡 PARTIAL — add/rm and gc-reaping-dead-packages covered (ops.jl, gc.jl "gc"); installed-files-read-only now asserted (✔ parity_gaps.jl "installed files are read-only": user-write cleared, write raises SystemError). Still open: clone-dir reaping isn't specifically exercised.
 
 ### package with wrong UUID — line 203
 - **Tests:** add with wrong UUID throws PkgError; wrong-UUID-but-correct-name yields a detailed message listing the registered UUID; missing-uuid spec throws.
@@ -516,7 +557,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### adding and upgrading different versions — line 221
 - **Tests:** add pinned VersionNumber / VersionRange; adding another package doesn't upgrade existing; `update(level=UPLEVEL_PATCH)` and `UPLEVEL_MINOR` bump appropriately.
-- **VibePkg:** 🟡 PARTIAL — add-at-version and preserve-existing covered (pins.jl, options.jl "add preserve against newer registry versions"); the UPLEVEL_PATCH vs UPLEVEL_MINOR bump semantics aren't directly exercised (only UPLEVEL_FIXED in options.jl).
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "up UPLEVEL patch vs minor" drives `plan_up` at FIXED/PATCH/MINOR against a 1.0.0/1.0.1/1.1.0 registry (holds / →1.0.1 / →1.1.0).
 
 ### testing — line 242
 - **Tests:** `Pkg.test(...; coverage=true)` runs tests and produces `.cov` files in the package dir.
@@ -540,7 +581,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### package name in resolver errors — line 350
 - **Tests:** requesting an unsatisfiable version produces a resolver error whose message contains the package name.
-- **VibePkg:** 🟡 PARTIAL — resolver machinery and diagnostics are tested (resolve.jl, planning.jl, pins.jl "Suggestions"), but the specific unsatisfiable-version-request-names-the-package case isn't asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "resolver error names the package" (unsatisfiable Example@99.0.0 → ResolverError names Example).
 
 ### protocols — line 358
 - **Tests:** `setprotocol!`/`GitTools.normalize_url` rewrite clone URLs per domain (https↔ssh), plus deprecation of the old `setprotocol!` forms.
@@ -560,7 +601,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### adding nonexisting packages — line 489
 - **Tests:** `add`/`update` of a random nonexistent package name throw PkgError.
-- **VibePkg:** 🟡 PARTIAL — invalid-name paths are tested (argshapes.jl "julia"; missing path in pins.jl), but adding/updating an unregistered random package name throwing isn't specifically asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "add nonexistent package throws" asserts `plan_add`/`plan_up` of a syntactically-valid unregistered name throw `PkgError` ("could not be resolved").
 
 ### add julia — line 497
 - **Tests:** `Pkg.add("julia")` throws (reserved name).
@@ -572,7 +613,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### up in Project without manifest — line 511
 - **Tests:** in a Project.toml-only env, `update` resolves and installs the dep (creating the manifest).
-- **VibePkg:** 🟡 PARTIAL — resolve/up from a project is covered broadly (planning.jl "Planning", options.jl "up: project vs manifest mode", git.jl "up with unregistered url-added deps"), but the specific manifest-less bootstrap-on-up scenario isn't named.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "up bootstraps a missing manifest" (project-only env → `plan_up`+`apply!` creates the Manifest.toml with Example).
 
 ### libgit2 downloads — line 525
 - **Tests:** duplicate of line 503 — `add(...; use_git_for_all_downloads=true)` then rm.
@@ -592,7 +633,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### invalid repo url — line 596
 - **Tests:** `add("https://github.com")` and `add("./Foobar")` both throw PkgError.
-- **VibePkg:** 🟡 PARTIAL — dead/invalid URL paths are tested (options.jl develop against `dead.invalid`, git.jl "add of a repo without commits"), but add of a bare non-repo URL and a relative `./Foobar` path aren't specifically asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "invalid repo url / path add errors": `add("https://github.com")` and `add("./Foobar")` throw PkgError at name-validation time (URL/path hint), and `add(path="./Foobar")` into an absent dir throws the isdir-guard PkgError.
 
 ### instantiating updated repo — line 611
 - **Tests:** multi-depot/multi-machine flow: clone, add by path, copy env to a second depot and instantiate, commit upstream changes, update, re-copy manifest, re-instantiate.
@@ -604,7 +645,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### stdlib_resolve! — line 662
 - **Tests:** `stdlib_resolve!` fills a missing uuid from a stdlib name and a missing name from a uuid, and leaves fully-specified specs alone.
-- **VibePkg:** 🟡 PARTIAL — stdlib name/uuid lookup is tested indirectly (depots_stdlibs.jl "Stdlibs"), but the name↔uuid completion API on PackageSpecs isn't directly asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "stdlib name<->uuid completion" asserts bidirectional completion via `EnvFiles.stdlib_uuid_for_name` / `Stdlibs.stdlib_infos` (VibePkg's PackageSpec is immutable, so no in-place `stdlib_resolve!`).
 
 ### issue #913 — line 675
 - **Tests:** add rev="master", delete Project/Manifest, re-add the same rev — must not fail.
@@ -620,7 +661,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### targets should survive add/rm — line 724
 - **Tests:** a project's `[targets]` are unchanged after an add followed by an rm (issue #876).
-- **VibePkg:** 🟡 PARTIAL — extras/compat preservation on rm is tested (planning.jl "rm keeps compat of extras and julia"; envfiles.jl `read_project_targets`), but the full `[targets]` round-trip-through-add/rm invariant isn't asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "[targets] survive add/rm" asserts the `[targets]` table (order-preserving, byte-identical TOML) is unchanged after an add-then-rm.
 
 ### canonicalized relative paths in manifest — line 739
 - **Tests:** reading a manifest path yields OS-native separators; writing emits forward slashes (`path = "bar/Foo"`).
@@ -632,7 +673,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### PkgError printing — line 769
 - **Tests:** `show(PkgError)` renders `PkgError("...")` and `showerror` prints the bare message.
-- **VibePkg:** 🟡 PARTIAL — `showerror(PkgError)` is exercised widely (pins.jl, argshapes.jl), but the `show`/repr `PkgError("...")` form isn't directly asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "PkgError printing" asserts `show` renders `PkgError("…")` and `showerror` prints the bare message.
 
 ### issue #2191: better diagnostic for missing package — line 775
 - **Tests:** dev a path package, delete its directory, `resolve` → PkgError whose message contains "This package is referenced in the manifest file:".
@@ -640,7 +681,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### issue #1066: colliding name/uuid in project — line 810
 - **Tests:** develop/add of a package whose name (but not uuid) or uuid (but not name) collides with an existing project dep throws PkgError.
-- **VibePkg:** 🟡 PARTIAL — ops.jl "same-name different-uuid packages coexist" handles the coexistence case, but the PkgError-on-collision (dev/add rejected) behavior isn't asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "colliding name or uuid in project errors" asserts the same-uuid/different-name collision throws PkgError ("Two different dependencies/weak dependencies can not have the same uuid"). Enforcement-point divergence: VibePkg keeps `[deps]` a name→UUID map (same-name collision can't be expressed) and enforces the uuid invariant at `validate_project` read time rather than at dev/add time.
 
 ### issue #1180: broken toml-files in HEAD — line 835
 - **Tests:** `status(diff=true)` warns "could not read project from HEAD" and falls back when HEAD's Project.toml is broken.
@@ -652,7 +693,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### up should prune manifest — line 857
 - **Tests:** `update` drops now-unreachable indirect deps from the manifest (Unpruned fixture: Example stays, Unicode removed).
-- **VibePkg:** 🟡 PARTIAL — resolve/up recompute the manifest broadly, but an explicit "up prunes a now-unreachable manifest entry" assertion isn't present.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "up prunes an unreachable manifest entry" (orphan dropped by `plan_up`, reachable Example + its Test dep kept).
 
 ### undo redo functionality — line 874
 - **Tests:** undo/redo stack across add/rm, no-op adds don't push states, and state persists across project swaps.
@@ -664,7 +705,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### URL with trailing slash — line 959
 - **Tests:** `add(url=".../Example.jl.git/")` strips the trailing slash and installs (PR #1784).
-- **VibePkg:** 🟡 PARTIAL — URL normalization is tested (doc_features.jl `normalize_url`), but trailing-slash stripping specifically isn't asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "URL trailing slash" asserts `Git.normalize_url` strips a trailing `/` (and collapses several) so a `.git/` URL matches the non-slash form.
 
 ### Pkg.test process failure — line 968
 - **Tests:** test-subprocess failures raise PkgError with mode-specific messages: signal KILL, exit code 1, exit code 2, and aggregated multi-package failures.
@@ -672,11 +713,11 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### range_compressed_versionspec — line 1044
 - **Tests:** compress a version pool (with/without a subset) into a minimal `VersionSpec` of ranges.
-- **VibePkg:** 🟡 PARTIAL — `range_compressed_versionspec` exists (src/Resolve/graphtype.jl) and runs via the resolver (resolve.jl), but has no direct unit test.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "range_compressed_versionspec" ports the reference pool/subset assertions directly.
 
 ### versionspec with v — line 1067
 - **Tests:** `VersionSpec("v1.2.3")` parses the `v` prefix and gives correct membership.
-- **VibePkg:** 🟡 PARTIAL — versions.jl parses `VersionBound("v1.2.3")`, but `VersionSpec("v1.2.3")` membership isn't asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "versionspec with v" asserts `VersionSpec("v1.2.3")` strips the prefix and has correct membership.
 
 ### Suggest `Pkg.develop` instead of `Pkg.add` — line 1074
 - **Tests:** `add(; path=dir)` where dir has only a Project.toml throws PkgError suggesting `develop`.
@@ -688,7 +729,7 @@ Older-style API/integration suite covering version parsing, add/rm/update/pin/de
 
 ### Issue #3147 — line 1090
 - **Tests:** pin/develop/add/update interactions preserve pin and tracking flags (is_pinned/is_tracking_path/is_tracking_repo) and versions across dev→pin→add and pin→update-noop→re-pin sequences.
-- **VibePkg:** 🟡 PARTIAL — pin/track-flag behavior is partly covered (ops.jl "pin@version re-tracks the registry"; pins.jl round-3 diagnostics), but the full dev+pin+add and pin+update-noop flag matrix isn't replicated.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "pin/track flag transitions (#3147)" asserts a coherent subset of the flag matrix: add→pin→up (pin flag + version held), dev→unrelated-add (dev entry stays path-tracked/unpinned), and dev→versionless-pin (pinned && path-tracked).
 
 ### check_registered error paths — line 1162
 - **Tests:** with zero registries, `add` auto-installs General; and a manifest referencing an unregistered UUID triggers an "expected package to be registered" error.
@@ -804,7 +845,7 @@ Programmatic API surface: activate semantics, the big precompile integration sui
 
 ### Pkg.activate — line 12
 - **Tests:** Exercises `activate` path resolution end-to-end: relative `"."`, activating a path dir over a same-named dep, activating a developed dep by name, empty-dir implicit projects, a registered (non-deved) dep name resolving to a fresh dir, resolving a dev'd dep by name from a different cwd, and no-arg `activate()` clearing `ACTIVE_PROJECT` to the LOAD_PATH project.
-- **VibePkg:** 🟡 PARTIAL — `doc_features.jl` "activate - and activate(dep name)" + `public_api.jl` "activate prev" cover path activation, `-`/prev toggling, dev-name→path, and non-dep-name→new-path. Not covered: no-arg `activate()` → `ACTIVE_PROJECT===nothing`, activating a registered non-dev dep name, and cwd-independent dev-name resolution.
+- **VibePkg:** 🟡 PARTIAL — `doc_features.jl` "activate - and activate(dep name)" + `public_api.jl` "activate prev" cover path activation, `-`/prev toggling, dev-name→path, and non-dep-name→new-path; the no-arg `activate()` → `ACTIVE_PROJECT===nothing` case is now covered (✔ parity_gaps.jl "activate() with no args clears ACTIVE_PROJECT"). Still open: activating a registered non-dev dep name, and cwd-independent dev-name resolution.
 
 ### Pkg.precompile — line 51
 - **Tests:** Large integration suite: sequential depth-first precompile of many generated dev deps, `JULIA_PKG_PRECOMPILE_AUTO` auto-precomp triggered by `build`/`add`/`update`, no-op detection on repeat, positional/vector/PackageSpec forms, and a soft-error broken dep. Also a second block asserting circular-dependency detection ("Circular dependency detected") and empty-env no-op.
@@ -840,7 +881,7 @@ Programmatic API surface: activate semantics, the big precompile integration sui
 
 ### issue #2587: PackageSpec uuid accepts Union{UUID,AbstractString,Nothing} — line 349
 - **Tests:** `PackageSpec(uuid=…)` normalizes `Base.UUID(0)`, a UUID object, a UUID string, and a `SubString` all to the same `Base.UUID`; and `PackageSpec()` / `uuid=nothing` leave `uuid===nothing`.
-- **VibePkg:** 🟡 PARTIAL — `argshapes.jl` "PackageSpec shapes" checks the string→`UUID` case only; the UUID-object, `SubString`, `UUID(0)`, and default/`nothing` uuid cases are not exercised.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "PackageSpec uuid normalization" exercises UUID-object, UUID-string, `SubString`, and `UUID(0)` all normalizing to the same `UUID`, plus default/`nothing`.
 
 ### set number of concurrent requests — line 376
 - **Tests:** `Types.num_concurrent_downloads()` defaults to 8, honors `JULIA_PKG_CONCURRENT_DOWNLOADS=5`, and throws on `0`.
@@ -884,7 +925,7 @@ Registry lifecycle (add/rm/update/status across REPL + API, multi-depot, multi-r
 
 ### `registries` — update/rm cycling by uuid, name=uuid, multi-depot — line 172
 - **Tests:** `registry up/rm` targeting a registry by uuid, `name=uuid`, and bare name across two depots (using `with_depot2`), re-adding and re-removing, asserting installed set and package availability after each step.
-- **VibePkg:** 🟡 PARTIAL — update by name and no-op update covered (`update_registries!` in registry_ops/registries), and rm by uuid/`name=uuid`/bare-name covered in "registry status / rm / add-by-name". No explicit multi-depot add/rm interleaving driven per-depot the way `with_depot2` does, and update-by-uuid / `name=uuid` targeting is not tested.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "registry rm/update by uuid and name=uuid" drives `remove_registry!` by uuid and by name=uuid (and the not-found no-op). Divergence: `update_registries!` targets by name only (no uuid form). The `with_depot2` per-depot interleaving remains a minor gap.
 
 ### `registries` — multiple registries in one command — line 221
 - **Tests:** `registry add General <url>` (several registries in a single call), `registry up A B C`, `registry rm A B`, and the list-form `Registry.add([...])` / `Registry.update([...])` / `Registry.rm([...])`; asserts combined installed set.
@@ -892,7 +933,7 @@ Registry lifecycle (add/rm/update/status across REPL + API, multi-depot, multi-r
 
 ### `registries` — same-name different-uuid add conflicts — line 270
 - **Tests:** After adding RegistryFoo1, adding RegistryFoo2 (same name, different uuid) throws `PkgError`, via both REPL and `Registry.add([...])`.
-- **VibePkg:** 🟡 PARTIAL — the conflict is implemented (`src/Registries.jl:683-691,762`, `"conflicts with existing registry"`) and `registries.jl:135` re-adds the same registry as a no-op, but no test asserts the `@test_throws PkgError` on a same-name/different-uuid add. The ambiguity is only exercised for `rm` ("registry status / rm / add-by-name").
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "same-name different-uuid registry conflict" adds two same-name/different-uuid source registries and asserts the second `add_registry_from_source!` throws PkgError "conflicts with existing registry", leaving the first intact.
 
 ### `registries` — issue #711: identical registry in two depots, then `add` — line 279
 - **Tests:** Adding General into two depots, then `Pkg.add("Example")` must not error because both depots hold the same-uuid `Example`.
@@ -916,7 +957,7 @@ Registry lifecycle (add/rm/update/status across REPL + API, multi-depot, multi-r
 
 ### `registries` > `yanking` — line 429
 - **Tests:** Against the JuliaRegistries/Test registry: `add Example` resolves to 0.5.0 (0.5.1 yanked), `update` won't move it, `add Example@0.5.1` throws `ResolverError`, `JSON` (dep on Example) also pins 0.5.0; a manifest already at yanked 0.5.1 is honored by `instantiate` (standalone and as a transitive dep).
-- **VibePkg:** 🟡 PARTIAL — `registries.jl` (`isyanked`), `planning.jl` "plan add Example: yanked 1.0.0 is skipped", `ops.jl` (free returns to latest non-yanked), and `execution.jl` "instantiate at a yanked version" (`is_version_yanked`, instantiate honors a manifest at a yanked version) cover most. Missing: `@test_throws ResolverError` when explicitly requesting the yanked version, and that `update` leaves a yanked-pinned package put.
+- **VibePkg:** 🟡 PARTIAL — `registries.jl` (`isyanked`), `planning.jl` "yanked 1.0.0 is skipped", `ops.jl` (free returns to latest non-yanked), and `execution.jl` "instantiate at a yanked version" cover most; the explicit-request case is now covered (✔ parity_gaps.jl "requesting a yanked version errors" → ResolverError). Still open: that `update` leaves a yanked-pinned package put.
 
 ### `compressed registry` (pkg-server) — line 496
 - **Tests:** With a real pkg server, for `JULIA_PKG_UNPACK_REGISTRY` = true and unset: adding General leaves a `.tar.gz`/`.tar.zst` tarball iff not unpacked; `Pkg.add("Example")` works; corrupting the recorded tree-sha1 (in `.tree_info.toml` or `General.toml`) forces `Pkg.update` to re-fetch; `Registry.rm` leaves the registries dir empty save `CACHEDIR.TAG`.
@@ -936,7 +977,7 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### Default manifest format is v2.1 — line 37
 - **Tests:** A fresh temp environment `add`ing a package writes a non-v1 manifest whose `manifest_format` is exactly v2.1.0.
-- **VibePkg:** 🟡 PARTIAL — Planning.jl sets `manifest_format = v"2.1.0"` for new manifests, but no test asserts a fresh add emits 2.1; only empty-file→2.0 (envfiles.jl:400) and registries-force-2.1 (envfiles.jl:374-375) are asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "fresh add writes manifest_format v2.1" asserts a fresh `plan_add` yields `manifest_format == v"2.1.0"` in memory and on disk (written `"2.1"`, re-read `v"2.1.0"`).
 
 ### Empty manifest file is automatically upgraded to v2 — line 50
 - **Tests:** An empty Manifest.toml reads as v1 semantically but is treated as v2.0.0; after an `add` it becomes v2.1; a Project-with-deps plus empty manifest doesn't error.
@@ -968,7 +1009,7 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### dropbuild — line 202
 - **Tests:** `Pkg.Operations.dropbuild` strips the DEV build number (`1.2.3-DEV.2134`→`1.2.3-DEV`) while leaving plain/rc versions intact.
-- **VibePkg:** 🟡 PARTIAL — `Planning.dropbuild` exists and is used (planning.jl:51 asserts `manifest.julia_version == dropbuild(VERSION)`), but there is no direct unit test over the four input forms.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "dropbuild" asserts the four input forms (`1.2.3-DEV.2134`→`1.2.3-DEV`; `-DEV`/plain/`-rc1` unchanged).
 
 ### new environment: value is `nothing`, then ~`VERSION` after resolve — line 208
 - **Tests:** A brand-new temp env has `manifest.julia_version === nothing`; after `add` it becomes `dropbuild(VERSION)`.
@@ -984,7 +1025,7 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### project_hash for identifying out of sync manifest — line 239
 - **Tests:** `is_manifest_current` flips false after `compat` change; `status` prints the "dependencies or compat requirements have changed since the manifest was last resolved" message; `instantiate` warns; `update` restores current; `rm` also restores current.
-- **VibePkg:** 🟡 PARTIAL — `manifest_matches_project` (options.jl:211-221) and `is_manifest_current` (planning.jl:61) are unit-tested for current vs compat-stale, and project_hash write is covered (envfiles.jl:273-274); missing are the status sync-message text and the instantiate warning.
+- **VibePkg:** 🟡 PARTIAL — `manifest_matches_project` / `is_manifest_current` are unit-tested; the end-to-end compat-change→predicate-flip is now covered (✔ parity_gaps.jl "stale manifest predicate flips (status stays silent)"). Divergence: VibePkg's `status`/`print_status` emit NO out-of-sync message (the test pins its absence). Still open: the instantiate-time stale warning.
 
 ### syntax julia_version — line 271
 - **Tests:** Umbrella for the project `[syntax] julia_version` handling.
@@ -1036,7 +1077,7 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### Package in multiple registries records all — line 599
 - **Tests:** A package present in two registries records both names in its entry's `registries` array and both registries in the manifest's `[registries]` section, round-tripping through TOML as a 2-element array.
-- **VibePkg:** 🟡 PARTIAL — a 2-registry `[registries]` section round-trips (envfiles.jl "manifest [registries] round trip" General+Local), but no test records TWO registry names into a single package entry (array-of-2) via add.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "package in two registries records both" resolves Example present in two registries and asserts `entry_registries(entry)` lists both names (2-element) plus both in the manifest `[registries]` section.
 
 
 ## test/resolve.jl  (Pkg.jl)
@@ -1072,7 +1113,7 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### get_earliest_backwards_compatible_version — line 32
 - **Tests:** `Pkg.Operations.get_earliest_backwards_compatible_version` maps a version to its backwards-compat floor: `1.2.3→1.0.0`, `0.2.3→0.2.0`, `0.0.3→0.0.3` (semver: floor at the leading non-zero component).
-- **VibePkg:** 🟡 PARTIAL — the same floor logic lives inline in `TestOps.force_latest_compat` (`src/TestOps.jl` lines 108-114), but no test directly asserts the mapping. `test/buildtest.jl` "test: force_latest_compat" only exercises `allow_earlier_backwards_compatible_versions=false` (no floor computed), so the backwards-floor branch is untested.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "test: force_latest_compat backwards-compat floor" drives `force_latest_compat(...; allow_earlier=true)` over 1.2.3/0.2.3/0.0.3 and asserts the compat floors at 1.0.0/0.2.0/0.0.3.
 
 ### OldOnly1 (`SomePkg = "=0.1.0"`) — line 39
 - **Tests:** End-to-end `Pkg.test` on a package pinned to a single old version: succeeds (returns `nothing`) for every combination of `force_latest_compatible_version` ∈ {false,true} × `allow_earlier_backwards_compatible_versions` ∈ {default,false,true} — the forced-latest mode is a no-op when only one version is allowed.
@@ -1189,7 +1230,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### path normalization in Project.toml [sources] — line 56
 - **Tests:** Reading then writing a `[sources]` entry with a `path` renders forward slashes (`subdir/LocalPkg`) in the TOML, never backslashes, so Windows-native separators are normalized on write.
-- **VibePkg:** 🟡 PARTIAL — `src/EnvFiles.jl` uses `normalize_path_for_toml` on the sources `path` on write and the project round-trip is tested generically (envfiles.jl), but no test explicitly asserts forward-slash output / no-backslash for a sources path.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "sources path is forward-slash normalized" reads then writes a `[sources]` path and asserts forward slashes / no backslash in the emitted TOML.
 
 ### recursive [sources] via repo URLs — line 93
 - **Tests:** A Parent→Child→Grandchild chain wired through `file://` git URLs (plus a path-sourced Sibling); `add(url=parent)` pulls in all four packages, each with the correct `git_source` per level, the Sibling is `is_tracking_path` with a `SiblingPkg` source dir, and `using ParentPkg; parent_value()` executes to `47`.
@@ -1371,7 +1412,7 @@ All six testsets exercise the `Pkg.BinaryPlatforms` compat shim (`Linux`/`MacOS`
 
 ### hashing — line 12
 - **Tests:** `hash` is stable/consistent for `Project()`, `VersionBound()`, and `Resolve.Fixed`; `VersionSpec`/`PackageEntry` hashes merely run (documented as unstable).
-- **VibePkg:** 🟡 PARTIAL — `PackageSpec` hash==`==` covered by argshapes.jl "PackageSpec shapes" and `VersionSpec` hash by versions.jl; hash-stability of `Project`, `VersionBound`, and `Resolve.Fixed` is not asserted.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "hashing" asserts consistent hashes for `EnvFiles.Project()`, `Versions.VersionBound`, and `Resolve.Fixed`, and that `VersionSpec`/`ManifestEntry` hashes merely run.
 
 ### safe_realpath — line 21
 - **Tests:** `safe_realpath` returns the input unchanged for empty, nonexistent, and drive-like paths instead of throwing (#3085).
@@ -1383,7 +1424,7 @@ All six testsets exercise the `Pkg.BinaryPlatforms` compat shim (`Linux`/`MacOS`
 
 ### PackageSpec version default — line 50
 - **Tests:** A `PackageSpec(name=...)` with no version defaults `version` to `VersionSpec("*")` (relied on by BinaryBuilderBase), while an explicitly supplied `VersionNumber`/version-string is preserved.
-- **VibePkg:** 🟡 PARTIAL — argshapes.jl "PackageSpec shapes" checks explicit versions are preserved, but does not assert the default-to-`"*"` behavior for a name-only spec.
+- **VibePkg:** ✅ COVERED — ✔ parity_gaps.jl "PackageSpec version default" asserts a name-only spec resolves to the all-versions `VersionSpec("*")` via `to_request`+`request_version_spec` (VibePkg keeps PackageSpec's `.version` `nothing` and defaults downstream), while explicit versions pass through.
 
 ### subprocess_handler forwards interrupts to the child — line 71
 - **Tests:** (non-Windows) A REPL `^C` (InterruptException in the parent task) is forwarded as SIGINT to the child process so it can trap, report, and exit cleanly (exit code 7, not SIGKILLed).
