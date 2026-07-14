@@ -13,6 +13,10 @@ downloading and installing the right artifacts when a package is installed,
 verifying them by hash, honoring overrides, and garbage-collecting unused
 trees.
 
+As with the project and manifest files, `JuliaArtifacts.toml` is accepted as
+an alternative name. When both names exist, the Julia-prefixed file takes
+precedence.
+
 ## `Artifacts.toml`
 
 A minimal entry binds a name to a tree hash and tells where a tarball of the
@@ -42,7 +46,8 @@ end
 
 The `git-tree-sha1` identifies the *unpacked content* and is what gets
 verified after download; the `sha256` verifies the tarball itself. Multiple
-`[[name.download]]` stanzas give mirror URLs.
+`[[name.download]]` stanzas give mirror URLs, tried in order until one
+downloads and verifies successfully.
 
 Two attributes and one structural variation extend the format:
 
@@ -159,8 +164,9 @@ artifact_path(hash)
 
 `bind_artifact!` accepts the same variations the file format has: a
 `platform` keyword for platform-specific bindings (one entry per platform),
-`download_info` — a vector of `(url, sha256)` tuples — to write the download
-stanzas that let others install the artifact, `lazy = true`, and
+`download_info` — a vector of `(url, sha256)` or `(url, sha256, size)` tuples —
+to write the download stanzas that let others install the artifact,
+`lazy = true`, and
 `force = true` to replace an existing binding. `unbind_artifact!` removes a
 binding from the file.
 
@@ -185,6 +191,13 @@ libfoo = "fb886e813a4aed4147d5979fcdf27457d20aa35d"
 Overridden artifacts are never downloaded; `artifact_path` and `artifact"..."`
 resolve to the override target. An empty string removes an override.
 
+Every depot may provide an `Overrides.toml`. They are layered in depot order,
+with the first depot taking precedence; an empty-string entry in a higher
+priority file can therefore re-enable the original artifact after a lower
+priority depot overrode it. Name-based overrides require the package UUID as
+well as the artifact name; the string macro supplies that context
+automatically.
+
 ## Extending platform selection
 
 For artifacts whose correct variant depends on more than the base platform
@@ -194,3 +207,11 @@ to its `Artifacts.toml`. VibePkg runs it at install time to ask the package
 which artifacts to download; at runtime the package passes the same augmented
 platform to `@artifact_str`. See the Julia manual on `Base.BinaryPlatforms`
 for how platform augmentation is written.
+
+The hook receives the target platform triplet as `ARGS[1]` and must print a
+TOML dictionary in the same shape as
+`select_downloadable_artifacts(artifacts_toml; platform)`. It runs in a
+minimal subprocess whose load path contains only Base and the standard
+libraries, so it must not import the package it is selecting artifacts for or
+any third-party dependency. Keep the hook lightweight: it runs during package
+operations, not only when the package is loaded.

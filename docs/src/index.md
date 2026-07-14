@@ -42,6 +42,21 @@ VibePkg can be used in two ways:
 Nearly every REPL command corresponds to one API function, and the two are
 documented together throughout.
 
+## Notable capabilities
+
+Beyond the usual add, update, and remove workflow, VibePkg includes:
+
+- [workspaces](@ref Workspaces), which give monorepos and related projects one
+  shared resolution while keeping each member's dependencies project-local;
+- recursive [`[sources]`](@ref recursive-sources), so private or unregistered
+  packages can describe where their own unregistered dependencies come from;
+- package-author conveniences such as [compat entries created by `add`](@ref
+  compat-on-add), weak dependencies, and extensions;
+- a rich [`status`](@ref inspecting-status) view for finding outdated,
+  constrained, deprecated, changed, and extension-providing packages; and
+- transactional environment changes with `undo` and `redo`, plus isolated
+  installation of command-line programs through [Apps](@ref).
+
 ## Relation to Pkg.jl
 
 VibePkg deliberately behaves like Pkg: the same commands, the same
@@ -57,11 +72,13 @@ a few sharpened behaviors.
 - [Managing Packages](@ref Managing-Packages) — adding, updating, pinning,
   developing, and removing packages in depth.
 - [Working with Environments](@ref Working-with-Environments) — project-local
-  environments, shared environments, temporary environments, and workspaces.
+  environments, shared environments, and temporary environments.
+- [Workspaces](@ref) — one shared resolution for monorepos, sibling packages,
+  tests, documentation, and other projects developed together.
 - [Compatibility](@ref) — declaring which versions of your dependencies your
   project works with.
-- [Registries](@ref) and [Artifacts](@ref) — where packages come from and how
-  binary data is handled.
+- [Registries](registries.md) and [Artifacts](artifacts.md) — where packages
+  come from and how binary data is handled.
 - [Apps](@ref) — installing packages as command-line executables.
 - [Glossary](@ref), [Project and Manifest files](@ref Project-and-Manifest),
   [REPL mode reference](@ref REPL-mode), and the [API Reference](@ref) — the

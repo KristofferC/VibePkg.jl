@@ -95,6 +95,17 @@ If the manifest was written by a different Julia version, a warning is printed
 and `activate -` toggles between the current and the previously active
 environment, like `cd -` in a shell.
 
+If a dependency is developed at a local path, its package name is also an
+activation shortcut:
+
+```
+(MyProject) vpkg> activate MyDevelopedDependency
+```
+
+This activates the dependency's project rather than a same-named path in the
+current directory. The API spelling for the previous-environment shortcut is
+`VibePkg.activate(; prev = true)`.
+
 ## Temporary environments
 
 For quickly trying a package out without touching any real environment:
@@ -130,31 +141,17 @@ project. Note that any environment can also be put on Julia's *load path* to
 make its packages loadable alongside the active project — see the Julia manual
 on code loading.
 
-## Workspaces
+## Workspace overview
 
-A *workspace* is a set of projects that resolve together and share one
-manifest. The root project declares its members:
+A workspace combines several projects into one development environment with a
+shared root manifest. It is useful for monorepos whose packages are developed
+together, and for keeping a package's tests, documentation, or benchmarks on
+the same dependency resolution. Each member retains its own `Project.toml` and
+declares its own dependencies.
 
-```toml
-[workspace]
-projects = ["test", "docs", "MySubPackage"]
-```
-
-Each member keeps its own `Project.toml` with its own dependencies, but there
-is a single `Manifest.toml`, next to the root project, holding the resolved
-union of everyone's dependencies with compatibility respected across all
-members. This guarantees that, for example, a package and its test or docs
-environment agree on shared dependency versions — and it is the natural setup
-for monorepos with several packages developed in lockstep.
-
-Operating from a member behaves as you would expect: changes to that member's
-dependencies edit *its* project file, but the shared root manifest is what gets
-re-resolved. Several commands accept a `--workspace` flag to widen their scope
-from the active project to all members: `status`, `update`, `instantiate`,
-`pin`, `free`, and `why`.
-
-Workspaces can be nested: a member can itself declare a workspace, and the
-outermost root's manifest is shared by all of them.
+The dedicated [Workspaces](@ref) chapter explains when to use a workspace,
+when separate environments are a better fit, how to lay out a monorepo, how
+sibling packages are path-tracked, and what `--workspace` changes.
 
 ## Environment precompilation
 
@@ -180,6 +177,31 @@ Automatic precompilation is skipped for `develop` and `resolve` (developed
 code tends to be edited immediately anyway). It can be turned off entirely with
 the environment variable `JULIA_PKG_PRECOMPILE_AUTO=0`, in which case packages
 precompile on first load instead.
+
+To batch several operations without precompiling after each one, use the
+do-block form. Automatic precompilation is suspended inside the block and one
+explicit precompile happens at the end:
+
+```julia
+VibePkg.precompile() do
+    VibePkg.add("Example")
+    VibePkg.develop("JSON")
+    VibePkg.up("HTTP")
+end
+```
+
+The progress display distinguishes packages being compiled, successful
+packages, packages which decline precompilation with `__precompile__(false)`,
+and failures. A package that failed during automatic precompilation is skipped
+on later automatic runs until its inputs change; an explicit `precompile`
+retries it. Pass package names to the API (`VibePkg.precompile(["Example"])`)
+to limit an explicit run to those packages and their dependency closure, or
+use `strict = true` to make any failure throw.
+
+On Julia versions whose precompiler supports background detaching, interactive
+progress can be detached with `d`; compilation continues while the REPL
+returns. Press `?` while the progress display is active to see the controls
+provided by that Julia version.
 
 If a new version of a package is installed while an older one is loaded in the
 session, the new version is still precompiled correctly against the loaded

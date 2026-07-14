@@ -44,13 +44,16 @@ grammar for each word:
 | `Example=7876af07-...`      | name and UUID (disambiguates duplicate names)    |
 | `7876af07-...`              | a bare UUID                                      |
 | `Example#master`            | a registered package, tracked by git revision    |
-| `https://github.com/...`    | a git URL, optionally with `#revision`           |
-| `./LocalPkg`, `~/dev/Pkg`   | a local path (anything containing a slash)       |
+| `https://github.com/...`    | a git URL, optionally with `#revision` or `:subdir` |
+| `./LocalPkg`, `~/dev/Pkg`   | a local path (anything containing a slash), optionally with `:subdir` |
 
 URLs and paths are only valid for `add` and `develop`; the other commands refer
 to packages that are already part of the environment. Revisions (`#rev`) are
 valid for `add` but not for `develop` — a developed package always tracks
 whatever is checked out at its path.
+
+GitHub `/tree/<rev>`, `/commit/<rev>`, and `/pull/<number>` URLs are recognized
+directly and converted to the corresponding repository revision.
 
 Words may be quoted with `'` or `"` when a path contains spaces.
 
@@ -59,7 +62,8 @@ Words may be quoted with `'` or `"` when a path contains spaces.
 ### `add`
 
 ```
-add [--preserve=<opt>] pkg[=uuid] [@version] [#rev] | url | path ...
+add [--preserve=<opt>] [-w|--weak] [-e|--extra]
+    pkg[=uuid] [@version] [#rev] | url [#rev] [:subdir] | path ...
 ```
 
 Add packages to the project. Registered names may carry a version (`@0.5`), a
@@ -68,6 +72,8 @@ as git sources. `--preserve` picks the resolve tier for the packages already in
 the environment: `installed`, `all`, `direct`, `semver`, `none`,
 `tiered_installed`, or `tiered` (the default). See
 [Preserve tiers](@ref preserve-tiers) for what they mean.
+`--weak` and `--extra` record registered packages in the project's
+`[weakdeps]` or `[extras]` table without resolving or installing them.
 
 **Examples**
 
@@ -77,6 +83,8 @@ vpkg> add Example@0.5
 vpkg> add Example#master
 vpkg> add Example=7876af07-990d-54b4-ab0e-23690620f79a
 vpkg> add https://github.com/JuliaLang/Example.jl#master
+vpkg> add https://github.com/timholy/SnoopCompile.jl:SnoopCompileCore
+vpkg> add --weak ChainRulesCore
 vpkg> add Example JSON StaticArrays
 ```
 
@@ -166,7 +174,7 @@ tracking the registry. `--all` frees everything freeable.
 
 ```
 status [-p|--project] [-m|--manifest] [-d|--diff] [-o|--outdated]
-       [--deprecated] [-c|--compat] [-e|--extensions] [--workspace]
+       [--deprecated] [-c|--compat] [-e|--extensions] [--workspace] [pkg ...]
 ```
 
 Show the environment. Project mode (default) lists the direct dependencies;
@@ -177,7 +185,8 @@ holding each one back. `--diff` shows the change relative to the last git
 committed version of the environment files, `--compat` shows the declared
 compat entries, `--extensions` the state of package extensions, `--deprecated`
 flags packages marked deprecated in the registry, and `--workspace` includes
-every workspace member's dependencies.
+every workspace member's dependencies. Package names filter the listing to
+matching entries; manifest-mode matches include their dependencies.
 
 ### `undo` / `redo`
 
@@ -217,13 +226,15 @@ place as far as possible.
 ### `precompile`
 
 ```
-precompile
+precompile [--strict] [--timing] [--workspace] [pkg ...]
 ```
 
-Precompile all packages in the environment. Note that packages are
-auto-precompiled after operations that change the environment, so running this
-by hand is rarely needed (see [Configuration](@ref config-envvars) for how to
-turn auto-precompilation off).
+Precompile all packages in the environment, or only the named packages and
+their dependency closure. `--strict` makes every compile failure an error,
+`--timing` reports per-package compile time, and `--workspace` includes all
+workspace members. Packages are auto-precompiled after operations that change
+the environment, so running this by hand is rarely needed (see
+[Configuration](@ref config-envvars) for how to turn auto-precompilation off).
 
 ### `test`
 
@@ -263,6 +274,7 @@ lists what is kept and what is deleted.
 activate [path]
 activate --shared name
 activate --temp
+activate -
 ```
 
 Set the environment commands operate on. With no argument, the default (`@v#.#`)
@@ -270,6 +282,8 @@ environment; with a path, the project at that path (created on first mutation
 if it doesn't exist). `--shared name` activates the named environment in the
 depot's `environments` folder, creating it if needed. `--temp` creates and
 activates a temporary environment that is deleted when the Julia process exits.
+`activate -` toggles between the current and previously active environments.
+If a name identifies a path-developed dependency, its project is activated.
 
 **Examples**
 
@@ -278,6 +292,7 @@ vpkg> activate .
 vpkg> activate MyProject
 vpkg> activate --shared plotting
 vpkg> activate --temp
+vpkg> activate -
 vpkg> activate
 ```
 
@@ -314,14 +329,13 @@ vpkg> compat --current
 ### `why`
 
 ```
-why [--workspace] pkg
+why [--workspace] pkg ...
 ```
 
-Show the dependency paths that lead from the project to the given package as
+Show the dependency paths that lead from the project to the given packages as
 a tree — the answer to "why is this in my manifest?". Branches terminating in
-the queried package are marked with a colored `▶`; a package whose sub-tree
-has already been printed is shown as `Name (*)` instead of being expanded
-again.
+a queried package are marked with a colored `▶`; a package whose sub-tree has
+already been printed is shown as `Name (*)` instead of being expanded again.
 
 ### `registry`
 
@@ -341,8 +355,10 @@ and `status` lists them. See [Registries](@ref).
 app add pkg
 app develop path
 app rm name
+app update [name]
 app status
 ```
 
 Manage applications: Julia packages installed so that their command-line
-entry points become executables on your `PATH`. See [Apps](@ref).
+entry points become executables on your `PATH`. `app update` refreshes every
+installed app, or only the named package/app. See [Apps](@ref).
