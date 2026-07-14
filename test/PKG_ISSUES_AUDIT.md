@@ -28,21 +28,26 @@ Test column: file + testset that pins the behavior, or `—`.
 
 ## Progress & regression tests
 
-- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **123 → 83 FIXED, 34 PERSISTS, 6 N/A**. The other 303 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
+- **Pages covered:** 1–18 = **all 426 open issues**. In-scope bugs: **124 → 83 FIXED, 35 PERSISTS, 6 N/A**. The other 302 issues are non-bugs (feature requests, RFCs, questions, pure-docs) → SKIP.
 - **Every FIXED issue has a regression test.** Page-1 #4686 & #4691 → `test/ops.jl`; the other **81 FIXED** → **`test/pkg_issues.jl`** (one self-contained `@testset "Pkg.jl#NNNN …"` each — 81 testsets, all green, auto-discovered by `runtests.jl`).
-- **The 34 PERSISTS** are real gaps (mostly faithful ports of still-open Pkg bugs), listed in the per-page tables below and summarized in the [pkg-issue-audit] memory. No passing test (they'd be `@test_broken`); the notable page-1 one is #4705.
-- Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
+- **Every PERSISTS bug has a `@test_broken` test** in **`test/pkg_issues_broken.jl`** (35 testsets, each asserting the *correct* behavior so it records **Broken** today and flips to an *Unexpected Pass* the moment the bug is fixed — at which point it moves into `test/pkg_issues.jl` as a passing `@test`). Verified 35/35 Broken standalone and after the full passing suite.
+- Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its `@test`, one agent/PERSISTS to write+verify its `@test_broken`.
 
-### The 34 PERSISTS (VibePkg gaps to consider fixing)
+### The 35 PERSISTS (VibePkg gaps to fix — each covered by a `@test_broken`)
 
-#4705, #3269, #3644, #4082, #4103, #4131, #4351, #4553, #4579, #4580 (pages 1–6);
-#3901, #3853, #3795, #4068, #4351, #2303, #4006, #2525, #708, #3150, #2922, #2894 (pages 7–14);
-#1236, #1657, #1829, #2007, #2023, #2028, #2211 (pages 15–17). Themes: resolver/`up`
-edge cases (build-metadata deps, targeted-`up` no-ops, stale explicit-requirement
-messages), `JULIA_PKG_OFFLINE` not honored on registry-update/instantiate, `Pkg.test`
-subprocess interrupt/flags, artifact file-mode & missing-`arch`, symlinked-depot dev
-paths, and `semver_spec("0.0.0")`/SubString-arg quirks. See per-page tables for evidence.
-- Method: `Workflow` fan-out — one agent/page to triage, one agent/bug to reproduce in its own `jld --test` daemon, one agent/FIXED to write+verify its testset.
+Pages 1–6: #4705, #4580, #4579, #4553, #4351, #4131, #4103, #4082, #3644, #3269.
+Pages 7–8: #4068, #4006, #3901, #3853, #3795, #2303.
+Pages 9–11: #3555, #3496, #3494, #3420, #3365, #3326, #1568.
+Pages 12–14: #3150, #2922, #2894, #2525, #708.
+Pages 15–17: #2211, #2028, #2023, #2007, #1829, #1657, #1236.
+
+Themes: resolver/`up` edge cases (build-metadata JLL deps, targeted-`up` no-ops, stale
+explicit-requirement / dropped-build-number messages, name↔UUID mismatch), `JULIA_PKG_OFFLINE`
+not honored on registry-update/instantiate, redundant registry updates on instantiate/`up`,
+`Pkg.test` subprocess interrupt-orphaning & hardcoded `--warn-overwrite`, artifact file-mode &
+missing-`arch` TypeError, `dev`/`add` not running `deps/build.jl`, symlinked project/depot dev
+paths, git submodules & non-standard SSH ports, and `semver_spec("0.0.0")` / `Registry.rm(SubString)`
+/ build-metadata version quirks. See per-page tables for per-issue evidence.
 
 ---
 
