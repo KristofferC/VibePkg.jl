@@ -8,8 +8,8 @@ if Base.get_bool_env("JULIA_PKG_DISALLOW_PKG_PRECOMPILATION", false) == true
     error("Precompiling VibePkg extension REPLExt is disallowed. JULIA_PKG_DISALLOW_PKG_PRECOMPILATION=$(ENV["JULIA_PKG_DISALLOW_PKG_PRECOMPILATION"])")
 end
 
-using REPL
-using REPL.LineEdit
+using REPL: REPL
+using REPL.LineEdit: LineEdit
 
 import VibePkg
 using VibePkg.REPLMode: REPLMode, do_cmd

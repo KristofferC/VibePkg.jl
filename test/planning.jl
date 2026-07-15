@@ -331,6 +331,38 @@ end
     end
 end
 
+# rm must retain [sources] entries of surviving weak dependencies, like the
+# compat entries above (the sources filter used to check only deps/extras)
+@testset "rm keeps [sources] of weakdeps" begin
+    mktempdir() do dir
+        write(
+            joinpath(dir, "Project.toml"), """
+            [deps]
+            Example = "$EXAMPLE_UUID"
+
+            [weakdeps]
+            SHA = "$SHA_UUID"
+            """
+        )
+        depot = mkpath(joinpath(dir, "depot"))
+        env = load_environment(dir; depots = depot_stack([depot]))
+        # the reader limits [sources] to deps/extras, so a weak dep's entry
+        # only arises in memory; attach one before planning the rm
+        project = VibePkg.EnvFiles.with_project(
+            env.project;
+            sources = Dict(
+                "SHA" => VibePkg.EnvFiles.SourceSpec(
+                    nothing, "https://example.com/SHA.jl.git", "main", nothing
+                ),
+            ),
+        )
+        env = Environment(env.project_file, env.manifest_file, project, env.manifest, env.workspace)
+        env2 = plan_rm(env, [PackageRequest("Example")])
+        @test !haskey(env2.project.deps, "Example")
+        @test haskey(env2.project.sources, "SHA")
+    end
+end
+
 # Pkg.jl#3814 — a [weakdeps] entry of the project with a [compat] bound
 # constrains the version when something else pulls the package in, and the
 # weakdep alone does not put it in the manifest
@@ -474,4 +506,93 @@ end
         @test entry_tree_hash(entry) === nothing       # old version/tree-hash gone
         @test entry_version(entry) == stdlib_version(dates_uuid, VERSION)
     end
+end
+
+# Pkg.jl#4720: the linear-time rewrites (dependents map + worklist BFS in
+# rm_manifest!/prune_manifest, seen-set in load_manifest_deps) must agree
+# with naive fixpoint/rescanning references on a large synthetic manifest.
+# Pure in-memory: no registry, no downloads, no timing assertions.
+@testset "linear-scan equivalence at scale (Pkg.jl#4720)" begin
+    N = 300
+    uu(i) = UUID(UInt128(i))
+    mkentry(name, uuid, deps) = VibePkg.EnvFiles.ManifestEntry(
+        name, uuid,
+        VibePkg.EnvFiles.RegistryTracked(v"1.0.0", nothing, String[]), false,
+        deps, Dict{String, UUID}(),
+        Dict{String, Union{String, Vector{String}}}(), Dict{String, VibePkg.EnvFiles.AppInfo}(),
+        nothing, nothing, Dict{String, Any}(),
+    )
+    # chain + diamond: Pi -> {P(i+1), P(i+2)}; plus a detached 2-cycle
+    CYCA, CYCB = uu(1001), uu(1002)
+    entries = Dict{UUID, VibePkg.EnvFiles.ManifestEntry}()
+    for i in 1:N
+        deps = Dict{String, UUID}()
+        i + 1 <= N && (deps["P$(i + 1)"] = uu(i + 1))
+        i + 2 <= N && (deps["P$(i + 2)"] = uu(i + 2))
+        entries[uu(i)] = mkentry("P$i", uu(i), deps)
+    end
+    entries[CYCA] = mkentry("CycA", CYCA, Dict("CycB" => CYCB))
+    entries[CYCB] = mkentry("CycB", CYCB, Dict("CycA" => CYCA))
+    manifest = VibePkg.EnvFiles.with_manifest(VibePkg.EnvFiles.Manifest(); deps = entries)
+
+    # naive references (the pre-#4720 shapes)
+    function naive_dependents(m)
+        d = Dict{UUID, Vector{UUID}}()
+        for uuid in keys(m.deps), (u2, e2) in m
+            uuid in values(e2.deps) && push!(get!(() -> UUID[], d, uuid), u2)
+        end
+        return d
+    end
+    function naive_rm_targets(m, seeds)
+        targets = Set{UUID}(seeds)
+        while true
+            grew = false
+            for (uuid, entry) in m
+                uuid in targets && continue
+                if any(in(targets), values(entry.deps))
+                    push!(targets, uuid)
+                    grew = true
+                end
+            end
+            grew || break
+        end
+        return targets
+    end
+
+    # dependents map == naive double loop
+    dependents = VibePkg.EnvFiles.manifest_dependents_map(manifest)
+    naive = naive_dependents(manifest)
+    @test keys(dependents) == keys(naive)
+    @test all(sort(dependents[k]) == sort(naive[k]) for k in keys(naive))
+
+    # rm_manifest! removes exactly the reverse closure: P150 takes P1..P150
+    # with it (every Pi with i <= 149 transitively depends on it)
+    new_deps = Dict{String, UUID}("P1" => uu(1), "P200" => uu(200))
+    pruned = VibePkg.Planning.rm_manifest!(manifest, new_deps, [PackageRequest("P150")])
+    expected_keep = union(Set(uu.(151:N)), Set([CYCA, CYCB]))
+    @test Set(keys(pruned.deps)) == expected_keep
+    @test Set(keys(pruned.deps)) ==
+        setdiff(Set(keys(manifest.deps)), naive_rm_targets(manifest, [uu(150)]))
+    @test new_deps == Dict("P200" => uu(200))   # dropped request pruned from deps
+
+    # removing one member of the detached cycle removes exactly the pair
+    pruned_cyc = VibePkg.Planning.rm_manifest!(manifest, Dict{String, UUID}(), [PackageRequest("CycA")])
+    @test Set(keys(pruned_cyc.deps)) == Set(uu.(1:N))
+
+    # prune_manifest keeps exactly the forward closure of the root
+    kept = VibePkg.Planning.prune_manifest(manifest, Set([uu(1)]))
+    @test Set(keys(kept.deps)) == Set(uu.(1:N))
+    # a keep uuid without a manifest entry is harmless (dropped by the filter)
+    kept_cyc = VibePkg.Planning.prune_manifest(manifest, Set([CYCA, uu(9999)]))
+    @test Set(keys(kept_cyc.deps)) == Set([CYCA, CYCB])
+
+    # load_manifest_deps: complete, deduplicated, prefix-order stable
+    nodes = VibePkg.Planning.load_manifest_deps(manifest)
+    @test length(nodes) == N + 2
+    @test allunique(n.uuid for n in nodes)
+    pre = [VibePkg.Planning.Node(; name = "P5", uuid = uu(5))]
+    nodes_pre = VibePkg.Planning.load_manifest_deps(manifest, pre)
+    @test nodes_pre[1] === pre[1]                  # preloaded node kept first
+    @test length(nodes_pre) == N + 2               # and not duplicated
+    @test allunique(n.uuid for n in nodes_pre)
 end

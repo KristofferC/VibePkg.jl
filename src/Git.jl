@@ -12,6 +12,7 @@ module Git
 using Base: UUID, SHA1
 import LibGit2
 using SHA: sha1
+using FileWatching: mkpidlock
 
 using ..Errors: PkgError, pkgerror
 using ..Utils: stderr_f, can_fancyprint, mv_temp_dir_retries,
@@ -159,7 +160,7 @@ function clone(io::IO, url, source_path; header = nothing, credentials = nothing
     end
 end
 
-function ensure_clone(io::IO, target_path, url; kwargs...)
+function ensure_clone(io::IO, target_path, url; kwargs...)::LibGit2.GitRepo
     if ispath(target_path)
         return LibGit2.GitRepo(target_path)
     else
@@ -222,17 +223,73 @@ function fetch(io::IO, repo::LibGit2.GitRepo, remoteurl = nothing; header = noth
 end
 
 function checkout_tree_to_path(repo::LibGit2.GitRepo, tree::LibGit2.GitObject, path::String)
-    return GC.@preserve path begin
-        opts = LibGit2.CheckoutOptions(
-            checkout_strategy = LibGit2.Consts.CHECKOUT_FORCE,
-            # Package trees must contain the canonical blob bytes.  In
-            # particular, a user's Windows core.autocrlf setting must not
-            # rewrite LF to CRLF and change the computed git-tree-sha1.
-            disable_filters = Cint(1),
-            target_directory = Base.unsafe_convert(Cstring, path)
-        )
-        LibGit2.checkout_tree(repo, tree, options = opts)
+    try
+        GC.@preserve path begin
+            opts = LibGit2.CheckoutOptions(
+                checkout_strategy = LibGit2.Consts.CHECKOUT_FORCE,
+                # Package trees must contain the canonical blob bytes.  In
+                # particular, a user's Windows core.autocrlf setting must not
+                # rewrite LF to CRLF and change the computed git-tree-sha1.
+                disable_filters = Cint(1),
+                target_directory = Base.unsafe_convert(Cstring, path)
+            )
+            LibGit2.checkout_tree(repo, tree, options = opts)
+        end
+    catch err
+        # a tree carrying a gitlink cannot be checked out of a bare clone by
+        # libgit2 ("cannot get submodules without a working tree", Pkg.jl#708
+        # — where the whole add fails); extract such trees by hand instead
+        err isa LibGit2.GitError && err.class == LibGit2.Error.Submodule || rethrow()
+        LibGit2.with(LibGit2.peel(LibGit2.GitTree, tree)) do t
+            extract_tree_to_path(repo, t, path)
+        end
     end
+    return
+end
+
+# Tree-entry on-disk modes needed during manual extraction (TreeHash.GitMode
+# has no gitlink member: hashed worktrees never contain one).
+const MODE_SUBMODULE = Cint(0o160000)   # gitlink
+const MODE_SYMLINK = Cint(0o120000)
+const MODE_EXECUTABLE = Cint(0o100755)
+
+# The by-hand fallback for checkout_tree_to_path: blobs are written raw (the
+# same fidelity the disabled filters give above) and a gitlink becomes an
+# empty directory — exactly what `git checkout` leaves for an uninitialized
+# submodule; the recorded git-tree-sha1 covers only the gitlink entry, never
+# the submodule's content.
+function extract_tree_to_path(repo::LibGit2.GitRepo, tree::LibGit2.GitTree, path::String)
+    mkpath(path)
+    for i in 1:LibGit2.count(tree)
+        entry = tree[i]
+        name = LibGit2.filename(entry)::String
+        mode = LibGit2.filemode(entry)
+        dest = joinpath(path, name)
+        if mode == MODE_SUBMODULE
+            mkpath(dest)
+        elseif LibGit2.entrytype(entry) === LibGit2.GitTree
+            LibGit2.with(LibGit2.GitTree(repo, LibGit2.entryid(entry))) do subtree
+                extract_tree_to_path(repo, subtree, dest)
+            end
+        else
+            LibGit2.with(LibGit2.GitBlob(repo, LibGit2.entryid(entry))) do blob
+                data = LibGit2.rawcontent(blob)
+                if mode == MODE_SYMLINK
+                    # the failed libgit2 checkout may have left a partial entry
+                    Base.rm(dest; force = true, recursive = true)
+                    @static if Sys.iswindows()
+                        write(dest, data)   # libgit2 parity without symlink support
+                    else
+                        symlink(String(data), dest)
+                    end
+                else
+                    write(dest, data)
+                    mode == MODE_EXECUTABLE && chmod(dest, 0o755)
+                end
+            end
+        end
+    end
+    return
 end
 
 # Stable clone-cache path for a URL (Pkg uses Base.hash(url), which is not
@@ -331,46 +388,63 @@ function install_tree_from_git!(
                 "Please check that the package name is correct and that your registries are up to date."
         )
     end
-    repo = nothing
-    tree = nothing
-    return try
-        cdir = mkpath(clones_dir(depots1(depots)))
-        create_cachedir_tag(cdir)
-        repo_path = joinpath(cdir, string(uuid))
-        first_url = first(urls)
-        repo = ensure_clone(
-            io, repo_path, first_url; isbare = true,
-            header = "[$uuid] $name from $first_url", depth = 1
-        )
-        git_hash = LibGit2.GitHash(hash.bytes)
-        for url in urls
-            try
-                LibGit2.with(LibGit2.GitObject, repo, git_hash) do g
+    cdir = mkpath(clones_dir(depots1(depots)))
+    create_cachedir_tag(cdir)
+    repo_path = joinpath(cdir, string(uuid))
+    # the uuid-keyed bare clone is shared by every version install in the
+    # depot: a per-cache pidlock serializes clone/fetch/lookup so concurrent
+    # processes (installing e.g. different versions of this package) never
+    # race a clone-in-progress
+    return mkpidlock(repo_path * ".pid", stale_age = 10) do
+        repo = nothing
+        tree = nothing
+        try
+            first_url = first(urls)
+            repo = ensure_clone(
+                io, repo_path, first_url; isbare = true,
+                header = "[$uuid] $name from $first_url", depth = 1
+            )
+            git_hash = LibGit2.GitHash(hash.bytes)
+            for url in urls
+                try
+                    LibGit2.with(LibGit2.GitObject, repo, git_hash) do g
+                    end
+                    break # object was found, we can stop
+                catch err
+                    err isa LibGit2.GitError && err.code == LibGit2.Error.ENOTFOUND || rethrow()
                 end
-                break # object was found, we can stop
+                # the registry records only a tree hash, so there is nothing to
+                # target: deepen and take every ref (a release commit may only be
+                # reachable from a tag)
+                fetch(io, repo, url; refspecs = refspecs_fallback, depth = LibGit2.Consts.FETCH_DEPTH_UNSHALLOW)
+            end
+            tree = try
+                LibGit2.GitObject(repo, git_hash)
             catch err
                 err isa LibGit2.GitError && err.code == LibGit2.Error.ENOTFOUND || rethrow()
+                error("$name: git object $(string(hash)) could not be found")
             end
-            # the registry records only a tree hash, so there is nothing to
-            # target: deepen and take every ref (a release commit may only be
-            # reachable from a tag)
-            fetch(io, repo, url; refspecs = refspecs_fallback, depth = LibGit2.Consts.FETCH_DEPTH_UNSHALLOW)
+            tree isa LibGit2.GitTree ||
+                error("$name: git object $(string(hash)) should be a tree, not $(typeof(tree))")
+            # stage the checkout in the depot's temp area (same filesystem) and
+            # move it into place atomically: checking out into `version_path`
+            # directly would leave an interrupted checkout to be accepted as a
+            # completed install by every later `isdir` check
+            create_cachedir_tag(dirname(dirname(version_path)))
+            staged = tempname(mkpath(joinpath(dirname(dirname(version_path)), "temp")))
+            try
+                mkpath(staged)
+                checkout_tree_to_path(repo, tree, staged)
+                mkpath(dirname(version_path))
+                mv_temp_dir_retries(staged, version_path; set_permissions = false)
+            finally
+                Base.rm(staged; force = true, recursive = true)
+            end
+            nothing
+        finally
+            repo !== nothing && close(repo)
+            tree !== nothing && close(tree)
         end
-        tree = try
-            LibGit2.GitObject(repo, git_hash)
-        catch err
-            err isa LibGit2.GitError && err.code == LibGit2.Error.ENOTFOUND || rethrow()
-            error("$name: git object $(string(hash)) could not be found")
-        end
-        tree isa LibGit2.GitTree ||
-            error("$name: git object $(string(hash)) should be a tree, not $(typeof(tree))")
-        mkpath(version_path)
-        create_cachedir_tag(dirname(dirname(version_path)))
-        checkout_tree_to_path(repo, tree, version_path)
-        nothing
-    finally
-        repo !== nothing && close(repo)
-        tree !== nothing && close(tree)
     end
 end
 
@@ -437,13 +511,23 @@ store, and read the package's Project.toml for its identity.
     cache = repo_cache_path(depots, url)
     mkpath(dirname(cache))
     create_cachedir_tag(dirname(cache))
-    repo = ensure_clone(io, cache, url; isbare = true, depth = 1)
+    # the url-keyed bare clone cache is shared across environments: a
+    # per-cache pidlock serializes clone/fetch/rev-lookup (and the empty-HEAD
+    # cache removal below) against concurrent processes adding the same url
+    cache_lock = mkpidlock(cache * ".pid", stale_age = 10)
+    local repo
+    try
+        repo = ensure_clone(io, cache, url; isbare = true, depth = 1)
+    catch
+        close(cache_lock)
+        rethrow()
+    end
     obj = nothing
     return try
         actual_rev = rev
         if rev === nothing
             head = try
-                LibGit2.head(repo)
+                LibGit2.head(repo)::LibGit2.GitReference
             catch err
                 err isa LibGit2.GitError || rethrow()
                 # a repository without commits clones fine but has no HEAD;
@@ -488,16 +572,18 @@ store, and read the package's Project.toml for its identity.
         # store.  Use the Git object's canonical id: re-hashing a Windows
         # checkout can lose Unix mode information and produce an id that does
         # not exist in the repository (and therefore cannot be re-fetched).
-        # snapshot the resolved object/rev into single-assignment locals so the
+        # snapshot the resolved handles into single-assignment locals so the
         # closure below captures them without boxing (`obj`/`actual_rev` are
-        # reassigned across the resolution branches above)
+        # reassigned across the resolution branches above; `repo` is assigned
+        # inside the enclosing `try`, which likewise defeats the analysis)
         checkout_obj = obj
         checkout_rev = actual_rev
+        checkout_repo = repo
         mktempdir() do temp
             tree = LibGit2.peel(LibGit2.GitTree, checkout_obj)
             package_tree = nothing
             try
-                checkout_tree_to_path(repo, tree, temp)
+                checkout_tree_to_path(checkout_repo, tree, temp)
                 pkg_root = subdir === nothing ? temp : joinpath(temp, subdir)
                 isdir(pkg_root) || pkgerror("path `$subdir` does not exist in the repository at `$url`")
                 git_subdir = subdir === nothing ? "." : replace(normpath(subdir), '\\' => '/')
@@ -530,6 +616,7 @@ store, and read the package's Project.toml for its identity.
     finally
         obj !== nothing && close(obj)
         close(repo)
+        close(cache_lock)
     end
 end
 

@@ -28,27 +28,34 @@ export gc
 gc_stamp(depot::String) = joinpath(mkpath(logdir(depot)), "gc.stamp")
 
 # Read a usage log, keep only entries whose key file still exists, rewrite
-# it compacted, and return the live keys.
+# it compacted, and return the live keys. Returns `nothing` when the log is
+# not parseable at all: the set of live roots it tracks is then unknown, so
+# the caller must fail closed and skip the sweeps that depend on it rather
+# than treat damaged bookkeeping as "nothing is live" (the next `log_usage`
+# write self-heals the file).
 function condense_usage!(usage_file::String)
     isfile(usage_file) || return String[]
     usage = try
         TOML.parsefile(usage_file)
     catch err
-        @warn "Failed to parse usage file `$usage_file`, ignoring." err
-        return String[]
+        @warn "Failed to parse usage file `$usage_file`; the content it tracks will not be collected." err
+        return nothing
     end
     # entries may have any shape (foreign writers, torn writes): salvage what
     # matches the schema, treat the rest as freshly used so nothing is swept
-    filter!(p -> isfile(p.first) && p.second isa Vector && !isempty(p.second), usage)
+    filter!(p -> isfile(p.first), usage)
     for (k, entries) in usage
         times = Dates.DateTime[]
         parents = String[]
-        for e in entries
+        for e in (entries isa Vector ? entries : Any[])
             e isa AbstractDict || continue
             t = get(e, "time", nothing)
             t isa Union{Dates.Date, Dates.DateTime} && push!(times, Dates.DateTime(t))
-            for p in get(e, "parent_projects", String[])
-                p isa String && push!(parents, p)
+            pp = get(e, "parent_projects", nothing)
+            if pp isa Vector
+                for p in pp
+                    p isa String && push!(parents, p)
+                end
             end
         end
         keep = Dict{String, Any}("time" => isempty(times) ? Dates.now() : maximum(times))
@@ -78,7 +85,8 @@ function artifact_hashes(artifacts_toml::String)
     hashes = String[]
     raw = try
         TOML.parsefile(artifacts_toml)
-    catch
+    catch err
+        @warn "Reading artifacts file at $artifacts_toml failed with error" err
         return hashes
     end
     artifact_walk!(hashes, raw)
@@ -135,29 +143,49 @@ function gc(
     gc_depots = force ? depots(d) : [depots1(d)]
 
     # ——— mark ————————————————————————————————————————————————————————————
+    # An unparseable usage log leaves the live set it tracks unknown; fail
+    # closed by skipping the sweeps that depend on it instead of collecting
+    # everything they cover.
     live_manifests = String[]
     live_artifact_tomls = String[]
     scratch_usage = Dict{String, Vector{String}}()   # space path => parent projects
+    forced_scratch = Set{String}()  # spaces with malformed entries: liveness unknown, keep
+    sweep_packages = true           # packages/ and clones/ (marked from manifests)
+    sweep_artifacts = true
+    sweep_scratch = true
     for depot in gc_depots
         ldir = logdir(depot)
-        append!(live_manifests, condense_usage!(joinpath(ldir, "manifest_usage.toml")))
-        append!(live_artifact_tomls, condense_usage!(joinpath(ldir, "artifact_usage.toml")))
+        live = condense_usage!(joinpath(ldir, "manifest_usage.toml"))
+        live === nothing ? (sweep_packages = false) : append!(live_manifests, live)
+        live = condense_usage!(joinpath(ldir, "artifact_usage.toml"))
+        live === nothing ? (sweep_artifacts = false) : append!(live_artifact_tomls, live)
         scratch_file = joinpath(ldir, "scratch_usage.toml")
         if isfile(scratch_file)
             raw = try
                 TOML.parsefile(scratch_file)
-            catch
+            catch err
+                @warn "Failed to parse usage file `$scratch_file`; the content it tracks will not be collected." err
+                sweep_scratch = false
                 Dict{String, Any}()
             end
             for (space, entries) in raw
-                entries isa Vector || continue
                 parents = String[]
-                for e in entries
-                    e isa AbstractDict || continue
-                    for p in get(e, "parent_projects", String[])
-                        p isa String && push!(parents, p)
+                malformed = !(entries isa Vector)
+                for e in (entries isa Vector ? entries : Any[])
+                    if e isa AbstractDict
+                        pp = get(e, "parent_projects", String[])
+                        if pp isa Vector
+                            for p in pp
+                                p isa String ? push!(parents, p) : (malformed = true)
+                            end
+                        else
+                            malformed = true
+                        end
+                    else
+                        malformed = true
                     end
                 end
+                malformed && push!(forced_scratch, space)
                 scratch_usage[space] = parents
             end
         end
@@ -201,6 +229,7 @@ function gc(
     keep_scratch = Set{String}(
         space for (space, parents) in scratch_usage if any(isfile, parents)
     )
+    union!(keep_scratch, forced_scratch)
 
     printpkgstyle(io, :Active, "manifest files: $(length(live_manifests)) found")
     if verbose
@@ -217,7 +246,7 @@ function gc(
     for depot in gc_depots
         # packages/<Name>/<slug>
         pdir = packages_dir(depot)
-        if isdir(pdir)
+        if sweep_packages && isdir(pdir)
             for name in readdir(pdir)
                 name == "CACHEDIR.TAG" && continue
                 name_dir = joinpath(pdir, name)
@@ -228,14 +257,18 @@ function gc(
                 isdir(name_dir) && isempty(readdir(name_dir)) && Base.rm(name_dir)
             end
         end
-        del, fr = sweep!(clones_dir(depot), keep_clones; verbose, io, label = "repo")
-        repos_deleted += del
-        freed += fr
-        del, fr = sweep!(artifacts_dir(depot), keep_artifacts; verbose, io, label = "artifact")
-        artifacts_deleted += del
-        freed += fr
+        if sweep_packages
+            del, fr = sweep!(clones_dir(depot), keep_clones; verbose, io, label = "repo")
+            repos_deleted += del
+            freed += fr
+        end
+        if sweep_artifacts
+            del, fr = sweep!(artifacts_dir(depot), keep_artifacts; verbose, io, label = "artifact")
+            artifacts_deleted += del
+            freed += fr
+        end
         sdir = scratchspaces_dir(depot)
-        if isdir(sdir)
+        if sweep_scratch && isdir(sdir)
             for uuid_dir in readdir(sdir; join = true)
                 basename(uuid_dir) == "CACHEDIR.TAG" && continue
                 isdir(uuid_dir) || continue

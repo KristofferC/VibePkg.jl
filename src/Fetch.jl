@@ -48,6 +48,19 @@ function server_host(server::String)
     return m === nothing ? server : String(m[1]::SubString{String})
 end
 
+"""
+    url_is_pkg_server(url, server) -> Bool
+
+Whether `url` addresses the package server `server` and so may carry its
+Authorization header. The prefix must end at a path boundary: a raw
+`startswith` would also match sibling hosts (`https://pkg.server.evil.tld/…`
+for server `https://pkg.server`), sending the bearer token to a host the
+package — not the user — chose. `server` comes slash-stripped from
+`pkg_server()`.
+"""
+url_is_pkg_server(url::String, server::String) =
+    url == server || startswith(url, server * "/")
+
 # The per-server directory name: characters that are invalid in filenames on
 # some platform (':' on Windows, notably from `host:port`) map to '_', e.g.
 # "localhost:8888" → "localhost_8888".
@@ -251,7 +264,7 @@ function download(
         show_progress::Bool = true,
     )
     server = pkg_server()
-    is_server_url = server !== nothing && startswith(url, server)
+    is_server_url = server !== nothing && url_is_pkg_server(url, server)
     headers = is_server_url ? pkg_server_headers(server::String; depots) : Pair{String, String}[]
     resp = _download(url, dest, headers; io, progress_header, show_progress)
     if is_server_url && resp.status == 401
@@ -335,7 +348,10 @@ function unpack(tarball::String, dest::String)
     end
 end
 
-# Simplified tarball reader without path tracking overhead
+# Simplified tarball reader without path tracking overhead. Entries the
+# predicate rejects have their data drained so the stream stays aligned on
+# the next header; the callback must itself consume every accepted entry's
+# data (e.g. via `Tar.read_data`).
 function read_tarball_simple(
         callback::Function,
         predicate::Function,
@@ -346,7 +362,10 @@ function read_tarball_simple(
     while !eof(tar)
         hdr = Tar.read_header(tar, globals = globals, buf = buf)
         hdr === nothing && break
-        predicate(hdr)::Bool || continue
+        if !(predicate(hdr)::Bool)
+            Tar.skip_data(tar, hdr.size)
+            continue
+        end
         Tar.check_header(hdr)
         before = applicable(position, tar) ? position(tar) : 0
         callback(hdr)
@@ -396,69 +415,90 @@ function install_archive(
 
     tmp_objects = String[]
     url_success = false
-    for (url, top) in urls
-        path = tempname() * randstring(6)
-        push!(tmp_objects, path)
-        url_success = true
-        try
-            download(url, path; io, depots, progress_header = name === nothing ? "Downloading" : "Downloading $(name)")
-        catch e
-            e isa InterruptException && rethrow()
-            url_success = false
-        end
-        url_success || continue
-        dir = tempname(depot_temp) * randstring(6)
-        push!(tmp_objects, dir)
-        try
-            unpack(path, dir)
-        catch e
-            e isa ProcessFailedException || rethrow()
-            @warn "failed to extract archive downloaded from $(url)"
-            url_success = false
-        end
-        url_success || continue
-        if top
-            unpacked = dir
-        else
-            dirs = readdir(dir)
-            # 7z on Windows might create this spurious file
-            filter!(x -> x != "pax_global_header", dirs)
-            @assert length(dirs) == 1
-            unpacked = joinpath(dir, dirs[1])
-        end
-        computed_hash = TreeHash.tree_hash(unpacked)
-        if SHA1(computed_hash) != hash
-            @warn "Downloaded package content does not match expected hash (git-tree-sha1); skipping this source" package = name url = url expected = hash computed = SHA1(computed_hash)
-            url_success = false
-        end
-        url_success || continue
+    try
+        for (url, top) in urls
+            path = tempname() * randstring(6)
+            push!(tmp_objects, path)
+            url_success = true
+            try
+                download(url, path; io, depots, progress_header = name === nothing ? "Downloading" : "Downloading $(name)")
+            catch e
+                e isa InterruptException && rethrow()
+                url_success = false
+            end
+            url_success || continue
+            dir = tempname(depot_temp) * randstring(6)
+            push!(tmp_objects, dir)
+            # a corrupt or malformed archive disqualifies this source only:
+            # the next url may still deliver good content
+            try
+                unpack(path, dir)
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "failed to extract archive downloaded from $(url)" exception = e
+                url_success = false
+            end
+            url_success || continue
+            if top
+                unpacked = dir
+            else
+                dirs = readdir(dir)
+                # 7z on Windows might create this spurious file
+                filter!(x -> x != "pax_global_header", dirs)
+                if length(dirs) != 1
+                    @warn "archive downloaded from $(url) does not contain a single top-level directory; skipping this source" package = name entries = length(dirs)
+                    url_success = false
+                    continue
+                end
+                unpacked = joinpath(dir, dirs[1])
+            end
+            computed_hash = try
+                SHA1(TreeHash.tree_hash(unpacked))
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "failed to hash content of archive downloaded from $(url); skipping this source" package = name exception = e
+                url_success = false
+                continue
+            end
+            if computed_hash != hash
+                @warn "Downloaded package content does not match expected hash (git-tree-sha1); skipping this source" package = name url = url expected = hash computed = computed_hash
+                url_success = false
+            end
+            url_success || continue
 
-        !isdir(dirname(version_path)) && mkpath(dirname(version_path))
-        mv_temp_dir_retries(unpacked, version_path; set_permissions = false)
-        break
+            !isdir(dirname(version_path)) && mkpath(dirname(version_path))
+            mv_temp_dir_retries(unpacked, version_path; set_permissions = false)
+            break
+        end
+    finally
+        foreach(x -> Base.rm(x; force = true, recursive = true), tmp_objects)
     end
-    foreach(x -> Base.rm(x; force = true, recursive = true), tmp_objects)
     return url_success
 end
 
 """
-    ensure_package_installed!(depots, name, uuid, tree_hash, repo_urls; readonly, io)
+    ensure_package_installed!(depots, name, uuid, tree_hash, repo_urls; archive_urls, readonly, io)
         -> (path, new::Bool)
 
 Idempotent content-addressed install: returns the existing tree if any depot
 has it, otherwise downloads/verifies/installs into the first depot under a
-pidlock. Throws when every source fails.
+pidlock. Throws when every source fails. `repo_urls` feeds the git fallback;
+`archive_urls` (default: the same list) feeds GitHub tarball synthesis —
+callers exclude subdir-package repos there, since a repo-root tarball cannot
+verify against the subdir tree hash while the git fallback finds the subdir
+tree object directly.
 """
 function ensure_package_installed!(
         depots::DepotStack, name::String, uuid::UUID, tree_hash::SHA1,
         repo_urls::Vector{String};
+        archive_urls::Vector{String} = repo_urls,
         readonly::Bool = true, io::IO = stderr_f(),
         server::Union{Nothing, String} = pkg_server(),
     )
     path, installed = find_installed(depots, name, uuid, tree_hash)
     installed && return path, false
 
-    urls = package_archive_urls(uuid, tree_hash, repo_urls; server)
+    urls = package_archive_urls(uuid, tree_hash, archive_urls; server)
     mkpath(dirname(path))
     # `already` distinguishes "another process installed the tree while we
     # blocked on the pidlock" from "we installed it": only the latter is `new`.

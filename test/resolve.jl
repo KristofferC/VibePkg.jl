@@ -28,6 +28,20 @@ using .ResolveUtils
     @test ResolverTimeoutError("slow") isa Exception
 end
 
+# ResolverTimeoutError must share ResolverError's user-facing formatting:
+# print `msg` (stripping baked-in ANSI color when the IO has no color) plus
+# any nested exception — not the default struct dump.
+@testset "resolver error formatting" begin
+    for E in (ResolverError, ResolverTimeoutError)
+        te = E("\e[31mthe resolver failed\e[39m")
+        @test sprint(showerror, te) == "the resolver failed"
+        @test occursin("\e[31m", sprint(showerror, te; context = :color => true))
+        @test !occursin(string(nameof(E)), sprint(showerror, te))
+        te2 = E("outer", ErrorException("inner"))
+        @test sprint(showerror, te2) == "outer\ninner"
+    end
+end
+
 const uA = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 const uB = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 const uC = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
@@ -46,11 +60,56 @@ const uC = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
     end
 end
 
+# The major/minor/patch triple discards prerelease and build metadata, so
+# distinct JLL builds would collapse to the same weight; the rank argument
+# (the version's index in the package's sorted version list, as used by
+# maxsum's Messages) must break those ties in version order.
+@testset "VersionWeight rank distinguishes prerelease/build metadata" begin
+    vs = [v"1.17.9", v"1.18.0-rc1", v"1.18.0", v"1.18.0+0", v"1.18.0+1", v"1.18.0+2", v"1.18.1"]
+    @test issorted(vs)
+    ws = [VersionWeight(v, i) for (i, v) in enumerate(vs)]
+    for i in eachindex(vs), j in eachindex(vs)
+        @test isless(ws[i], ws[j]) == isless(vs[i], vs[j])
+        @test (ws[i] == ws[j]) == (vs[i] == vs[j])
+    end
+end
+
+# secondmax must not overflow when fewer than two states are selected:
+# without the guard it returns typemin - max, which wraps around to a huge
+# positive value and corrupts the decimation order.
+@testset "secondmax with fewer than two selected states" begin
+    FV = Resolve.FieldValue
+    f = FV[FV(1)]
+    @test Resolve.secondmax(f) == typemin(FV)
+    @test Resolve.secondmax(f) < zero(FV)              # i.e. no wrap-around
+    f2 = FV[FV(1), FV(2)]
+    @test Resolve.secondmax(f2, BitVector([false, true])) == typemin(FV)
+    @test Resolve.secondmax(f2, BitVector([false, false])) == typemin(FV)
+    @test Resolve.secondmax(f2) == FV(-1)              # normal two-state case
+end
+
+# Diagnostics must keep prerelease/build metadata: VersionSpec/VersionRange
+# only track major.minor.patch, so distinct JLL builds would render
+# identically through range_compressed_versionspec.
+@testset "compressed_versions_string keeps build metadata" begin
+    cvs = Resolve.compressed_versions_string
+    pool = [v"1.18.0+1", v"1.18.0+2"]
+    @test cvs(copy(pool), [v"1.18.0+1"]) == "1.18.0+1"
+    @test cvs(copy(pool), [v"1.18.0+2"]) == "1.18.0+2"
+    @test cvs([v"1.2.3-rc1", v"1.2.4"], [v"1.2.3-rc1"]) == "1.2.3-rc1"
+    # metadata-free output is unchanged relative to range_compressed_versionspec
+    pool2 = [v"1.0.0", v"1.0.1", v"1.1.0", v"2.0.0"]
+    subset2 = [v"1.0.0", v"1.0.1", v"2.0.0"]
+    @test cvs(copy(pool2), copy(subset2)) ==
+        string(Resolve.range_compressed_versionspec(copy(pool2), copy(subset2)))
+    @test cvs(copy(pool2)) == "1.0.0 - 2.0.0"
+end
+
 # Synthetic graph mirroring the shapes deps_graph feeds the resolver:
 #   A: 1.0.0/1.1.0 depend on B@1;  2.0.0 depends on B@2 and weak-depends on C@1
 #   B: 1.0.0, 2.0.0
 #   C: 1.0.0
-function solve(reqs::Requires; fixed = Dict{UUID, Fixed}(), b_versions = [v"1.0.0", v"2.0.0"])
+function mk_graph(reqs::Requires; fixed = Dict{UUID, Fixed}(), b_versions = [v"1.0.0", v"2.0.0"])
     vr(s) = VersionRange(s)
     deps = Dict{UUID, Vector{Dict{VersionRange, Set{UUID}}}}(
         uA => [Dict(vr("1") => Set([uB]), vr("2") => Set([uB]))],
@@ -81,10 +140,14 @@ function solve(reqs::Requires; fixed = Dict{UUID, Fixed}(), b_versions = [v"1.0.
         u => [Set(vs)] for (u, vs) in versions
     )
     names = Dict{UUID, String}(uA => "A", uB => "B", uC => "C")
-    graph = Resolve.Graph(
+    return Resolve.Graph(
         deps, compat, weak_deps, weak_compat, versions, versions_per_registry,
         names, reqs, fixed, false, VERSION, Dict{UUID, VersionNumber}(),
     )
+end
+
+function solve(reqs::Requires; kwargs...)
+    graph = mk_graph(reqs; kwargs...)
     Resolve.simplify_graph!(graph)
     return Resolve.resolve(graph)
 end
@@ -191,6 +254,37 @@ end
         sol = Resolve.resolve(graph)
         @test sol == Dict(uA => v"1.0.0", uB => v"1.0.0", uC => v"1.0.0", uD => v"1.0.0")
     end
+end
+
+# Versions that differ only in build metadata (as JLLs produce) must flow
+# through the resolver: the highest build wins and resolver diagnostics keep
+# the build suffix so distinct builds stay distinguishable.
+@testset "JLL build metadata in resolution and diagnostics" begin
+    sol = solve(Requires(uB => VersionSpec("1")); b_versions = [v"1.0.0+1", v"1.0.0+2"])
+    @test sol[uB] == v"1.0.0+2"
+
+    err = try
+        solve(Requires(uB => VersionSpec("2")); b_versions = [v"1.0.0+1"])
+    catch e
+        e
+    end
+    @test err isa ResolverError
+    msg = replace(sprint(showerror, err), r"\e\[[0-9;]*m" => "")
+    @test occursin("possible versions are: 1.0.0+1", msg)
+end
+
+# maxsum must close its timeout timer and pop its graph snapshot even when
+# convergence throws (try/finally): corrupt an ignored package's constraints
+# so update_solution! throws inside converge!, then check the solve stack.
+@testset "maxsum cleans up on throw" begin
+    graph = mk_graph(Requires(uA => VersionSpec("*")))
+    Resolve.simplify_graph!(graph)
+    depth = length(graph.solve_stack)
+    p0 = graph.data.pdict[uA]
+    graph.ignored[p0] = true
+    fill!(graph.gconstr[p0], false)   # no state left: update_solution! throws
+    @test_throws MethodError Resolve.maxsum(graph)
+    @test length(graph.solve_stack) == depth
 end
 
 # Pkg.jl resolve.jl "realistic" — four large real-world dependency graphs

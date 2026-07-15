@@ -98,6 +98,13 @@ function find_project_file(env::Union{Nothing, String} = nothing)
             """
         )
     end
+    # canonicalize the parent directory but keep a symlinked project file
+    # itself: resolving it would move the environment's identity to the link
+    # target and place the manifest beside the wrong directory
+    if islink(project_file)
+        dir, base = splitdir(abspath(project_file))
+        return joinpath(safe_realpath(dir), base)
+    end
     return safe_realpath(project_file)
 end
 
@@ -287,9 +294,20 @@ function is_manifest_current(env::Environment)
         project_file = projectfile_path(dir; strict = true)
         project_file === nothing && continue
         project = read_project(project_file)
-        recorded_deps = merge(entry.deps, entry.weakdeps)
+        # the manifest records exactly the package's declared weak set
+        # (fixups_from_projectfile), so the complete maps must match
+        declared_weak = merge(project.weakdeps, project.deps_weak)
+        declared_weak == entry.weakdeps || return false
+        # every declared strong dep must be recorded ...
         for (name, uuid) in project.deps
-            get(recorded_deps, name, nothing) == uuid || return false
+            get(entry.deps, name, nothing) == uuid || return false
+        end
+        # ... and every recorded dep must still be declared. An entry's `deps`
+        # may legitimately include the weak deps too (they enter the fixed
+        # requirements at resolve time), so check against the union.
+        declared_all = merge(project.deps, declared_weak)
+        for (name, uuid) in entry.deps
+            get(declared_all, name, nothing) == uuid || return false
         end
     end
     return true

@@ -65,6 +65,11 @@ end
 Update installed registries (all of them, or only the named ones).
 """
 function update(names::String...; io::IO = stderr_f())
+    if API.is_offline()
+        # offline mode issues no network requests at all (Pkg.jl#4579)
+        printpkgstyle(io, :Offline, "skipping registry update", color = Base.info_color())
+        return nothing
+    end
     Registries.update_registries!(
         depot_stack(); names = isempty(names) ? nothing : collect(String, names), io,
     )
@@ -84,7 +89,8 @@ end
 
 Show the installed registries: short uuid, name, source url, the on-disk
 form (packed/unpacked/git/bare), and — for registries the package server
-tracks — the serving url, the selected flavor
+tracks and `update_registries!` can update in place (not git or bare
+directory registries) — the serving url, the selected flavor
 (`JULIA_PKG_SERVER_REGISTRY_PREFERENCE`), and whether an update is
 available. The server query is skipped in offline mode.
 """
@@ -108,8 +114,10 @@ function status(; io::IO = stderr_f())
         repo === nothing || print(io, " ($repo)")
         println(io)
         println(io, "    ", registry_form(reg))
+        # git and bare directory registries (tree_info === nothing) cannot
+        # be server-updated in place, so no served-by/update line for them
         if server_hashes !== nothing && haskey(server_hashes, uuid) &&
-                !ispath(joinpath(reg.path, ".git"))
+                !ispath(joinpath(reg.path, ".git")) && reg.tree_info !== nothing
             print(io, "    served by $server")
             flavor == "" || print(io, " ($flavor flavor)")
             server_hashes[uuid] == reg.tree_info || print(io, " - update available")

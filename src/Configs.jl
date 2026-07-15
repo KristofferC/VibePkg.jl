@@ -61,6 +61,23 @@ function pkg_server()
     return String(rstrip(server, '/'))
 end
 
+"`JULIA_PKG_OFFLINE`: whether the environment forces offline mode."
+offline_env() = Base.get_bool_env("JULIA_PKG_OFFLINE", false) == true
+
+"`JULIA_PKG_DEVDIR`, defaulting to `dev` in the first depot."
+devdir_env(depots::DepotStack) = get(ENV, "JULIA_PKG_DEVDIR", joinpath(depots1(depots), "dev"))
+
+"`JULIA_PKG_CONCURRENT_DOWNLOADS`: a positive integer, default 8."
+function concurrent_downloads_env()
+    val = get(ENV, "JULIA_PKG_CONCURRENT_DOWNLOADS", "8")
+    num = tryparse(Int, val)
+    num === nothing &&
+        pkgerror("Environment variable `JULIA_PKG_CONCURRENT_DOWNLOADS` expects an integer, instead found `$val`")
+    num < 1 &&
+        pkgerror("Environment variable `JULIA_PKG_CONCURRENT_DOWNLOADS` must be greater than 0, instead found `$num`")
+    return num
+end
+
 """
     Config(depots = depot_stack(); io, offline, respect_sysimage_versions)
 
@@ -86,9 +103,9 @@ function Config(
     )
     return Config(
         depots, io, pkg_server(),
-        offline || Base.get_bool_env("JULIA_PKG_OFFLINE", false) == true,
-        get(ENV, "JULIA_PKG_DEVDIR", joinpath(depots1(depots), "dev")),
-        max(1, something(tryparse(Int, get(ENV, "JULIA_PKG_CONCURRENT_DOWNLOADS", "8")), 8)),
+        offline || offline_env(),
+        devdir_env(depots),
+        concurrent_downloads_env(),
         respect_sysimage_versions,
     )
 end

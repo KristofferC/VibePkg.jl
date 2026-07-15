@@ -32,8 +32,17 @@ end
 
 const DictStdLibs = Dict{UUID, StdlibInfo}
 
-const UPGRADABLE_STDLIBS = ["DelimitedFiles", "Statistics"]
-const UPGRADABLE_STDLIBS_UUIDS = Set{UUID}()
+# Fixed, well-known identities: populated eagerly so consulting the set never
+# depends on `stdlib_infos()` having run first.
+const UPGRADABLE_STDLIBS = [
+    "DelimitedFiles" => UUID("8bb1440f-4735-579b-a4ab-409b98df4dab"),
+    "Statistics" => UUID("10745b16-79ce-11e8-11f9-7d13ad32a3b2"),
+]
+const UPGRADABLE_STDLIBS_UUIDS = Set{UUID}(last.(UPGRADABLE_STDLIBS))
+
+# the precompile workload scrubs mutable module state out of the image;
+# restore the eager set contents on every load
+__init__() = union!(UPGRADABLE_STDLIBS_UUIDS, last.(UPGRADABLE_STDLIBS))
 
 # Populated by HistoricalStdlibVersions.jl (same protocol as Pkg):
 const STDLIBS_BY_VERSION = Pair{VersionNumber, DictStdLibs}[]
@@ -58,10 +67,7 @@ function load_stdlib()
         nothing === uuid && continue
         v_str = get(project, "version", nothing)::Union{String, Nothing}
         version = isnothing(v_str) ? nothing : VersionNumber(v_str)
-        if name in UPGRADABLE_STDLIBS
-            push!(UPGRADABLE_STDLIBS_UUIDS, UUID(uuid))
-            continue
-        end
+        any(p -> first(p) == name, UPGRADABLE_STDLIBS) && continue
         deps = UUID.(values(get(project, "deps", Dict{String, Any}())))
         weakdeps = UUID.(values(get(project, "weakdeps", Dict{String, Any}())))
         stdlib[UUID(uuid)] = StdlibInfo(name, UUID(uuid), version, deps, weakdeps)

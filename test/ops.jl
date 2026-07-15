@@ -8,13 +8,15 @@ LocalPkgServer.isolate!()
 using Test
 using Base: UUID
 using VibePkg
+using VibePkg: API
 using VibePkg.Configs: Config
 using VibePkg.Depots: depot_stack
 using VibePkg.Registries: reachable_registries
 using VibePkg.Environments
 using VibePkg.Planning
-using VibePkg.Planning: PackageRequest
+using VibePkg.Planning: PackageRequest, dropbuild
 using VibePkg.EnvFiles: entry_version, is_path_tracked, is_registry_tracked
+import TOML
 using VibePkg.Errors: PkgError
 using VibePkg.Display: print_env_diff, print_status
 using VibePkg.Execution: instantiate!, manifest_matches_project
@@ -1247,5 +1249,564 @@ end
             @test occursin("EUPL-1.2+", txt2)
             @test occursin("[tool.mytool]", txt2)
         end
+    end
+end
+
+# developing a package listed in [weakdeps] must promote it to a real dep in
+# both representations — left in weakdeps the reader demotes it to weak-only
+# and then rejects its [sources] entry, making the environment unloadable
+@testset "develop of a weakdep promotes it out of [weakdeps]" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            devuuid = "deadbeef-dead-beef-dead-beefdeadbeef"
+            devpkg = joinpath(dir, "MyDev")
+            mkpath(joinpath(devpkg, "src"))
+            write(
+                joinpath(devpkg, "Project.toml"), """
+                name = "MyDev"
+                uuid = "$devuuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(devpkg, "src", "MyDev.jl"), "module MyDev end\n")
+
+            envdir = mkpath(joinpath(dir, "env"))
+            write(
+                joinpath(envdir, "Project.toml"), """
+                [weakdeps]
+                MyDev = "$devuuid"
+                """
+            )
+            env = load_environment(envdir; depots)
+            planned = plan_develop(env, regs, Config(depots), devpkg)
+            @test haskey(planned.project.deps, "MyDev")
+            @test !haskey(planned.project.weakdeps, "MyDev")
+            @test !haskey(planned.project.deps_weak, "MyDev")
+
+            # the round-trip through disk must load (and stay a real dep)
+            write_environment(env, planned)
+            env2 = load_environment(envdir; depots)
+            @test haskey(env2.project.deps, "MyDev")
+            @test !haskey(env2.project.deps_weak, "MyDev")
+            @test is_path_tracked(env2.manifest[UUID(devuuid)])
+        end
+    end
+end
+
+# targeted `up` on a fully-pinned environment must validate the request
+# instead of silently returning through the all-pinned shortcut
+@testset "targeted up validates names on a fully-pinned env" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        mktempdir() do dir
+            # a hand-written fully-pinned environment: every manifest entry is
+            # pinned (a resolved fixture env would drag in unpinned stdlibs)
+            envdir = mkpath(joinpath(dir, "env"))
+            write(
+                joinpath(envdir, "Project.toml"),
+                "[deps]\nExample = \"7876af07-990d-54b4-ab0e-23690620f79a\"\n"
+            )
+            write(
+                joinpath(envdir, "Manifest.toml"), """
+                julia_version = "1.12.6"
+                manifest_format = "2.0"
+                project_hash = "1111111111111111111111111111111111111111"
+
+                [[deps.Example]]
+                git-tree-sha1 = "2222222222222222222222222222222222222222"
+                pinned = true
+                uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+                version = "0.5.1"
+                """
+            )
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_offline = VibePkg.API.OFFLINE_MODE[]
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                VibePkg.API.OFFLINE_MODE[] = true   # hermetic: no registry fetch
+                # the update-everything form still short-circuits
+                buf = IOBuffer()
+                VibePkg.up(; io = buf)
+                @test occursin("All dependencies are pinned", String(take!(buf)))
+                # an unknown target errors instead of hitting the shortcut
+                @test_throws PkgError VibePkg.up("Nonexistent"; io = devnull)
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.OFFLINE_MODE[] = old_offline
+            end
+        end
+    end
+end
+
+# develop of a vector applies as ONE transaction: a failing item must leave
+# the environment untouched (per-item mutation loops commit earlier items)
+@testset "vector develop is atomic" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        mktempdir() do dir
+            good = joinpath(dir, "GoodPkg")
+            mkpath(joinpath(good, "src"))
+            write(
+                joinpath(good, "Project.toml"), """
+                name = "GoodPkg"
+                uuid = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(good, "src", "GoodPkg.jl"), "module GoodPkg end\n")
+            envdir = mkpath(joinpath(dir, "env"))
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                @test_throws PkgError VibePkg.develop(
+                    [
+                        VibePkg.PackageSpec(path = good),
+                        VibePkg.PackageSpec(path = joinpath(dir, "NoSuchPkg")),
+                    ]; io = devnull
+                )
+                # the failing second item rolled the whole call back
+                @test !isfile(joinpath(envdir, "Manifest.toml"))
+                proj = joinpath(envdir, "Project.toml")
+                @test !isfile(proj) || !occursin("GoodPkg", read(proj, String))
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            end
+        end
+    end
+end
+
+# name-keyed wrappers accept UUID-only PackageSpecs (previously the UUID was
+# stringified into a "name" no manifest entry could match)
+@testset "UUID-only PackageSpec for build" begin
+    mktempdir() do depot
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        mktempdir() do dir
+            envdir = mkpath(joinpath(dir, "env"))
+            env = load_environment(envdir; depots)
+            write_environment(env, plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.1")]))
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                # not installed -> build has nothing to run, but the UUID must
+                # resolve to `Example` instead of erroring on a uuid-string name
+                VibePkg.build(VibePkg.PackageSpec(uuid = EXAMPLE_UUID); io = devnull)
+                @test true
+                # an unknown uuid errors clearly
+                @test_throws PkgError VibePkg.build(
+                    VibePkg.PackageSpec(uuid = Base.UUID("99999999-9999-9999-9999-999999999999"));
+                    io = devnull
+                )
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            end
+        end
+    end
+end
+
+# why: a UUID names the package exactly; a duplicated name errors instead of
+# silently explaining whichever entry the manifest iteration hit last
+@testset "why disambiguates duplicate manifest names" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        u1 = "11111111-1111-1111-1111-111111111111"
+        u2 = "22222222-2222-2222-2222-222222222222"
+        root = "33333333-3333-3333-3333-333333333333"
+        other = "44444444-4444-4444-4444-444444444444"
+        write(
+            joinpath(envdir, "Project.toml"), """
+            [deps]
+            Root = "$root"
+            Other = "$other"
+            """
+        )
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "1.12.6"
+            manifest_format = "2.0"
+            project_hash = "1111111111111111111111111111111111111111"
+
+            [[deps.Root]]
+            git-tree-sha1 = "2222222222222222222222222222222222222222"
+            uuid = "$root"
+            version = "1.0.0"
+
+                [deps.Root.deps]
+                Dup = "$u1"
+
+            [[deps.Other]]
+            git-tree-sha1 = "3333333333333333333333333333333333333333"
+            uuid = "$other"
+            version = "1.0.0"
+
+                [deps.Other.deps]
+                Dup = "$u2"
+
+            [[deps.Dup]]
+            git-tree-sha1 = "4444444444444444444444444444444444444444"
+            uuid = "$u1"
+            version = "1.0.0"
+
+            [[deps.Dup]]
+            git-tree-sha1 = "5555555555555555555555555555555555555555"
+            uuid = "$u2"
+            version = "2.0.0"
+            """
+        )
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot_path = copy(Base.DEPOT_PATH)
+        try
+            copy!(Base.DEPOT_PATH, [depot])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            # by uuid: each Dup is explained through its own dependent
+            buf = IOBuffer()
+            VibePkg.why(VibePkg.PackageSpec(uuid = Base.UUID(u1)); io = buf)
+            out1 = String(take!(buf))
+            @test occursin("Root", out1) && !occursin("Other", out1)
+            VibePkg.why(VibePkg.PackageSpec(uuid = Base.UUID(u2)); io = buf)
+            out2 = String(take!(buf))
+            @test occursin("Other", out2) && !occursin("Root", out2)
+            # by name: ambiguous -> error, never a silent last-wins pick
+            @test_throws PkgError VibePkg.why("Dup"; io = devnull)
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot_path)
+        end
+    end
+end
+
+# develop must honor PackageSpec.subdir for path and url requests: the
+# tracked project is the one under `subdir`, not the repository root
+@testset "develop honors subdir" begin
+    LibGit2 = VibePkg.Git.LibGit2
+    sub_uuid = Base.UUID("5abd1e00-1111-4111-8111-111111111111")
+    root_uuid = Base.UUID("400f0000-2222-4222-8222-222222222222")
+    mktempdir() do depot
+        make_test_registry(depot)
+        mktempdir() do dir
+            # a monorepo: a decoy package at the root and the real one below
+            repo_dir = joinpath(dir, "Mono")
+            mkpath(joinpath(repo_dir, "src"))
+            write(
+                joinpath(repo_dir, "Project.toml"), """
+                name = "RootPkg"
+                uuid = "$root_uuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(repo_dir, "src", "RootPkg.jl"), "module RootPkg end\n")
+            subpkg = joinpath(repo_dir, "SubPkg")
+            mkpath(joinpath(subpkg, "src"))
+            write(
+                joinpath(subpkg, "Project.toml"), """
+                name = "SubPkg"
+                uuid = "$sub_uuid"
+                version = "0.1.0"
+                """
+            )
+            write(joinpath(subpkg, "src", "SubPkg.jl"), "module SubPkg end\n")
+
+            old_active = Base.ACTIVE_PROJECT[]
+            old_depot_path = copy(Base.DEPOT_PATH)
+            old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            old_devdir = get(ENV, "JULIA_PKG_DEVDIR", nothing)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            try
+                copy!(Base.DEPOT_PATH, [depot])
+                ENV["JULIA_PKG_DEVDIR"] = joinpath(dir, "devdir")
+
+                # path + subdir tracks the subproject, not the root project
+                envdir = mkpath(joinpath(dir, "env-path"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                VibePkg.develop(VibePkg.PackageSpec(path = repo_dir, subdir = "SubPkg"); io = devnull)
+                env = load_environment(envdir; depots = depot_stack([depot]))
+                @test haskey(env.manifest, sub_uuid)
+                @test !haskey(env.manifest, root_uuid)
+                @test VibePkg.EnvFiles.entry_path(env.manifest[sub_uuid]) == subpkg
+
+                # a nonexistent subdir errors before anything is written
+                envdir2 = mkpath(joinpath(dir, "env-bad"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir2, "Project.toml")
+                @test_throws PkgError VibePkg.develop(
+                    VibePkg.PackageSpec(path = repo_dir, subdir = "NoSuchDir"); io = devnull
+                )
+                @test !isfile(joinpath(envdir2, "Manifest.toml"))
+
+                # url + subdir: the clone is tracked at its subdirectory
+                gitrepo = LibGit2.init(repo_dir)
+                try
+                    # git pathspecs are /-separated on every platform — joinpath
+                    # would produce backslashes on Windows and silently match nothing
+                    LibGit2.add!(gitrepo, "Project.toml", "src/RootPkg.jl")
+                    LibGit2.add!(gitrepo, "SubPkg/Project.toml", "SubPkg/src/SubPkg.jl")
+                    sig = LibGit2.Signature("vibepkg-test", "test@example.com")
+                    LibGit2.commit(gitrepo, "init"; author = sig, committer = sig)
+                finally
+                    close(gitrepo)
+                end
+                envdir3 = mkpath(joinpath(dir, "env-url"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir3, "Project.toml")
+                VibePkg.develop(VibePkg.PackageSpec(url = repo_dir, subdir = "SubPkg"); io = devnull)
+                env3 = load_environment(envdir3; depots = depot_stack([depot]))
+                @test haskey(env3.manifest, sub_uuid)
+                @test !haskey(env3.manifest, root_uuid)
+                @test VibePkg.EnvFiles.entry_path(env3.manifest[sub_uuid]) ==
+                    joinpath(dir, "devdir", "Mono", "SubPkg")
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
+                copy!(Base.DEPOT_PATH, old_depot_path)
+                VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+                old_devdir === nothing ? delete!(ENV, "JULIA_PKG_DEVDIR") : (ENV["JULIA_PKG_DEVDIR"] = old_devdir)
+            end
+        end
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl manifests.jl "v1.0: activate and read, upgrade on write" (line 79) and
+# "v2.0: … upgrade on write" (line 99) — activating a v1.0 / v2.0 reference
+# manifest and then running an op rewrites it upgraded to manifest_format 2.1.
+# Divergence: `add`/resolve re-stamp the format to 2.1, but `rm` prunes the
+# manifest in place and preserves whatever format it already had (so it keeps
+# 2.1 after an add, but would NOT by itself upgrade a bare v1 manifest).
+@testset "op-driven manifest upgrade to format 2.1" begin
+    v1_manifest = """
+    [[Example]]
+    deps = ["Test"]
+    git-tree-sha1 = "2222222222222222222222222222222222222222"
+    uuid = "$EXAMPLE_UUID"
+    version = "0.5.1"
+
+    [[Test]]
+    uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+    """
+    v2_manifest = """
+    julia_version = "1.7.0-DEV"
+    manifest_format = "2.0"
+
+    [[deps.Example]]
+    deps = ["Test"]
+    git-tree-sha1 = "2222222222222222222222222222222222222222"
+    uuid = "$EXAMPLE_UUID"
+    version = "0.5.1"
+
+    [[deps.Test]]
+    uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+    """
+    for (label, manifest_text, loaded_format) in (
+            ("v1.0", v1_manifest, v"1.0.0"),
+            ("v2.0", v2_manifest, v"2.0.0"),
+        )
+        mktempdir() do dir
+            depot = mkpath(joinpath(dir, "depot"))
+            make_test_registry(depot)
+            depots = depot_stack([depot])
+            regs = reachable_registries(depots)
+            envdir = mkpath(joinpath(dir, "env"))
+            write(joinpath(envdir, "Project.toml"), "[deps]\nExample = \"$EXAMPLE_UUID\"\n")
+            write(joinpath(envdir, "Manifest.toml"), manifest_text)
+
+            env = load_environment(envdir; depots)
+            @test env.manifest.manifest_format == loaded_format   # reads the old format
+
+            # add upgrades the on-disk manifest to 2.1
+            added = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+            @test added.manifest.manifest_format == v"2.1.0"
+            write_environment(env, added)
+            raw = TOML.parsefile(joinpath(envdir, "Manifest.toml"))
+            @test raw["manifest_format"] == "2.1"
+            reloaded = load_environment(envdir; depots)
+            @test reloaded.manifest.manifest_format == v"2.1.0"
+
+            # a following rm keeps the manifest at 2.1
+            removed = plan_rm(reloaded, [PackageRequest("Example")])
+            @test removed.manifest.manifest_format == v"2.1.0"
+            @test isempty(removed.manifest.deps)
+        end
+    end
+end
+
+# Pkg.jl manifests.jl "activating old environment: maintains old version, then
+# ~`VERSION` after resolve" (line 216) — activating a v2.0 reference env keeps
+# its recorded julia_version (1.7.0-DEV); a subsequent add flips it to
+# dropbuild(VERSION).
+@testset "activating old env keeps julia_version, add flips it" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        regs = reachable_registries(depots)
+        envdir = mkpath(joinpath(dir, "env"))
+        write(joinpath(envdir, "Project.toml"), "[deps]\nExample = \"$EXAMPLE_UUID\"\n")
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "1.7.0-DEV"
+            manifest_format = "2.0"
+
+            [[deps.Example]]
+            deps = ["Test"]
+            git-tree-sha1 = "2222222222222222222222222222222222222222"
+            uuid = "$EXAMPLE_UUID"
+            version = "0.5.1"
+
+            [[deps.Test]]
+            uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+            """
+        )
+
+        env = load_environment(envdir; depots)
+        @test env.manifest.julia_version == v"1.7.0-DEV"    # old version preserved on read
+
+        added = plan_add(env, regs, Config(depots), [PackageRequest("Example")])
+        @test added.manifest.julia_version == dropbuild(VERSION)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# API-level update_on_mismatch flows need the fixture pkg server + an active
+# project (real install of Example), driven through ACTIVE_PROJECT/DEPOT_PATH.
+function with_update_on_mismatch_world(f)
+    LocalPkgServer.ensure!()
+    return mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = API.AUTO_PRECOMPILE_ENABLED[]
+        API.AUTO_PRECOMPILE_ENABLED[] = false
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            f(dir, envdir)
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+    end
+end
+
+reloadenv(envdir) = load_environment(envdir; depots = depot_stack())
+
+# Pkg.jl manifests.jl "manifest from a different julia minor version" (line 280)
+# — without the flag `instantiate` warns and keeps the stale manifest; with
+# `update_on_mismatch = true` it falls back to `up` and regenerates for the
+# current julia version.
+@testset "update_on_mismatch: julia minor version mismatch" begin
+    with_update_on_mismatch_world() do dir, envdir
+        VibePkg.add("Example"; io = devnull)
+        mf = joinpath(envdir, "Manifest.toml")
+        stamped = reloadenv(envdir).manifest.julia_version
+        @test stamped == dropbuild(VERSION)
+
+        # rewrite the manifest's julia_version to a different minor
+        other = VersionNumber(VERSION.major, VERSION.minor == 0 ? 99 : VERSION.minor - 1, 0)
+        write(mf, replace(read(mf, String), "julia_version = \"$stamped\"" => "julia_version = \"$other\""))
+        @test reloadenv(envdir).manifest.julia_version == other
+        @test !manifest_matches_project(reloadenv(envdir))
+
+        # default: warns, stays stale
+        @test_logs (:warn, r"different julia version") match_mode = :any VibePkg.instantiate(; io = devnull)
+        @test reloadenv(envdir).manifest.julia_version == other
+
+        # update_on_mismatch=true: falls back to update, becomes current
+        VibePkg.instantiate(; update_on_mismatch = true, io = devnull)
+        env = reloadenv(envdir)
+        @test env.manifest.julia_version == dropbuild(VERSION)
+        @test manifest_matches_project(env)
+    end
+end
+
+# Pkg.jl manifests.jl "manifest stale due to compat change" (line 298) — after a
+# conflicting compat change the default `instantiate` just warns and stays
+# stale; `update_on_mismatch = true` falls back to update so the manifest
+# becomes current (re-resolving Example down to the only compatible version).
+@testset "update_on_mismatch: stale due to compat change" begin
+    EX = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+    with_update_on_mismatch_world() do dir, envdir
+        VibePkg.add("Example"; io = devnull)
+        @test entry_version(reloadenv(envdir).manifest[EX]) == v"0.5.5"
+
+        # a compat entry that excludes the resolved version leaves the manifest
+        # in place (conflict → not downgraded) but stale
+        VibePkg.compat("Example", "=0.5.0"; io = devnull)
+        @test entry_version(reloadenv(envdir).manifest[EX]) == v"0.5.5"
+        @test !manifest_matches_project(reloadenv(envdir))
+
+        # default: warns, stays stale
+        @test_logs (:warn, r"does not match") match_mode = :any VibePkg.instantiate(; io = devnull)
+        env = reloadenv(envdir)
+        @test entry_version(env.manifest[EX]) == v"0.5.5"
+        @test !manifest_matches_project(env)
+
+        # update_on_mismatch=true: falls back to update, becomes current
+        VibePkg.instantiate(; update_on_mismatch = true, io = devnull)
+        env = reloadenv(envdir)
+        @test entry_version(env.manifest[EX]) == v"0.5.0"
+        @test manifest_matches_project(env)
+    end
+end
+
+# Pkg.jl manifests.jl "no mismatch: update_on_mismatch=true is a no-op" (line
+# 322) — when the manifest already matches, `instantiate(update_on_mismatch =
+# true)` changes nothing and keeps installed versions.
+@testset "update_on_mismatch: no-op when already current" begin
+    EX = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+    with_update_on_mismatch_world() do dir, envdir
+        VibePkg.add("Example"; io = devnull)
+        before = entry_version(reloadenv(envdir).manifest[EX])
+        @test manifest_matches_project(reloadenv(envdir))
+        VibePkg.instantiate(; update_on_mismatch = true, io = devnull)
+        env = reloadenv(envdir)
+        @test manifest_matches_project(env)
+        @test entry_version(env.manifest[EX]) == before
+    end
+end
+
+# Pkg.jl manifests.jl "undo reverts the fallback even as first op" (line 334) —
+# if instantiate(update_on_mismatch=true) is the first op in a fresh session and
+# triggers the fallback, the pre-update snapshot is saved so `undo` restores the
+# earlier version.
+@testset "undo reverts the update_on_mismatch fallback as first op" begin
+    EX = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+    with_update_on_mismatch_world() do dir, envdir
+        VibePkg.add("Example"; io = devnull)
+        VibePkg.compat("Example", "=0.5.0"; io = devnull)
+        # simulate a fresh session: clear the per-project undo stacks
+        empty!(API.UNDO_STACKS)
+        version_pre = entry_version(reloadenv(envdir).manifest[EX])
+        @test version_pre == v"0.5.5"
+
+        VibePkg.instantiate(; update_on_mismatch = true, io = devnull)
+        version_post = entry_version(reloadenv(envdir).manifest[EX])
+        @test version_post == v"0.5.0"
+        @test version_post != version_pre
+
+        VibePkg.undo(; io = devnull)
+        @test entry_version(reloadenv(envdir).manifest[EX]) == version_pre
     end
 end

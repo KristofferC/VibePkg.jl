@@ -41,7 +41,7 @@ using ..Utils: printpkgstyle, pathrepr
 
 export app_add, app_develop, app_rm, app_update, app_status
 
-const SHIM_VERSION = "1.1"
+const SHIM_VERSION = "1.2"
 
 apps_dir(d::DepotStack) = joinpath(environments_dir(depots1(d)), "apps")
 app_manifest_file(d::DepotStack) = joinpath(apps_dir(d), "AppManifest.toml")
@@ -138,8 +138,8 @@ function bat_shim(app::AppInfo, julia::String, entry::String, depot::String, loa
     for %%I in ("%~dp0..") do set "depot=%%~fI"
     if not exist "%depot%\\environments\\apps\\AppManifest.toml" set "depot=$(normpath(depot))"
 
-    rem (no delayed expansion here so '!' stays literal; trailing ';' keeps
-    rem the default system depots)
+    rem (delayed expansion stays disabled throughout so '!' in paths and
+    rem arguments stays literal; trailing ';' keeps the default system depots)
     set "JULIA_LOAD_PATH=$lp"
     set "JULIA_DEPOT_PATH=%depot%;"
 
@@ -149,49 +149,40 @@ function bat_shim(app::AppInfo, julia::String, entry::String, depot::String, loa
         set "julia_cmd=$julia_escaped"
     )
 
-    setlocal EnableDelayedExpansion
-
-    rem Parse arguments, splitting on the first -- into julia_args / app_args
+    rem Parse arguments, splitting on the first -- into julia_args / app_args.
+    rem The goto loop re-parses each line every iteration, so plain %var%
+    rem expansion is fresh and delayed expansion (which would corrupt
+    rem literal '!' in the arguments) is never needed.
     set "found_sep="
     set "julia_args="
     set "app_args="
 
     :__next
     if "%~1"=="" goto __done
+    if defined found_sep goto __app
 
-    if not defined found_sep if "%~1"=="--" (
+    if "%~1"=="--" (
         set "found_sep=1"
         shift
         goto __next
     )
 
-    if not defined found_sep (
-        if defined julia_args (
-            set "julia_args=!julia_args! %1"
-        ) else (
-            set "julia_args=%1"
-        )
-        shift
-        goto __next
-    )
+    if defined julia_args (set "julia_args=%julia_args% %1") else (set "julia_args=%1")
+    shift
+    goto __next
 
-    if defined found_sep (
-        if defined app_args (
-            set "app_args=!app_args! %1"
-        ) else (
-            set "app_args=%1"
-        )
-        shift
-        goto __next
-    )
+    :__app
+    if defined app_args (set "app_args=%app_args% %1") else (set "app_args=%1")
+    shift
+    goto __next
 
     :__done
     rem With no -- every original argument goes to the app
     if defined found_sep (
         "%julia_cmd%" ^
-            --startup-file=no$flags_part !julia_args! ^
+            --startup-file=no$flags_part %julia_args% ^
             -m $entry_escaped ^
-            !app_args!
+            %app_args%
     ) else (
         "%julia_cmd%" ^
             --startup-file=no$flags_part ^

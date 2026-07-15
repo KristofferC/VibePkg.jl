@@ -54,7 +54,11 @@ struct ResolverTimeoutError <: Exception
 end
 ResolverTimeoutError(msg::AbstractString) = ResolverTimeoutError(msg, nothing)
 
-function Base.showerror(io::IO, pkgerr::ResolverError)
+# Both resolver exceptions carry the same (msg, ex) payload and share the
+# same user-facing formatting below.
+const ResolverExceptions = Union{ResolverError, ResolverTimeoutError}
+
+function Base.showerror(io::IO, pkgerr::ResolverExceptions)
     # color is baked into `msg` at construction time (see `logstr`); honor the
     # target IO's color support here by stripping ANSI escapes when it's off.
     msg = pkgerr.msg

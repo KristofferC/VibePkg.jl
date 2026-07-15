@@ -7,8 +7,9 @@
 # uses.
 
 using PrecompileTools: @compile_workload
+using REPL.Terminals: Terminals
 
-struct FakeTerminal <: REPL.Terminals.UnixTerminal
+struct FakeTerminal <: Terminals.UnixTerminal
     in_stream::IOBuffer
     out_stream::IOBuffer
     err_stream::IOBuffer
@@ -16,7 +17,7 @@ struct FakeTerminal <: REPL.Terminals.UnixTerminal
     raw::Bool
 end
 FakeTerminal() = FakeTerminal(IOBuffer(), IOBuffer(), IOBuffer(), false, true)
-REPL.Terminals.raw!(::FakeTerminal, raw::Bool) = raw
+Terminals.raw!(::FakeTerminal, raw::Bool) = raw
 
 function precompile_ext()
     term = FakeTerminal()

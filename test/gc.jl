@@ -8,7 +8,7 @@ LocalPkgServer.isolate!()
 using Test
 using Base: UUID, SHA1
 using TOML
-using VibePkg.Depots: depot_stack, log_usage
+using VibePkg.Depots: depot_stack, log_usage, log_scratch_usage
 using VibePkg.GCOps
 using VibePkg.EnvFiles
 using VibePkg.Configs: Config
@@ -129,15 +129,97 @@ end
     end
 end
 
-# Pkg.jl#2633 — a corrupt manifest_usage.toml doesn't stop gc
-@testset "gc tolerates corrupt usage log" begin
+# Pkg.jl#2633 — a corrupt manifest_usage.toml doesn't stop gc; and gc fails
+# closed: with the record of live manifests unreadable, packages and clones
+# (marked from manifests) are preserved rather than mass-collected, while
+# classes with healthy logs still sweep
+@testset "gc fails closed on corrupt manifest usage log" begin
     mktempdir() do dir
         depot = mkpath(joinpath(dir, "depot"))
         depots = depot_stack([depot])
-        write(joinpath(mkpath(joinpath(depot, "logs")), "manifest_usage.toml"), "this is }{ not toml")
-        dead_pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
+        usage_file = joinpath(mkpath(joinpath(depot, "logs")), "manifest_usage.toml")
+        write(usage_file, "this is }{ not toml")
+        pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
+        clone = mkpath(joinpath(depot, "clones", "some-clone"))
+        dead_art = mkpath(joinpath(depot, "artifacts", "feedfacefeedfacefeedfacefeedfacefeedface"))
         @test_logs (:warn, r"Failed to parse usage file") match_mode = :any GCOps.gc(depots; io = devnull)
-        @test !isdir(dead_pkg)
+        @test isdir(pkg)                                    # liveness unknown -> kept
+        @test isdir(clone)                                  # clones come from manifests too
+        @test !isdir(dead_art)                              # artifact log fine -> still swept
+        @test read(usage_file, String) == "this is }{ not toml"  # left for log_usage to heal
+        # once the log is healthy again the next gc collects as usual
+        Base.rm(usage_file)
+        GCOps.gc(depots; io = devnull)
+        @test !isdir(pkg)
+        @test !isdir(clone)
+    end
+end
+
+# fail-closed is per sweep class: a corrupt artifact_usage.toml preserves
+# artifacts but packages still sweep, and a corrupt scratch_usage.toml
+# preserves scratchspaces
+@testset "gc fails closed per class on corrupt usage logs" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        logs = mkpath(joinpath(depot, "logs"))
+        write(joinpath(logs, "artifact_usage.toml"), "also }{ not toml")
+        write(joinpath(logs, "scratch_usage.toml"), "even more }{ not toml")
+        dead_pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
+        art = mkpath(joinpath(depot, "artifacts", "feedfacefeedfacefeedfacefeedfacefeedface"))
+        space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), "space1"))
+        @test_logs (:warn, r"Failed to parse usage file") match_mode = :any GCOps.gc(depots; io = devnull)
+        @test isdir(art)        # liveness unknown -> kept
+        @test isdir(space)      # liveness unknown -> kept
+        @test !isdir(dead_pkg)  # manifest log fine -> still swept
+    end
+end
+
+# a usage log that parses but whose value for an existing file is malformed
+# must treat that file as freshly used (fail closed), not drop it and sweep
+# the packages/scratchspaces it vouches for
+@testset "gc preserves roots behind schema-corrupt usage entries" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        logs = mkpath(joinpath(depot, "logs"))
+
+        # manifest referenced by a malformed (non-array) usage value
+        envdir = mkpath(joinpath(dir, "env"))
+        manifest_file = joinpath(envdir, "Manifest.toml")
+        write(
+            manifest_file, """
+            julia_version = "1.12.0"
+            manifest_format = "2.1"
+
+            [[deps.Foo]]
+            git-tree-sha1 = "$FOO_HASH"
+            uuid = "$FOO_UUID"
+            version = "1.0.0"
+            """
+        )
+        write(joinpath(logs, "manifest_usage.toml"), "'$(manifest_file)' = 3\n")
+        live_pkg = mkpath(joinpath(depot, "packages", "Foo", Base.version_slug(FOO_UUID, FOO_HASH)))
+        dead_pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
+
+        # a scratchspace with malformed entries is kept, a well-formed one
+        # whose parents are gone is still collected in the same run
+        odd_space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), "odd"))
+        dead_space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), "dead"))
+        write(
+            joinpath(logs, "scratch_usage.toml"), """
+            '$(odd_space)' = [3]
+            '$(dead_space)' = [{ time = 2024-01-01T00:00:00, parent_projects = ['$(joinpath(dir, "gone-project"))'] }]
+            """
+        )
+
+        GCOps.gc(depots; io = devnull)
+        @test isdir(live_pkg)        # its manifest was salvaged as live
+        @test !isdir(dead_pkg)       # unreferenced content still sweeps
+        @test isdir(odd_space)       # malformed entries -> kept
+        @test !isdir(dead_space)     # parents gone -> collected
+        # the salvaged manifest key survives the compaction rewrite
+        @test haskey(TOML.parsefile(joinpath(logs, "manifest_usage.toml")), manifest_file)
     end
 end
 
@@ -241,5 +323,43 @@ end
         GCOps.gc(depots; io = devnull)              # must not error or delete it
         @test isfile(joinpath(reg, "Registry.toml"))
         @test isfile(joinpath(reg, "E", "Example", "Package.toml"))
+    end
+end
+
+# builds record scratch usage keyed by the scratchspace path with a
+# parent_projects list — the liveness key gc uses; a time-only entry (or one
+# keyed by the manifest file) would let gc sweep live scratchspaces
+@testset "scratch usage from builds survives gc" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        proj = joinpath(mkpath(joinpath(dir, "proj")), "Project.toml")
+        write(proj, "")
+        space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), string(FOO_HASH)))
+        write(joinpath(space, "build.log"), "built")
+        log_scratch_usage(depots, space, proj)
+
+        # the entry is keyed by the scratchspace and carries parent_projects
+        usage = TOML.parsefile(joinpath(depot, "logs", "scratch_usage.toml"))
+        @test haskey(usage, space)
+        @test usage[space][1]["parent_projects"] == [proj]
+
+        # a second parent merges into the list — never replaces it
+        proj2 = joinpath(mkpath(joinpath(dir, "proj2")), "Project.toml")
+        write(proj2, "")
+        log_scratch_usage(depots, space, proj2)
+        usage = TOML.parsefile(joinpath(depot, "logs", "scratch_usage.toml"))
+        @test sort(usage[space][1]["parent_projects"]) == sort([proj, proj2])
+
+        # a live parent project keeps the scratchspace through gc
+        GCOps.gc(depots; io = devnull)
+        @test isfile(joinpath(space, "build.log"))
+
+        # both parents gone -> the scratchspace is collected
+        Base.rm(proj)
+        Base.rm(proj2)
+        GCOps.gc(depots; io = devnull)
+        @test !isdir(space)
     end
 end

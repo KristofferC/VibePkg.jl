@@ -15,7 +15,7 @@ module REPLMode
 using Base: UUID
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f, unstableio
+using ..Utils: stderr_f, unstableio, URL_SCHEME_RE
 using ..Configs: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR,
     PRESERVE_ALL_INSTALLED, PRESERVE_ALL, PRESERVE_DIRECT, PRESERVE_SEMVER,
     PRESERVE_NONE, PRESERVE_TIERED_INSTALLED, PRESERVE_TIERED
@@ -152,7 +152,7 @@ function build_command_table()
         shorts = Dict("p" => "project", "m" => "manifest", "v" => "verbose", "u" => "update_on_mismatch"),
         help = "instantiate [-p|--project] [-m|--manifest] [-v|--verbose] [--workspace] [--julia_version_strict] [-u|--update_on_mismatch]\n\nMake the environment ready to use: download everything the manifest records. `--project` resolves from the project instead of using the manifest; `--verbose` shows build output; `--julia_version_strict` errors instead of warning on manifest version check failures; `--update_on_mismatch` falls back to `up` when the manifest does not match the project."
     )
-    register!("resolve", nothing, API.resolve, :none, 0:0; help = "resolve\n\nReconcile the manifest with the project without moving installed versions.")
+    register!("resolve", nothing, API.resolve, :none, 0:0; help = "resolve\n\nReconcile the manifest with the project without moving installed versions. Never modifies Project.toml.")
     register!(
         "precompile", nothing, API.precompile, :strings, 0:typemax(Int),
         Dict(
@@ -290,12 +290,13 @@ is_path_like(word) =
     occursin('/', word) || occursin('\\', word) || word in (".", "..") ||
     startswith(word, '~') || occursin(r"^[A-Za-z]:", word)
 
-# Pkg's `looks_like_url`: schemes, anything with `.git`, and scp-style
-# `user@host:path` where the host looks like a hostname or an IP — but not
-# like a version number, so `Example@1.0:sub` stays name micro-syntax.
+# Pkg's `looks_like_url`: every scheme the Git layer accepts (`http(s)://`,
+# `git://`, `ssh://`, `file://` — Utils.URL_SCHEME_RE), anything with `.git`,
+# and scp-style `user@host:path` where the host looks like a hostname or an
+# IP — but not like a version number, so `Example@1.0:sub` stays name
+# micro-syntax.
 function looks_like_url(str::String)
-    if startswith(str, "http://") || startswith(str, "https://") ||
-            startswith(str, "git@") || startswith(str, "ssh://") || occursin(".git", str)
+    if occursin(URL_SCHEME_RE, str) || startswith(str, "git@") || occursin(".git", str)
         return true
     end
     at_pos = findfirst('@', str)
@@ -311,10 +312,8 @@ function looks_like_url(str::String)
 end
 
 looks_like_complete_url(str::String) =
-    (
-    startswith(str, "http://") || startswith(str, "https://") ||
-        startswith(str, "git@") || startswith(str, "ssh://")
-) && (occursin('.', str) || occursin('/', str))
+    (occursin(URL_SCHEME_RE, str) || startswith(str, "git@")) &&
+    (occursin('.', str) || occursin('/', str))
 
 # `C:` at the start of a word is a Windows drive, not a subdir separator
 is_windows_drive_colon(str::String, colon_pos::Int) =
@@ -663,10 +662,36 @@ function execute_commands(parsed_commands; io::IO = stderr_f())
     return TEST_MODE[] ? captured : nothing
 end
 
+# Split an input line into `;`-separated statements, honoring the same
+# single/double quoting as `tokenize_words` (no escapes), so a quoted
+# argument such as `activate "dir;name"` stays inside one statement. An
+# unterminated quote keeps the rest of the line in one statement and is
+# rejected by `tokenize_words`.
+function split_statements(input::AbstractString)
+    statements = String[]
+    buf = IOBuffer()
+    quote_char = nothing
+    for c in input
+        if quote_char !== nothing
+            write(buf, c)
+            c == quote_char && (quote_char = nothing)
+        elseif c == '"' || c == '\''
+            write(buf, c)
+            quote_char = c
+        elseif c == ';'
+            push!(statements, String(take!(buf)))
+        else
+            write(buf, c)
+        end
+    end
+    push!(statements, String(take!(buf)))
+    return statements
+end
+
 function do_cmd(input::AbstractString; io::IO = stderr_f())
     parsed_commands = ParsedCommand[]
     comma_break = uses_comma_sugar(input)
-    for statement in split(input, ';')
+    for statement in split_statements(input)
         statement = strip(statement)
         isempty(statement) && continue
         push!(parsed_commands, parse_statement(tokenize_words(statement; comma_break)))
@@ -699,26 +724,47 @@ function reachable_registries()
     )
 end
 
+const REGISTERED_PACKAGE_NAMES = Ref{Union{Nothing, Vector{String}}}(nothing)
+const DEPRECATED_PACKAGE_NAMES = Ref{Union{Nothing, Set{String}}}(nothing)
+
+function reset_completion_cache!()
+    REGISTERED_PACKAGE_NAMES[] = nothing
+    DEPRECATED_PACKAGE_NAMES[] = nothing
+    return
+end
+
 function registered_package_names()
+    # callers get a copy so they cannot mutate the cache through it
+    cached = REGISTERED_PACKAGE_NAMES[]
+    cached === nothing || return copy(cached)
     names = String[]
     for registry in reachable_registries(), (_, package) in Registries.registry_pkgs(registry)
         push!(names, package.name)
     end
-    return sort!(unique!(names))
+    sort!(unique!(names))
+    REGISTERED_PACKAGE_NAMES[] = names
+    return copy(names)
 end
 
-function is_deprecated_package_name(name::String)
-    found = false
-    for registry in reachable_registries()
-        for uuid in Registries.uuids_from_name(registry, name)
-            package = get(registry, uuid, nothing)
-            package === nothing && continue
-            found = true
-            Registries.isdeprecated(Registries.registry_info(registry, package)) || return false
-        end
+# a name counts as deprecated when it is registered and every registered
+# package carrying it is deprecated; computed in one registry sweep and
+# cached — the per-candidate registry walk made every completion re-discover
+# registries and reload package metadata
+function deprecated_package_names()
+    cached = DEPRECATED_PACKAGE_NAMES[]
+    cached === nothing || return cached
+    deprecated = Set{String}()
+    live = Set{String}()
+    for registry in reachable_registries(), (_, package) in Registries.registry_pkgs(registry)
+        info = Registries.registry_info(registry, package)
+        push!(Registries.isdeprecated(info) ? deprecated : live, package.name)
     end
-    return found
+    setdiff!(deprecated, live)
+    DEPRECATED_PACKAGE_NAMES[] = deprecated
+    return deprecated
 end
+
+is_deprecated_package_name(name::String) = name in deprecated_package_names()
 
 function environment_dependency_names()
     env = Environments.load_environment(; depots = depot_stack())
@@ -726,6 +772,10 @@ function environment_dependency_names()
 end
 
 stdlib_names() = sort!([info.name for info in values(Stdlibs.stdlib_infos())])
+
+# registry add / remove / update invalidates the caches automatically,
+# without every frontend having to remember reset_completion_cache!
+push!(Registries.REGISTRY_CHANGE_HOOKS, reset_completion_cache!)
 
 """
     completions_for(partial) -> (candidates, word)

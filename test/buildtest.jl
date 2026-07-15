@@ -29,6 +29,8 @@ const RP_UUID = UUID("abababab-1111-2222-3333-444444444444")
 const DP_UUID = UUID("cdcdcdcd-1111-2222-3333-444444444444")
 const LD_UUID = UUID("babababa-1111-2222-3333-444444444444")
 const PR_UUID = UUID("dededede-1111-2222-3333-444444444444")
+const CL_UUID = UUID("acacacac-1111-2222-3333-444444444444")
+const VB_UUID = UUID("bcbcbcbc-1111-2222-3333-444444444444")
 const EX_UUID = UUID("7876af07-990d-54b4-ab0e-23690620f79a")   # Example
 
 # a fresh single-depot environment with `pkg` dev'd into it
@@ -632,4 +634,115 @@ end
     @test flag(true) == "@/proj"                    # tracked at the package source
     @test flag("/tmp/trace.info") == "/tmp/trace.info"   # explicit path passthrough
     @test flag("user") == "user"
+end
+
+# the --depwarn flag passed to the test subprocess mirrors all three parent
+# states (0=no, 1=yes, 2=error): a parent started with --depwarn=no must not
+# upgrade its test subprocesses to --depwarn=yes
+@testset "test flags mirror the parent depwarn state" begin
+    # in-process: the emitted flag maps whatever this process runs with
+    flags = string(TestOps.test_subprocess_flags("/proj"; coverage = false, julia_args = String[]))
+    @test occursin("--depwarn=$(("no", "yes", "error")[Base.JLOptions().depwarn + 1])", flags)
+    # subprocess: pin each parent state and read the emitted flag back
+    sep = Sys.iswindows() ? ';' : ':'
+    probe = """
+    using VibePkg
+    flags = string(VibePkg.TestOps.test_subprocess_flags("/proj"; coverage = false, julia_args = String[]))
+    print(match(r"--depwarn=(\\w+)", flags).captures[1])
+    """
+    for state in ("no", "yes", "error")
+        cmd = addenv(
+            `$(joinpath(Sys.BINDIR, "julia")) --startup-file=no --depwarn=$state -e $probe`,
+            "JULIA_LOAD_PATH" => join(["@", pkgdir(TestOps), "@stdlib"], sep),
+            "JULIA_DEPOT_PATH" => LocalPkgServer.worker_depot_path(),
+            "JULIA_PROJECT" => nothing,
+        )
+        @test read(cmd, String) == state
+    end
+end
+
+# the test/build sandboxes are scoped to the run (mktempdir-do): they are
+# removed as soon as the subprocess finishes — on success and failure alike —
+# not left behind for process-exit cleanup
+@testset "sandboxes are cleaned up deterministically" begin
+    mktempdir() do dir
+        pkg = joinpath(dir, "CleanPkg")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "deps"))
+        mkpath(joinpath(pkg, "test"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "CleanPkg"
+            uuid = "$CL_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "CleanPkg.jl"), "module CleanPkg\nend\n")
+        # both subprocesses record their sandbox (the active project's dir)
+        record = repr(joinpath(dir, "sandboxes.txt"))
+        write(
+            joinpath(pkg, "deps", "build.jl"),
+            "open(io -> println(io, dirname(Base.active_project())), $record, \"a\")\n"
+        )
+        write(
+            joinpath(pkg, "test", "runtests.jl"),
+            "open(io -> println(io, dirname(Base.active_project())), $record, \"a\")\n" *
+                "get(ENV, \"CLEANPKG_FAIL\", \"\") == \"1\" && exit(3)\n"
+        )
+
+        env, depots = dev_fixture(dir, pkg)
+        BuildOps.build!(env, depots, [CL_UUID]; io = devnull)
+        @test TestOps.test!(env, RegistryInstance[], Config(depots), CL_UUID; io = devnull) === nothing
+        failed = withenv("CLEANPKG_FAIL" => "1") do
+            TestOps.test!(env, RegistryInstance[], Config(depots), CL_UUID; io = devnull)
+        end
+        @test failed !== nothing
+        sandboxes = readlines(joinpath(dir, "sandboxes.txt"))
+        @test length(sandboxes) == 3           # build + passing test + failing test
+        for sandbox in sandboxes
+            @test !ispath(sandbox)
+        end
+    end
+end
+
+# verbose builds route the subprocess output through the op's io (never the
+# process-global stdout/stderr) and skip the log file
+@testset "build: verbose output routes through io" begin
+    mktempdir() do dir
+        pkg = joinpath(dir, "VerbosePkg")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "deps"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "VerbosePkg"
+            uuid = "$VB_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "VerbosePkg.jl"), "module VerbosePkg\nend\n")
+        write(joinpath(pkg, "deps", "build.jl"), "println(\"verbose-build-marker\")\n")
+
+        env, depots = dev_fixture(dir, pkg)
+        iob = IOBuffer()
+        # an IOContext-wrapped io is unwrapped for the subprocess pipeline
+        BuildOps.build!(env, depots, [VB_UUID]; verbose = true, io = IOContext(iob, :color => false))
+        out = String(take!(iob))
+        @test occursin("Building", out)                  # the banner
+        @test occursin("verbose-build-marker", out)      # the subprocess output
+        @test !isfile(joinpath(pkg, "deps", "build.log"))
+
+        # a verbose failure still raises the pinned error, with the output
+        # in the io stream rather than a log tail
+        write(joinpath(pkg, "deps", "build.jl"), "error(\"verbose-kaboom-marker\")\n")
+        err = try
+            BuildOps.build!(env, depots, [VB_UUID]; verbose = true, io = iob)
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test err.msg == "Error building `VerbosePkg`"
+        @test occursin("verbose-kaboom-marker", String(take!(iob)))
+        @test !isfile(joinpath(pkg, "deps", "build.log"))
+    end
 end

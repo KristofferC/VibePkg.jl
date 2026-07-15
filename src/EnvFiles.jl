@@ -33,7 +33,7 @@ using TOML: TOML
 
 using ..Errors: pkgerror
 using ..Versions: VersionSpec, semver_spec
-using ..Utils: isurl, normalize_path_for_toml, denormalize_path_from_toml
+using ..Utils: isurl, normalize_path_for_toml, denormalize_path_from_toml, atomic_write
 
 export Compat, AppInfo, SourceSpec, RepoPackage, Project,
     Tracking, PathTracked, RepoTracked, RegistryTracked,
@@ -45,6 +45,7 @@ export Compat, AppInfo, SourceSpec, RepoPackage, Project,
     entry_repo_rev, entry_repo_subdir, entry_registries,
     is_path_tracked, is_repo_tracked, is_registry_tracked,
     with_project, with_manifest, with_entry,
+    manifest_dependents_map,
     check_manifest_julia_version_compat
 
 ###########
@@ -278,6 +279,23 @@ Base.keys(m::Manifest) = keys(m.deps)
 Base.values(m::Manifest) = values(m.deps)
 Base.pairs(m::Manifest) = pairs(m.deps)
 
+"""
+    manifest_dependents_map(m::Manifest) -> Dict{UUID, Vector{UUID}}
+
+Reverse dependency edges: for each uuid, the uuids of the manifest entries
+that list it as a dependency. Built in one pass so callers that need
+dependents of many packages avoid rescanning the manifest per package.
+"""
+function manifest_dependents_map(m::Manifest)
+    dependents = Dict{UUID, Vector{UUID}}()
+    for (uuid, entry) in m
+        for dep in values(entry.deps)
+            push!(get!(() -> UUID[], dependents, dep), uuid)
+        end
+    end
+    return dependents
+end
+
 ######################
 # Functional updates #
 ######################
@@ -493,9 +511,9 @@ function read_project_workspace(raw::Dict)
     workspace_table = Dict{String, Any}()
     for (key, val) in raw
         if key == "projects"
-            for path in val
-                path isa String || pkgerror("Expected entry in `projects` to be strings")
-            end
+            # an empty or heterogeneous TOML array parses as Vector{Any}
+            val isa Vector && all(x -> x isa String, val) ||
+                pkgerror("Expected `projects` in the `workspace` section to be a list of strings")
         else
             pkgerror("Invalid key `$key` in `workspace`")
         end
@@ -655,6 +673,18 @@ function destructure_project(project::Project)::Dict{String, Any}
     entry!("extras", project.extras)
     entry!("compat", Dict(name => x.str for (name, x) in project.compat))
     entry!("targets", project.targets)
+    appdict = Dict{String, Any}()
+    for (appname, appinfo) in project.apps
+        # start from the app's raw table so unrecognized keys survive; the
+        # typed fields overwrite (or remove) their raw counterparts
+        app_dict = Dict{String, Any}(appinfo.raw)
+        appinfo.submodule === nothing ? delete!(app_dict, "submodule") :
+            (app_dict["submodule"] = appinfo.submodule)
+        isempty(appinfo.julia_flags) ? delete!(app_dict, "julia_flags") :
+            (app_dict["julia_flags"] = appinfo.julia_flags)
+        appdict[appname] = app_dict
+    end
+    entry!("apps", appdict)
     entry!(
         "syntax", project.julia_syntax_version === nothing ? nothing :
             Dict("julia_version" => string(project.julia_syntax_version))
@@ -696,7 +726,7 @@ render_project(project::Project) = sprint(write_project, project)
 function write_project(project::Project, project_file::AbstractString)
     str = render_project(project)
     mkpath(dirname(project_file))
-    return write(project_file, str)
+    return atomic_write(project_file, str)
 end
 
 ####################
@@ -1217,7 +1247,7 @@ function write_manifest(manifest::Manifest, manifest_file::AbstractString)
     end
     str = render_manifest(manifest)
     mkpath(dirname(manifest_file))
-    return write(manifest_file, str)
+    return atomic_write(manifest_file, str)
 end
 
 ############

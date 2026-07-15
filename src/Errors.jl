@@ -12,7 +12,16 @@ struct PkgError <: Exception
 end
 
 pkgerror(msg::String) = throw(PkgError(msg))
-pkgerror(msg...) = throw(PkgError(join(msg)))
+
+"""
+    pkgerror(parts::AbstractString...)
+
+Throw a [`PkgError`](@ref) whose message is the concatenation of `parts`
+(a convenience for splitting long messages over several literals). Only
+strings are accepted — interpolate other values into the message instead
+of passing them as separate arguments.
+"""
+pkgerror(parts::AbstractString...) = throw(PkgError(join(parts)))
 
 Base.showerror(io::IO, err::PkgError) = print(io, err.msg)
 

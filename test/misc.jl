@@ -39,14 +39,41 @@ end
     end
 end
 
+# Utils.isurl is anchored: a URL must *start* with a Git-layer scheme or be
+# SCP-like (`user@host:path`). URL-looking substrings inside plain paths must
+# not count, and characters beyond the old regex's whitelist (`%`, `?`, ...)
+# must not disqualify a real URL.
+@testset "isurl" begin
+    isurl = VibePkg.Utils.isurl
+    # every scheme the Git layer accepts
+    @test isurl("https://github.com/JuliaLang/Example.jl.git")
+    @test isurl("http://example.com/repo")
+    @test isurl("git://example.com/Repo.jl")
+    @test isurl("ssh://git@server.com/repo.git")
+    @test isurl("file:///home/user/repo")
+    # scp-like forms, including non-`git` users
+    @test isurl("git@github.com:JuliaLang/Example.jl.git")
+    @test isurl("deploy@ghe.example.com:org/A.git")
+    # valid URL characters the old whitelist rejected
+    @test isurl("https://example.com/repo?ref=main&x=1")
+    @test isurl("https://example.com/some%20repo.git")
+    # paths that merely contain URL-looking substrings are paths
+    @test !isurl("mirror/https://example.com/repo")
+    @test !isurl("some/dir/ssh:copy")
+    @test !isurl("../local/path")
+    @test !isurl("/abs/local/path")
+    @test !isurl("C:\\Users\\me\\repo")
+    @test !isurl("relative/path/to/pkg")
+end
+
 # Pkg.jl api.jl "set number of concurrent requests" — the download concurrency
-# comes from JULIA_PKG_CONCURRENT_DOWNLOADS (default 8). Unlike Pkg (which
-# errors on 0), VibePkg clamps to at least 1 and falls back to 8 on garbage.
+# comes from JULIA_PKG_CONCURRENT_DOWNLOADS (default 8). Like Pkg, values
+# that are not positive integers are rejected with a PkgError.
 @testset "concurrent-download config" begin
     @test withenv(() -> Config().concurrency, "JULIA_PKG_CONCURRENT_DOWNLOADS" => nothing) == 8
     @test withenv(() -> Config().concurrency, "JULIA_PKG_CONCURRENT_DOWNLOADS" => "5") == 5
-    @test withenv(() -> Config().concurrency, "JULIA_PKG_CONCURRENT_DOWNLOADS" => "0") == 1
-    @test withenv(() -> Config().concurrency, "JULIA_PKG_CONCURRENT_DOWNLOADS" => "garbage") == 8
+    @test_throws VibePkg.Errors.PkgError withenv(() -> Config().concurrency, "JULIA_PKG_CONCURRENT_DOWNLOADS" => "0")
+    @test_throws VibePkg.Errors.PkgError withenv(() -> Config().concurrency, "JULIA_PKG_CONCURRENT_DOWNLOADS" => "garbage")
 end
 
 # Pkg.jl#4438 / issue #2728 — depot cache directories get a CACHEDIR.TAG file

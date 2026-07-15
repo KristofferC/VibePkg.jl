@@ -11,11 +11,12 @@ using TOML: TOML
 using FileWatching: mkpidlock
 
 using ..Errors: pkgerror
+using ..Utils: atomic_toml_write
 
 export DepotStack, depot_stack, depots, depots1, logdir,
     packages_dir, clones_dir, registries_dir, artifacts_dir,
     scratchspaces_dir, environments_dir, servers_dir, bin_dir,
-    find_installed, log_usage, atomic_toml_write
+    find_installed, log_usage, log_scratch_usage, atomic_toml_write
 
 struct DepotStack
     paths::Vector{String}
@@ -55,30 +56,10 @@ function find_installed(d::DepotStack, name::String, uuid::UUID, tree_hash::SHA1
     for depot in depots(d)
         for slug in (slug_default, Base.version_slug(uuid, tree_hash, 4))
             path = abspath(packages_dir(depot), name, slug)
-            ispath(path) && return path, true
+            isdir(path) && return path, true
         end
     end
     return abspath(packages_dir(depots1(d)), name, slug_default), false
-end
-
-"""
-    atomic_toml_write(path, data; kws...)
-
-Write TOML data via a temporary file + rename, preventing torn writes.
-"""
-function atomic_toml_write(path::String, data; kws...)
-    dir = dirname(path)
-    isempty(dir) && (dir = pwd())
-    temp_path, temp_io = mktemp(dir)
-    return try
-        TOML.print(temp_io, data; kws...)
-        close(temp_io)
-        mv(temp_path, path; force = true)
-    catch
-        close(temp_io)
-        rm(temp_path; force = true)
-        rethrow()
-    end
 end
 
 """
@@ -133,6 +114,74 @@ function log_usage(d::DepotStack, source_files, usage_filename::AbstractString)
                 end
             end
             usage[k] = [Dict("time" => isempty(times) ? timestamp : maximum(times))]
+        end
+
+        try
+            atomic_toml_write(usage_file, usage, sorted = true)
+        catch err
+            @error "Failed to write valid usage file `$usage_file`" exception = err
+        end
+    end
+    return
+end
+
+"""
+    log_scratch_usage(d, scratch_dir, parent_project)
+
+Record that the scratchspace at `scratch_dir` is used by `parent_project`,
+in `logs/scratch_usage.toml` of the first depot. GC keeps a scratchspace
+only while one of its recorded `parent_projects` files still exists, so —
+unlike [`log_usage`](@ref) — entries are keyed by the scratchspace path and
+`parent_projects` must be carried (and preserved for co-resident entries)
+through compaction.
+"""
+function log_scratch_usage(d::DepotStack, scratch_dir::AbstractString, parent_project::AbstractString)
+    dir = logdir(d)
+    !ispath(dir) && mkpath(dir)
+
+    usage_file = joinpath(dir, "scratch_usage.toml")
+    timestamp = now()
+
+    mkpidlock(usage_file * ".pid", stale_age = 3) do
+        usage = if isfile(usage_file)
+            try
+                TOML.parsefile(usage_file)
+            catch err
+                @warn "Failed to parse usage file `$usage_file`, ignoring." err
+                Dict{String, Any}()
+            end
+        else
+            Dict{String, Any}()
+        end
+
+        # record new usage (append; compaction below merges)
+        prev = get(usage, scratch_dir, nothing)
+        entries = prev isa Vector ? prev : Any[]
+        push!(entries, Dict{String, Any}("time" => timestamp, "parent_projects" => [String(parent_project)]))
+        usage[String(scratch_dir)] = entries
+
+        # keep one entry per key: the latest time and the union of
+        # parent_projects — GC's liveness key, which must never be dropped
+        for k in keys(usage)
+            entries = usage[k]
+            times = Dates.DateTime[]
+            parents = String[]
+            if entries isa Vector
+                for e in entries
+                    e isa AbstractDict || continue
+                    t = get(e, "time", nothing)
+                    t isa Union{Dates.Date, Dates.DateTime} && push!(times, Dates.DateTime(t))
+                    pps = get(e, "parent_projects", nothing)
+                    if pps isa Vector
+                        for p in pps
+                            p isa String && push!(parents, p)
+                        end
+                    end
+                end
+            end
+            keep = Dict{String, Any}("time" => isempty(times) ? timestamp : maximum(times))
+            isempty(parents) || (keep["parent_projects"] = unique!(parents))
+            usage[k] = [keep]
         end
 
         try

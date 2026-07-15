@@ -603,6 +603,19 @@ end
 # packed tarballs (unpacked directories under JULIA_PKG_UNPACK_REGISTRY),
 # git clones (fetch + ff-merge on update), and plain directory copies.
 
+# Callbacks run after any registry mutation (add / remove / update).
+# Higher layers (e.g. REPLMode's completion-name caches) register
+# invalidation hooks here; Registries cannot call them directly without
+# inverting the module layer order.
+const REGISTRY_CHANGE_HOOKS = Function[]
+
+function notify_registry_change!()
+    for hook in REGISTRY_CHANGE_HOOKS
+        hook()
+    end
+    return
+end
+
 function validate_registry_name(name::String)
     if isempty(name) || name in (".", "..") || occursin(r"[\\/:*?\"<>|]", name)
         pkgerror(
@@ -645,9 +658,10 @@ function server_registry_hashes(server::String; depots::Union{Nothing, DepotStac
 end
 
 # Read a single file's content out of a compressed tarball without
-# unpacking everything to disk. The callback must consume every entry's
-# data (read_tarball_simple has no skip support), so non-matches are
-# drained to devnull.
+# unpacking everything to disk. read_tarball_simple drains entries its
+# predicate rejects, but the callback must consume the data of every
+# entry it accepts — the accept-all predicate here means non-matches
+# are drained to devnull.
 function read_file_from_tarball(tarball::String, wanted::String)
     content = Ref{Union{Nothing, String}}(nothing)      # Ref: mutated in the callback, not reassigned
     buf = Vector{UInt8}(undef, Tar.DEFAULT_BUFFER_SIZE)
@@ -677,7 +691,21 @@ end
             pkgerror("downloaded registry $uuid does not match the expected tree hash $hash")
         reg_toml = read_file_from_tarball(tmp, "Registry.toml")
         reg_toml === nothing && pkgerror("registry tarball for $uuid is missing Registry.toml")
-        name = validate_registry_name(TOML.parse(reg_toml)["name"]::String)
+        reg_data = TOML.tryparse(reg_toml)
+        reg_data isa TOML.ParserError &&
+            pkgerror("registry tarball for $uuid has a malformed Registry.toml")
+        # the embedded uuid must be the one the server was asked for: a
+        # mismatched tarball must not be installed under the requested uuid
+        embedded = get(reg_data, "uuid", nothing)
+        embedded_uuid = embedded isa String ? tryparse(UUID, embedded) : nothing
+        embedded_uuid == uuid || pkgerror(
+            "Registry.toml in the registry downloaded for $uuid declares uuid " *
+                "`$(embedded_uuid === nothing ? "<missing or invalid>" : embedded_uuid)`"
+        )
+        reg_name = get(reg_data, "name", nothing)
+        reg_name isa String ||
+            pkgerror("registry tarball for $uuid has no `name` in Registry.toml")
+        name = validate_registry_name(reg_name)
 
         reg_dir = mkpath(registries_dir(depot))
         create_cachedir_tag(reg_dir)
@@ -800,6 +828,7 @@ function add_registry_from_source!(d::DepotStack, source::String; io::IO = stder
                 return name
             end
             mv(tmp, joinpath(reg_dir, name))
+            notify_registry_change!()
             printstyled(io, lpad("Installed", 12); color = :green, bold = true)
             println(io, " registry `$name` into the depot")
             return name
@@ -858,6 +887,7 @@ function add_default_registries!(
         printstyled(io, lpad("Installed", 12); color = :green, bold = true)
         println(io, " registry `$name` into the depot")
     end
+    isempty(added) || notify_registry_change!()
     return added
 end
 
@@ -887,6 +917,7 @@ function add_registry!(depots::DepotStack, spec::String; io::IO = stderr_f())
             name = mkpidlock(joinpath(registries_dir(depot), ".pid"), stale_age = 10) do
                 install_server_registry!(depot, server, known.uuid, hash; io)
             end
+            notify_registry_change!()
             printstyled(io, lpad("Installed", 12); color = :green, bold = true)
             println(io, " registry `$name` into the depot")
             return name
@@ -958,6 +989,7 @@ function remove_registry!(
             end
         end
     end
+    notify_registry_change!()
     return nothing
 end
 
@@ -1029,7 +1061,7 @@ persisted update log is more recent than `update_cooldown` are skipped
                 Dict{UUID, SHA1}()
             else
                 try
-                    server_registry_hashes(server)
+                    server_registry_hashes(server; depots = depots_arg)
                 catch err
                     err isa InterruptException && rethrow()
                     @error "Some registries failed to update:" exception = err
@@ -1053,7 +1085,13 @@ persisted update log is more recent than `update_cooldown` are skipped
             (uuid === nothing || current === nothing) && continue
             on_cooldown(uuid) && continue
             latest = latest_hash(uuid)
-            (latest === nothing || latest == current) && continue
+            latest === nothing && continue
+            if latest == current
+                # a successful server check that found the registry already
+                # current still refreshes the cooldown for later sessions
+                stamp!(uuid)
+                continue
+            end
             try
                 name = install_server_registry!(depot, server, uuid, latest; io)
                 push!(updated, name)
@@ -1092,7 +1130,12 @@ persisted update log is more recent than `update_cooldown` are skipped
                 end
                 on_cooldown(uuid) && continue
                 latest = latest_hash(uuid)
-                (latest === nothing || latest == current) && continue
+                latest === nothing && continue
+                if latest == current
+                    # already current: stamp the successful check (see above)
+                    stamp!(uuid)
+                    continue
+                end
                 basename(dir) == "General" && warn_general_registry_format("unpacked tarball")
                 try
                     name = install_server_registry!(depot, server, uuid, latest; io)
@@ -1106,6 +1149,7 @@ persisted update log is more recent than `update_cooldown` are skipped
         end
     end
     log_dirty[] && save_registry_update_log(depot, update_log)
+    isempty(updated) || notify_registry_change!()
     return updated
 end
 

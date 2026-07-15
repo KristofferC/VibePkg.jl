@@ -227,3 +227,84 @@ end
         @test isfile(joinpath(pkgdir, "src", "Example.jl"))
     end
 end
+
+if !@isdefined(make_test_registry)
+    include("testhelpers.jl")
+end
+
+# Regression: pkg_may_have_extensions must be conservative — it may return
+# false only when a registry that knows the exact version affirmatively
+# records no weakdeps for it. Otherwise (package or version unknown to every
+# registry) selective instantiate could skip a real extension provider.
+@testset "pkg_may_have_extensions is conservative" begin
+    mktempdir() do depot
+        make_test_registry(depot)   # Example: 0.5.0, 0.5.1, 1.0.0; WeakDeps for "1"
+        regs = reachable_registries(depot_stack([depot]))
+        may = VibePkg.Execution.pkg_may_have_extensions
+        # registry records weakdeps covering 1.0.0
+        @test may(regs, EXAMPLE_UUID, v"1.0.0")
+        # registry knows 0.5.0 and no weakdeps range covers it
+        @test !may(regs, EXAMPLE_UUID, v"0.5.0")
+        # version unknown to every registry → nothing rules extensions out
+        @test may(regs, EXAMPLE_UUID, v"0.6.0")
+        # package unknown to every registry → nothing rules extensions out
+        @test may(regs, UUID("deadbeef-dead-beef-dead-beefdeadbeef"), v"1.0.0")
+        # non-concrete version → always possible
+        @test may(regs, EXAMPLE_UUID, nothing)
+        # no registries at all → nothing rules extensions out
+        @test may(VibePkg.Registries.RegistryInstance[], EXAMPLE_UUID, v"1.0.0")
+    end
+end
+
+# bytes2hex helper mirroring Pkg.jl's `tree_hash` wrapper (new.jl:3517)
+th(root::AbstractString; kwargs...) = bytes2hex(tree_hash(root; kwargs...))
+
+@testset "git tree hash computation (parity)" begin
+    # Pkg.jl test/new.jl "git tree hash computation" (line 3519)
+    # -- executable-bit sensitivity matrix (new.jl:3531-3537) --------------
+    # Only git's user-exec bit (100755) affects the hash; group/other-exec
+    # bits do not. Hashes are git's actual command-line output.
+    mktempdir() do dir
+        file = joinpath(dir, "hello.txt")
+        open(file, write = true) do io
+            println(io, "Hello, world.")
+        end
+        chmod(file, 0o644)
+        @test "0a890bd10328d68f6d85efd2535e3a4c588ee8e6" == th(dir)
+        chmod(file, 0o645)  # other-x bit doesn't matter
+        @test "0a890bd10328d68f6d85efd2535e3a4c588ee8e6" == th(dir)
+        chmod(file, 0o654)  # group-x bit doesn't matter
+        @test "0a890bd10328d68f6d85efd2535e3a4c588ee8e6" == th(dir)
+        chmod(file, 0o744)  # user-x bit matters
+        @test "952cfce0fb589c02736482fa75f9f9bb492242f8" == th(dir)
+    end
+
+    # -- Foo vs FooGit: a .git subdirectory is excluded (new.jl:3557-3571) --
+    mktempdir() do dir
+        mkdir(joinpath(dir, "Foo"))
+        mkdir(joinpath(dir, "FooGit"))
+        mkdir(joinpath(dir, "FooGit", ".git"))
+        write(joinpath(dir, "Foo", "foo"), "foo")
+        chmod(joinpath(dir, "Foo", "foo"), 0o644)
+        write(joinpath(dir, "FooGit", "foo"), "foo")
+        chmod(joinpath(dir, "FooGit", "foo"), 0o644)
+        write(joinpath(dir, "FooGit", ".git", "foo"), "foo")
+        chmod(joinpath(dir, "FooGit", ".git", "foo"), 0o644)
+        @test th(joinpath(dir, "Foo")) ==
+            th(joinpath(dir, "FooGit")) ==
+            "2f42e2c1c1afd4ef8c66a2aaba5d5e1baddcab33"
+    end
+
+    # -- symlink whose name is a prefix of a sibling dir (new.jl:3573-3583) --
+    # "5.28" (symlink) must sort AFTER "5.28.1/" the way git sorts entries
+    # (directories compared as "name/"), so the tree hash matches git's.
+    if !Sys.iswindows()
+        mktempdir() do dir
+            mkdir(joinpath(dir, "5.28.1"))
+            write(joinpath(dir, "5.28.1", "foo"), "")
+            chmod(joinpath(dir, "5.28.1", "foo"), 0o644)
+            symlink("5.28.1", joinpath(dir, "5.28"))
+            @test th(dir) == "5e50a4254773a7c689bebca79e2954630cab9c04"
+        end
+    end
+end

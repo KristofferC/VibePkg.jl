@@ -149,14 +149,52 @@ end
         LibGit2.commit(repo, "add 0.6.0"; author = sig, committer = sig)
         LibGit2.close(repo)
 
-        updated = VibePkg.Registries.update_registries!(depots; server = nothing, io = devnull)
-        @test updated == ["TestRegistry"]
-        # fresh instance sees the new version (git dirs are not content-cached)
-        r = only(reachable_registries(depots))
-        info = registry_info(r, r[EXAMPLE_UUID])
-        @test haskey(info.version_info, v"0.6.0")
-        # nothing further to do
-        @test isempty(VibePkg.Registries.update_registries!(depots; server = nothing, io = devnull))
+        probe_hits = Ref(0)
+        probe = () -> (probe_hits[] += 1; nothing)
+        push!(VibePkg.Registries.REGISTRY_CHANGE_HOOKS, probe)
+        try
+            updated = VibePkg.Registries.update_registries!(depots; server = nothing, io = devnull)
+            @test updated == ["TestRegistry"]
+            @test probe_hits[] == 1    # a real update fires the change hooks
+            # fresh instance sees the new version (git dirs are not content-cached)
+            r = only(reachable_registries(depots))
+            info = registry_info(r, r[EXAMPLE_UUID])
+            @test haskey(info.version_info, v"0.6.0")
+            # nothing further to do
+            @test isempty(VibePkg.Registries.update_registries!(depots; server = nothing, io = devnull))
+            @test probe_hits[] == 1    # a no-op update does not
+        finally
+            filter!(h -> h !== probe, VibePkg.Registries.REGISTRY_CHANGE_HOOKS)
+        end
+    end
+end
+
+# registry mutations (add / remove) invalidate the completion-name caches
+# automatically, and callers get a copy they cannot poison the cache through
+@testset "registry mutations invalidate completion caches" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        old_depots = copy(Base.DEPOT_PATH)
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            VibePkg.REPLMode.reset_completion_cache!()
+            @test isempty(VibePkg.REPLMode.registered_package_names())
+            # registry add is visible without a manual cache reset
+            src = make_test_registry(mkpath(joinpath(dir, "src")))
+            VibePkg.Registry.add(src; io = devnull)
+            @test "Example" in VibePkg.REPLMode.registered_package_names()
+            @test !VibePkg.REPLMode.is_deprecated_package_name("Example")
+            # the returned vector is a copy: mutating it cannot poison the cache
+            names = VibePkg.REPLMode.registered_package_names()
+            push!(names, "Bogus")
+            @test !("Bogus" in VibePkg.REPLMode.registered_package_names())
+            # registry rm is visible too
+            VibePkg.Registry.rm("TestRegistry"; io = devnull)
+            @test isempty(VibePkg.REPLMode.registered_package_names())
+        finally
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.REPLMode.reset_completion_cache!()
+        end
     end
 end
 

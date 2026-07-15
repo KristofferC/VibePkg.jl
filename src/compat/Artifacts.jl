@@ -13,8 +13,9 @@ using Base.BinaryPlatforms: AbstractPlatform, HostPlatform, platforms_match, tri
 import TOML
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f, create_cachedir_tag, mv_temp_dir_retries
+using ..Utils: stderr_f, create_cachedir_tag, mv_temp_dir_retries, atomic_toml_write
 using ..Depots: depot_stack, depots1, artifacts_dir, log_usage
+using FileWatching: mkpidlock
 import ..ArtifactOps
 import ..TreeHash
 
@@ -95,6 +96,20 @@ function create_artifact(f::Function; legacy_symlink_size::Bool = false)
     end
 end
 
+# whether a `[[<name>]]` entry binds a platform semantically equivalent to
+# `platform` (per `platforms_match`); entries with an unrecognized shape or
+# no recoverable platform never match and are kept as-is
+function entry_platform_matches(x, name::String, artifacts_toml::String, platform::AbstractPlatform)
+    x isa Dict{String, Any} || return false
+    p = unpack_platform(x, name, artifacts_toml)
+    return p !== nothing && platforms_match(platform, p)
+end
+
+# bind/unbind are parse-modify-write transactions on a shared file: serialize
+# them with a pidlock and replace the file atomically
+transact_artifacts_toml(f::Function, artifacts_toml::String) =
+    mkpidlock(f, artifacts_toml * ".pid", stale_age = 20)
+
 # a `[[<name>.download]]` entry from `(url, sha256[, size])` tuples
 function download_entry_dict(info::Tuple)
     url = String(info[1])
@@ -124,36 +139,34 @@ function bind_artifact!(
         download_info::Union{Vector{<:Tuple}, Nothing} = nothing,
         lazy::Bool = false, force::Bool = false,
     )
-    artifact_dict = isfile(artifacts_toml) ? TOML.parsefile(artifacts_toml) : Dict{String, Any}()
-    if !force && haskey(artifact_dict, name)
-        existing = artifact_dict[name]
-        if !isa(existing, Vector) || platform === nothing
-            pkgerror("Mapping for '$name' within $(artifacts_toml) already exists!")
-        else
-            plat = platform
-            matches(x) = x isa Dict{String, Any} &&
-                (p = unpack_platform(x, name, artifacts_toml); p !== nothing && platforms_match(plat, p))
-            any(matches, existing) &&
-                pkgerror("Mapping for '$name'/$(triplet(plat)) within $(artifacts_toml) already exists!")
+    transact_artifacts_toml(artifacts_toml) do
+        artifact_dict = isfile(artifacts_toml) ? TOML.parsefile(artifacts_toml) : Dict{String, Any}()
+        if !force && haskey(artifact_dict, name)
+            existing = artifact_dict[name]
+            if !isa(existing, Vector) || platform === nothing
+                pkgerror("Mapping for '$name' within $(artifacts_toml) already exists!")
+            else
+                plat = platform
+                any(x -> entry_platform_matches(x, name, artifacts_toml, plat), existing) &&
+                    pkgerror("Mapping for '$name'/$(triplet(plat)) within $(artifacts_toml) already exists!")
+            end
         end
-    end
-    meta = Dict{String, Any}("git-tree-sha1" => string(hash))
-    lazy && (meta["lazy"] = true)
-    download_info === nothing || (meta["download"] = download_entry_dict.(download_info))
-    if platform === nothing
-        artifact_dict[name] = meta
-    else
-        pack_platform!(meta, platform)
-        entries = get(artifact_dict, name, nothing)
-        entries = entries isa Vector ? entries : Any[]
-        # one entry per platform: an identical platform is replaced
-        # (entries with an unrecognized shape are kept as-is)
-        filter!(x -> !(x isa Dict{String, Any}) || unpack_platform(x, name, artifacts_toml) != platform, entries)
-        push!(entries, meta)
-        artifact_dict[name] = entries
-    end
-    open(artifacts_toml, "w") do io
-        TOML.print(io, artifact_dict; sorted = true)
+        meta = Dict{String, Any}("git-tree-sha1" => string(hash))
+        lazy && (meta["lazy"] = true)
+        download_info === nothing || (meta["download"] = download_entry_dict.(download_info))
+        if platform === nothing
+            artifact_dict[name] = meta
+        else
+            pack_platform!(meta, platform)
+            entries = get(artifact_dict, name, nothing)
+            entries = entries isa Vector ? entries : Any[]
+            # one entry per platform: a semantically equivalent platform is
+            # replaced (entries with an unrecognized shape are kept as-is)
+            filter!(x -> !entry_platform_matches(x, name, artifacts_toml, platform), entries)
+            push!(entries, meta)
+            artifact_dict[name] = entries
+        end
+        atomic_toml_write(artifacts_toml, artifact_dict; sorted = true)
     end
     log_usage(depot_stack(), artifacts_toml, "artifact_usage.toml")
     return nothing
@@ -170,22 +183,22 @@ function unbind_artifact!(
         platform::Union{AbstractPlatform, Nothing} = nothing,
     )
     isfile(artifacts_toml) || return nothing
-    artifact_dict = TOML.parsefile(artifacts_toml)
-    haskey(artifact_dict, name) || return nothing
-    if platform === nothing
-        delete!(artifact_dict, name)
-    else
-        entries = artifact_dict[name]
-        # a platform-agnostic binding (single table) has no per-platform
-        # entry to remove
-        entries isa Vector || return nothing
-        artifact_dict[name] = filter(
-            x -> !(x isa Dict{String, Any}) || unpack_platform(x, name, artifacts_toml) != platform,
-            entries,
-        )
-    end
-    open(artifacts_toml, "w") do io
-        TOML.print(io, artifact_dict; sorted = true)
+    transact_artifacts_toml(artifacts_toml) do
+        artifact_dict = TOML.parsefile(artifacts_toml)
+        haskey(artifact_dict, name) || return nothing
+        if platform === nothing
+            delete!(artifact_dict, name)
+        else
+            entries = artifact_dict[name]
+            # a platform-agnostic binding (single table) has no per-platform
+            # entry to remove
+            entries isa Vector || return nothing
+            artifact_dict[name] = filter(
+                x -> !entry_platform_matches(x, name, artifacts_toml, platform),
+                entries,
+            )
+        end
+        atomic_toml_write(artifacts_toml, artifact_dict; sorted = true)
     end
     return nothing
 end

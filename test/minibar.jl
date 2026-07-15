@@ -25,6 +25,14 @@ using VibePkg.MiniProgressBars
     show_progress(io, bar)
     @test occursin("25.0 %", String(take!(io.io)))
 
+    # the exported default has an empty header: `split("")` is empty, which
+    # must not throw a BoundsError when picking the styled first word
+    bar = MiniProgressBar(mode = :percentage, always_reprint = true)
+    bar.max = 4; bar.current = 1
+    io = IOContext(IOBuffer(), :displaysize => (24, 80))
+    show_progress(io, bar)
+    @test occursin("25.0 %", String(take!(io.io)))
+
     # Pkg.jl#3581: unchanged state emits nothing; a redraw is one \r-anchored
     # line with no cursor-movement escapes
     bar = MiniProgressBar(header = "Updating", mode = :percentage)
