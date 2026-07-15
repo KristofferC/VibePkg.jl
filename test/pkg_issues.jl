@@ -224,7 +224,7 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin(r"expected package.*to exist at path", sprint(showerror, err))
+            @test occursin(r"Package .* is expected at path", sprint(showerror, err))
 
             # Conflict variant from the report: the manifest entry ALSO carries a
             # repo url and a git-tree-sha1 alongside the (missing) path. `path`
@@ -252,7 +252,7 @@ end
                 e
             end
             @test err2 isa PkgError
-            @test occursin(r"expected package.*to exist at path", sprint(showerror, err2))
+            @test occursin(r"Package .* is expected at path", sprint(showerror, err2))
         end
     end
 end
@@ -1811,7 +1811,7 @@ end
             end
             @test err isa PkgError
             @test !(err isa ArgumentError)
-            @test occursin("invalid version specifier", sprint(showerror, err))
+            @test occursin("invalid version specifier", lowercase(sprint(showerror, err)))
 
             # Control: the same spec without the build tag resolves fine.
             env2 = plan_add(env, regs, cfg, [PackageRequest("Example", nothing, "0.5.1")])
@@ -2468,7 +2468,12 @@ end
             env = load_environment(envdir; depots)
 
             # develop records a valid path-tracked direct dep, not a broken orphan
-            developed = plan_develop(env, regs, Config(depots), devpkg)
+            # Pkg's test harness disables sysimage-version respect while it
+            # substitutes external stdlibs. Mirror that explicit escape hatch:
+            # Random is itself baked into the running sysimage.
+            developed = plan_develop(
+                env, regs, Config(depots; respect_sysimage_versions = false), devpkg,
+            )
             @test haskey(developed.manifest, random_uuid)
             @test is_path_tracked(developed.manifest[random_uuid])
             @test developed.project.deps["Random"] == random_uuid
@@ -3160,7 +3165,7 @@ end
             end
             @test err isa PkgError
             @test !(err isa ArgumentError)
-            @test occursin("invalid version specifier", sprint(showerror, err))
+            @test occursin("invalid version specifier", lowercase(sprint(showerror, err)))
         end
     end
 end
@@ -3488,7 +3493,7 @@ end
             depots, name, meta; server = "https://pkgserver.invalid", io = devnull,
         )
         msg = sprint(showerror, err.value)
-        @test occursin("failed to install artifact", msg)
+        @test occursin("failed to install artifact", lowercase(msg))
         @test occursin("https://blocked.invalid/foo.tar.gz", msg)
         @test occursin("https://pkgserver.invalid", msg)
 
@@ -3497,7 +3502,7 @@ end
             depots, name, meta; server = nothing, io = devnull,
         )
         msg2 = sprint(showerror, err2.value)
-        @test occursin("failed to install artifact", msg2)
+        @test occursin("failed to install artifact", lowercase(msg2))
         @test occursin("https://blocked.invalid/foo.tar.gz", msg2)
     end
 end

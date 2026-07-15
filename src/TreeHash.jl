@@ -73,7 +73,7 @@ function blob_hash(
         # silently verify (or mis-verify) corrupt trees, so read failures
         # must propagate rather than degrade to a warning.
         e isa InterruptException && rethrow()
-        error("failed to read $(repr(path)) while computing git-tree-sha1: $(sprint(showerror, e))")
+        error("Failed to read $(repr(path)) while computing its Git blob hash: $(sprint(showerror, e))")
     end
 
     return SHA.digest!(ctx)
@@ -85,7 +85,7 @@ blob_hash(path::AbstractString; legacy_symlink_size::Bool = false) =
 # empty directories, so they are excluded from hashing.
 function contains_files(path::AbstractString)
     st = lstat(path)
-    ispath(st) || throw(ArgumentError("non-existent path: $(repr(path))"))
+    ispath(st) || throw(ArgumentError("Path $(repr(path)) does not exist"))
     isdir(st) || return true
     for p in readdir(path)
         contains_files(joinpath(path, p)) && return true
@@ -105,7 +105,7 @@ function tree_hash(
         ::Type{HashType}, root::AbstractString;
         legacy_symlink_size::Bool = false,
     ) where {HashType}
-    isdir(root) || throw(ArgumentError("tree_hash root is not a directory: $(repr(root))"))
+    isdir(root) || throw(ArgumentError("tree_hash requires an existing directory; got $(repr(root))"))
     entries = Tuple{String, Vector{UInt8}, GitMode}[]
     for f in sort(readdir(root; join = true); by = f -> gitmode(f) == mode_dir ? f * "/" : f)
         basename(f) == ".git" && continue

@@ -94,7 +94,7 @@ end
 
 function historical_stdlibs_check()
     return if isempty(STDLIBS_BY_VERSION)
-        pkgerror("If you want to set `julia_version`, you must first populate the `STDLIBS_BY_VERSION` global constant.  Try `using HistoricalStdlibVersions`")
+        pkgerror("Historical stdlib metadata is unavailable. Load it with `using HistoricalStdlibVersions` before setting julia_version")
     end
 end
 
@@ -109,7 +109,7 @@ function get_last_stdlibs(julia_version::VersionNumber; use_historical_for_curre
     last_version = nothing
     for (version, stdlibs) in STDLIBS_BY_VERSION
         if !isnothing(last_version) && last_version > version
-            pkgerror("STDLIBS_BY_VERSION must be sorted by version number")
+            pkgerror("Historical stdlib metadata is out of order at Julia $version after $last_version; versions must be sorted")
         end
         if VersionNumber(julia_version.major, julia_version.minor, julia_version.patch) < version
             break
@@ -119,7 +119,7 @@ function get_last_stdlibs(julia_version::VersionNumber; use_historical_for_curre
     end
     # Serving different patches is safe-ish; different majors/minors is not.
     if last_version !== nothing && (last_version.major != julia_version.major || last_version.minor != julia_version.minor)
-        pkgerror("Could not find a julia version in STDLIBS_BY_VERSION that matches the major & minor version of requested julia_version v$(julia_version)")
+        pkgerror("No historical stdlib data matches Julia $julia_version (major.minor $(julia_version.major).$(julia_version.minor))")
     end
     return last_stdlibs
 end

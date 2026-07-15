@@ -15,7 +15,7 @@ module REPLMode
 using Base: UUID
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f, unstableio, URL_SCHEME_RE
+using ..Utils: stderr_f, unstableio, URL_SCHEME_RE, expanduser_path
 using ..Configs: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR,
     PRESERVE_ALL_INSTALLED, PRESERVE_ALL, PRESERVE_DIRECT, PRESERVE_SEMVER,
     PRESERVE_NONE, PRESERVE_TIERED_INSTALLED, PRESERVE_TIERED
@@ -36,8 +36,9 @@ const TEST_MODE = Ref(false)
 #################
 
 # `--preserve=<opt>` values (Pkg's `do_preserve` table)
+const PRESERVE_VALUES = "installed, all, direct, semver, none, tiered_installed, or tiered"
 function do_preserve(x::Union{Nothing, String})
-    x === nothing && pkgerror("option `preserve` requires an argument")
+    x === nothing && pkgerror("Option --preserve requires a value; expected $PRESERVE_VALUES")
     x == "installed" && return PRESERVE_ALL_INSTALLED
     x == "all" && return PRESERVE_ALL
     x == "direct" && return PRESERVE_DIRECT
@@ -45,7 +46,7 @@ function do_preserve(x::Union{Nothing, String})
     x == "none" && return PRESERVE_NONE
     x == "tiered_installed" && return PRESERVE_TIERED_INSTALLED
     x == "tiered" && return PRESERVE_TIERED
-    pkgerror("`$x` is not a valid argument for `--preserve`.")
+    pkgerror("Invalid --preserve value $(repr(x)); expected $PRESERVE_VALUES")
 end
 
 # How positional words are interpreted before reaching the API function.
@@ -218,7 +219,7 @@ function show_help(io::IO, cmd::Union{Nothing, String} = nothing)
         println(io, "  ", rpad("app", 14), "app add|develop|rm|update|status")
     else
         spec = get(specs, cmd, nothing)
-        spec === nothing && pkgerror("`$cmd` is not a recognized command")
+        spec === nothing && pkgerror("Unknown command $(repr(cmd)). Type ? to list available commands")
         println(io, "  ", replace(spec.help, "\n" => "\n  "))
         if !isempty(spec.opts)
             println(io, "\n  options: ", join(sort!(["--" * k for k in keys(spec.opts)]), " "))
@@ -246,12 +247,13 @@ function tokenize_words(s::AbstractString; comma_break::Bool = false)
     words = Word[]
     buf = IOBuffer()
     quote_char = nothing
+    quote_position = 0
     flush_word!(isquoted) = begin
         w = String(take!(buf))
         isempty(w) || push!(words, Word(w, isquoted))
         return
     end
-    for c in s
+    for (char_position, c) in enumerate(s)
         if quote_char !== nothing
             if c == quote_char
                 quote_char = nothing
@@ -262,13 +264,14 @@ function tokenize_words(s::AbstractString; comma_break::Bool = false)
         elseif c == '"' || c == '\''
             flush_word!(false)
             quote_char = c
+            quote_position = char_position
         elseif isspace(c) || (comma_break && c == ',')
             flush_word!(false)
         else
             write(buf, c)
         end
     end
-    quote_char === nothing || pkgerror("unterminated quote in command")
+    quote_char === nothing || pkgerror("Unterminated quote beginning at character $quote_position")
     flush_word!(false)
     return words
 end
@@ -436,13 +439,13 @@ end
 function identifier_fields(word::String)
     looks_like_url(word) && return (; url = word)
     if is_path_like(word)
-        # `expanduser` throws a bare ArgumentError for unsupported `~user`
+        # Path expansion throws a bare ArgumentError for unsupported `~user`
         # forms; surface it as a clean pkgerror instead.
         path = try
-            expanduser(word)
+            expanduser_path(word)
         catch err
             err isa ArgumentError || rethrow()
-            pkgerror("cannot expand path `$word`: $(err.msg)")
+            pkgerror("Could not expand path $(repr(word)): $(sprint(showerror, err))")
         end
         return (; path)
     end
@@ -451,7 +454,7 @@ function identifier_fields(word::String)
     uuid = nothing
     if (i = findfirst('=', name)) !== nothing
         uuid_str = String(strip(name[nextind(name, i):end]))
-        occursin(UUID_RE, uuid_str) || pkgerror("unable to parse `$word` as a package")
+        occursin(UUID_RE, uuid_str) || pkgerror("Malformed package token $(repr(word)): expected NAME=UUID with a valid UUID")
         uuid = UUID(uuid_str)
         name = String(strip(name[1:prevind(name, i)]))
     end
@@ -469,18 +472,18 @@ function fold_package_tokens(tokens::Vector{PkgTok})
     i = firstindex(tokens)
     while i <= lastindex(tokens)
         tok = tokens[i]
-        tok isa PkgId || pkgerror("package name/uuid must precede $(modifier_desc(tok))")
+        tok isa PkgId || pkgerror("Package name or UUID must precede $(modifier_desc(tok))")
         version = rev = subdir = nothing
         i += 1
         while i <= lastindex(tokens) && !((m = tokens[i]) isa PkgId)
             if m isa VerTok
-                version === nothing || pkgerror("multiple version specifiers for one package")
+                version === nothing || pkgerror("Package $(repr(tok.val)) has multiple version specifiers")
                 version = m.val
             elseif m isa RevTok
-                rev === nothing || pkgerror("multiple revision specifiers for one package")
+                rev === nothing || pkgerror("Package $(repr(tok.val)) has multiple revision specifiers")
                 rev = m.val
             else
-                subdir === nothing || pkgerror("multiple subdir specifiers for one package")
+                subdir === nothing || pkgerror("Package $(repr(tok.val)) has multiple subdirectory specifiers")
                 subdir = m.val
             end
             i += 1
@@ -515,7 +518,7 @@ end
 help_command(cmd::String...; io::IO = stderr_f()) = show_help(io, isempty(cmd) ? nothing : cmd[1])
 
 function parse_statement(words::Vector{Word})
-    isempty(words) && pkgerror("no command given")
+    isempty(words) && pkgerror("No command was provided; type ? to list available commands")
     cmdword = words[1].raw
     if cmdword == "?" || cmdword == "help" || startswith(cmdword, "?")
         cmd = if cmdword in ("?", "help")
@@ -526,50 +529,51 @@ function parse_statement(words::Vector{Word})
         return ParsedCommand(help_command, cmd === nothing ? Any[] : Any[cmd], Dict{Symbol, Any}())
     end
     if cmdword == "app"
-        length(words) >= 2 || pkgerror("`app` requires a subcommand (add, develop, rm, update, status)")
+        length(words) >= 2 || pkgerror("app requires a subcommand; expected add, develop, rm, update, or status")
         sub = words[2].raw
         rest = [w.raw for w in words[3:end]]
         Apps = getfield(parentmodule(API), :Apps)
         if sub in ("add",)
-            length(rest) == 1 || pkgerror("`app add` takes one package")
+            length(rest) == 1 || pkgerror("app add expects exactly one package; usage: app add PACKAGE")
             return ParsedCommand(Apps.add, Any[rest[1]], Dict{Symbol, Any}())
         elseif sub in ("dev", "develop")
-            length(rest) == 1 || pkgerror("`app develop` takes one path")
+            length(rest) == 1 || pkgerror("app develop expects exactly one path; usage: app develop PATH")
             return ParsedCommand(Apps.develop, Any[rest[1]], Dict{Symbol, Any}())
         elseif sub in ("rm", "remove")
-            length(rest) == 1 || pkgerror("`app rm` takes one name")
+            length(rest) == 1 || pkgerror("app rm expects exactly one name; usage: app rm NAME")
             return ParsedCommand(Apps.rm, Any[rest[1]], Dict{Symbol, Any}())
         elseif sub in ("up", "update")
-            length(rest) <= 1 || pkgerror("`app update` takes at most one name")
+            length(rest) <= 1 || pkgerror("app update expects at most one name; usage: app update [NAME]")
             return ParsedCommand(Apps.update, Any[rest...], Dict{Symbol, Any}())
         elseif sub in ("st", "status")
             return ParsedCommand(Apps.status, Any[rest...], Dict{Symbol, Any}())
         else
-            pkgerror("`app $sub` is not a recognized command")
+            pkgerror("Unknown app subcommand $(repr(sub)); expected add, develop, rm, update, or status")
         end
     end
     if cmdword == "registry"
-        length(words) >= 2 || pkgerror("`registry` requires a subcommand (add, remove, update, status)")
+        length(words) >= 2 || pkgerror("registry requires a subcommand; expected add, remove, update, or status")
         sub = words[2].raw
         rest = [w.raw for w in words[3:end]]
         fn = if sub in ("add",)
             VibePkgRegistryAdd
         elseif sub in ("rm", "remove")
-            isempty(rest) && pkgerror("`registry rm` requires at least one registry")
+            isempty(rest) && pkgerror("registry rm requires at least one registry; usage: registry rm NAME|UUID")
             VibePkgRegistryRm
         elseif sub in ("up", "update")
             VibePkgRegistryUpdate
         elseif sub in ("st", "status")
-            isempty(rest) || pkgerror("`registry status` takes no arguments")
+            isempty(rest) || pkgerror("registry status accepts no arguments; usage: registry status")
             VibePkgRegistryStatus
         else
-            pkgerror("`registry $sub` is not a recognized command")
+            pkgerror("Unknown registry subcommand $(repr(sub)); expected add, remove, update, or status")
         end
         return ParsedCommand(fn, Any[rest...], Dict{Symbol, Any}())
     end
     spec = get(command_specs(), cmdword, nothing)
-    spec === nothing && pkgerror("`$cmdword` is not a recognized command")
+    spec === nothing && pkgerror("Unknown command $(repr(cmdword)). Type ? to list available commands")
     opts = Dict{Symbol, Any}()
+    option_for_kwarg = Dict{Symbol, String}()
     positional = Word[]
     for w in words[2:end]
         word = w.raw
@@ -581,27 +585,40 @@ function parse_statement(words::Vector{Word})
                 body, nothing
             end
             optspec = get(spec.opts, key, nothing)
-            optspec === nothing && pkgerror("invalid option `--$key` for command `$(spec.canonical)`")
+            optspec === nothing && pkgerror(
+                "Invalid option --$key for command $(spec.canonical); valid options are " *
+                    (isempty(spec.opts) ? "none" : join(sort!(collect("--" * k for k in keys(spec.opts))), ", "))
+            )
             kwarg, fixed_value = optspec
+            if haskey(option_for_kwarg, kwarg)
+                previous = option_for_kwarg[kwarg]
+                pkgerror("Conflicting options $previous and --$key for command $(spec.canonical)")
+            end
+            option_for_kwarg[kwarg] = "--$key"
             opts[kwarg] = if fixed_value isa Function
                 fixed_value(val)
             elseif fixed_value === nothing
                 val
             else
-                val === nothing || pkgerror("option `--$key` does not take an argument")
+                val === nothing || pkgerror("Option --$key does not accept a value")
                 fixed_value
             end
         elseif startswith(word, "-") && length(word) == 2
             long = get(spec.shorts, word[2:end], nothing)
-            long === nothing && pkgerror("invalid option `$word` for command `$(spec.canonical)`")
+            long === nothing && pkgerror("Invalid option $word for command $(spec.canonical); type ?$(spec.canonical) for help")
             kwarg, fixed_value = spec.opts[long]
+            if haskey(option_for_kwarg, kwarg)
+                previous = option_for_kwarg[kwarg]
+                pkgerror("Conflicting options $previous and $word for command $(spec.canonical)")
+            end
+            option_for_kwarg[kwarg] = word
             opts[kwarg] = fixed_value
         else
             push!(positional, w)
         end
     end
     length(positional) in spec.arg_count ||
-        pkgerror("wrong number of arguments for `$(spec.canonical)`")
+        pkgerror("Wrong number of arguments for $(spec.canonical); usage: $(first(split(spec.help, '\n')))")
 
     args = if spec.arg_kind === :requests
         tokens = PkgTok[]
@@ -612,12 +629,23 @@ function parse_statement(words::Vector{Word})
         if spec.canonical ∉ ("add", "develop")
             for s in specs
                 (s.url === nothing && s.path === nothing) ||
-                    pkgerror("urls and paths are only valid for `add` and `develop`")
+                    pkgerror("URLs and paths are supported only by add and develop; command $(spec.canonical) received $(repr(something(s.url, s.path)))")
             end
         end
         Any[specs]
     elseif spec.arg_kind === :splat
-        Any[(w.raw for w in positional)...]
+        vals = String[w.raw for w in positional]
+        if spec.canonical in ("activate", "generate")
+            for i in eachindex(vals)
+                vals[i] = try
+                    expanduser_path(vals[i])
+                catch err
+                    err isa ArgumentError || rethrow()
+                    pkgerror("Could not expand path $(repr(vals[i])): $(sprint(showerror, err))")
+                end
+            end
+        end
+        Any[vals...]
     elseif spec.arg_kind === :strings
         isempty(positional) ? Any[] : Any[String[w.raw for w in positional]]
     else
@@ -809,8 +837,8 @@ function completions_for(partial::AbstractString)
                 names = vcat(registered_package_names(), stdlib_names())
                 filter(n -> !startswith(n, word) || !is_deprecated_package_name(n), names)
             elseif spec.canonical == "activate"
-                base = isempty(word) ? "." : (isdir(expanduser(word)) ? word : dirname(word))
-                dir = expanduser(base)
+                base = isempty(word) ? "." : (isdir(expanduser_path(word)) ? word : dirname(word))
+                dir = expanduser_path(base)
                 isdir(dir) ? [joinpath(base == "." ? "" : base, d) for d in readdir(dir) if isdir(joinpath(dir, d))] : String[]
             else
                 String[]

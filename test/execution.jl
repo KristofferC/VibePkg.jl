@@ -126,6 +126,78 @@ end
     end
 end
 
+# Pkg.jl new.jl "Depot setup" (line 30) — the first public add in a clean
+# world bootstraps General, and changing a registry-tracked dependency's
+# version keeps every content-addressed install available in the shared depot.
+@testset "first add bootstraps General and preserves versioned installs" begin
+    fx = LocalPkgServer.ensure!()
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+
+            @test !ispath(joinpath(depot, "registries"))
+            @test !isfile(joinpath(envdir, "Project.toml"))
+
+            versions = VersionNumber.(LocalPkgServer.VERSIONS)
+            installed = Dict{VersionNumber, String}()
+            for version in versions
+                VibePkg.add(PackageSpec(name = "Example", version = version); io = devnull)
+                if version == first(versions)
+                    regs = reachable_registries(depot_stack(); read_from_tarball = true)
+                    @test any(r -> registry_name(r) == "General", regs)
+                    @test isfile(joinpath(depot, "registries", "General.toml"))
+                    @test isfile(joinpath(envdir, "Project.toml"))
+                    @test isfile(joinpath(envdir, "Manifest.toml"))
+                end
+                info = VibePkg.dependencies()[EXAMPLE]
+                expected_hash = SHA1(fx.version_hashes[string(version)])
+                expected_source = joinpath(
+                    depot, "packages", "Example", Base.version_slug(EXAMPLE, expected_hash),
+                )
+
+                @test info.version == version
+                @test info.is_direct_dep && info.is_tracking_registry
+                @test !info.is_tracking_path && !info.is_tracking_repo
+                @test info.source == expected_source
+                @test SHA1(tree_hash(info.source)) == expected_hash
+                @test TOML.parsefile(joinpath(info.source, "Project.toml"))["version"] == string(version)
+                installed[version] = info.source
+
+                # A later add only changes the active manifest entry: every
+                # source tree installed by an earlier add remains untouched.
+                @test length(unique(values(installed))) == length(installed)
+                @test all(isdir, values(installed))
+                for (old_version, old_source) in installed
+                    @test TOML.parsefile(joinpath(old_source, "Project.toml"))["version"] ==
+                        string(old_version)
+                    @test SHA1(tree_hash(old_source)) ==
+                        SHA1(fx.version_hashes[string(old_version)])
+                end
+            end
+
+            for cache in ("registries", "packages")
+                tag = joinpath(depot, cache, "CACHEDIR.TAG")
+                @test isfile(tag)
+                @test startswith(read(tag, String), "Signature: 8a477f597d28d172789f06886806bc55")
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end
+
 # Pkg.jl#1491 — instantiate installs the manifest's pinned version even when
 # the registry has yanked it (instantiate never consults registry versions)
 @testset "instantiate at a yanked version" begin
@@ -189,42 +261,6 @@ end
         installed = instantiate!(env, regs, Config(depots); io = devnull)
         @test any(i -> i.uuid == EXAMPLE, installed)
         @test isfile(joinpath(depot, "packages", "Example", Base.version_slug(EXAMPLE, SHA1(hash)), "src", "Example.jl"))
-    end
-end
-
-# Pkg.jl new.jl "Issue #2931" — a registry-tracked manifest entry that records
-# a tree hash but no version still resolves and materializes; after its install
-# directory is deleted, a re-instantiate downloads it again.
-@testset "instantiate a versionless entry and re-download (#2931)" begin
-    fx = LocalPkgServer.ensure!()
-    h = fx.version_hashes["0.5.5"]
-    mktempdir() do dir
-        depot = mkpath(joinpath(dir, "depot"))
-        depots = depot_stack([depot])
-        VibePkg.Registries.add_default_registries!(depots; io = devnull)
-        regs = reachable_registries(depots; read_from_tarball = true)
-        envdir = mkpath(joinpath(dir, "env"))
-        write(joinpath(envdir, "Project.toml"), "[deps]\nExample = \"$EXAMPLE\"\n")
-        write(
-            joinpath(envdir, "Manifest.toml"), """
-            julia_version = "$VERSION"
-            manifest_format = "2.0"
-
-            [[deps.Example]]
-            uuid = "$EXAMPLE"
-            git-tree-sha1 = "$h"
-            """
-        )
-        env = load_environment(envdir; depots)
-        pkgdir = joinpath(depot, "packages", "Example", Base.version_slug(EXAMPLE, SHA1(h)))
-
-        @test any(i -> i.uuid == EXAMPLE, instantiate!(env, regs, Config(depots); io = devnull))
-        @test isfile(joinpath(pkgdir, "src", "Example.jl"))
-
-        # delete the install dir → a fresh instantiate re-materializes it
-        Base.rm(pkgdir; recursive = true, force = true)
-        @test any(i -> i.uuid == EXAMPLE, instantiate!(env, regs, Config(depots); io = devnull))
-        @test isfile(joinpath(pkgdir, "src", "Example.jl"))
     end
 end
 

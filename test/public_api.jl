@@ -11,6 +11,9 @@ end
 LocalPkgServer.isolate!()
 
 using Test
+using Logging
+using LibGit2
+import TOML
 using Base: UUID
 using VibePkg
 using VibePkg.Configs: Config
@@ -201,7 +204,7 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("Cannot modify a readonly environment", err.msg)
+            @test occursin("Cannot modify read-only environment", err.msg)
 
             # An old snapshot has readonly=false, but it must not be able to
             # bypass the current environment's guard. The rejected write also
@@ -285,6 +288,138 @@ end
     end
 end
 
+@testset "test op: allow_reresolve recovers a yanked manifest version" begin
+    mktempdir() do dir
+        fx = LocalPkgServer.ensure!()
+        depot = mkpath(joinpath(dir, "depot"))
+        pkg = mkpath(joinpath(dir, "ReresolvePkg"))
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        pkg_uuid = UUID("cccccccc-1111-2222-3333-444444444444")
+
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "ReresolvePkg"
+            uuid = "$pkg_uuid"
+            version = "0.1.0"
+
+            [deps]
+            Example = "$EXAMPLE_UUID"
+
+            [compat]
+            Example = "0.5"
+
+            [extras]
+            Test = "$TEST_UUID"
+
+            [targets]
+            test = ["Test"]
+            """
+        )
+        write(
+            joinpath(pkg, "src", "ReresolvePkg.jl"),
+            "module ReresolvePkg\nimport Example\nexample_version() = Base.pkgversion(Example)\nend\n",
+        )
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using Test, ReresolvePkg
+            @test ReresolvePkg.example_version() == v"0.5.0"
+            """
+        )
+
+        # A tiny registry whose package trees are served by LocalPkgServer.
+        # Version 0.5.1 remains in the checked-in manifest below but has been
+        # yanked from the registry, while 0.5.0 is the surviving fallback.
+        regpkg = mkpath(joinpath(depot, "registries", "YankedRegistry", "E", "Example"))
+        write(
+            joinpath(depot, "registries", "YankedRegistry", "Registry.toml"), """
+            name = "YankedRegistry"
+            uuid = "23338594-aafe-5451-b93e-139f81909106"
+            repo = "https://example.invalid/YankedRegistry"
+
+            [packages]
+            $EXAMPLE_UUID = { name = "Example", path = "E/Example" }
+            """
+        )
+        open(joinpath(regpkg, "Package.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    "name" => "Example",
+                    "uuid" => string(EXAMPLE_UUID),
+                    "repo" => fx.git_repo,
+                ),
+            )
+        end
+        write(
+            joinpath(regpkg, "Versions.toml"), """
+            ["0.5.0"]
+            git-tree-sha1 = "$(fx.version_hashes["0.5.0"])"
+
+            ["0.5.1"]
+            git-tree-sha1 = "$(fx.version_hashes["0.5.1"])"
+            yanked = true
+            """
+        )
+        write(
+            joinpath(pkg, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.Example]]
+            git-tree-sha1 = "$(fx.version_hashes["0.5.1"])"
+            uuid = "$EXAMPLE_UUID"
+            version = "0.5.1"
+
+            [[deps.ReresolvePkg]]
+            deps = ["Example"]
+            path = "."
+            uuid = "$pkg_uuid"
+            version = "0.1.0"
+            """
+        )
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot_path = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(pkg, "Project.toml")
+            copy!(Base.DEPOT_PATH, [depot])
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+
+            # The child must use the same fresh depot into which this API call
+            # installs the recovered package source.
+            withenv("JULIA_DEPOT_PATH" => depot) do
+                # Preserve-exact must expose the broken checked-in manifest when
+                # fallback is forbidden.
+                @test_throws VibePkg.Resolve.ResolverError VibePkg.test(
+                    ; allow_reresolve = false, io = devnull,
+                )
+
+                # With fallback enabled, exercise the real public sandbox flow:
+                # resolve fails, plan_up picks 0.5.0, its source is installed from
+                # the local server, and the test subprocess observes that version.
+                output = IOBuffer()
+                test_error = try
+                    VibePkg.test(; allow_reresolve = true, io = output)
+                    nothing
+                catch err
+                    err
+                end
+                text = String(take!(output))
+                test_error === nothing || println(stderr, text)
+                @test test_error === nothing
+                @test occursin("Could not use exact versions", text)
+                @test occursin("Successfully re-resolved", text)
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot_path)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end
+
 @testset "precompile options" begin
     mktempdir() do dir
         with_api_env(dir) do proj, depot
@@ -357,6 +492,106 @@ end
     end
 end
 
+# Pkg.jl api.jl "Pkg.precompile" — the mutating API operations that promise
+# auto-precompilation really populate the cache, and an immediately following
+# manual precompile is consequently a no-op.  A local Git repository exercises
+# both add and branch-update without a registry or network connection.
+@testset "auto-precompile triggers and no-op detection" begin
+    old_auto = API.AUTO_PRECOMPILE_ENABLED[]
+    try
+        API.AUTO_PRECOMPILE_ENABLED[] = true
+        @test withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+            API.should_autoprecompile()
+        end
+        @test !withenv("JULIA_PKG_PRECOMPILE_AUTO" => "false") do
+            API.should_autoprecompile()
+        end
+        API.AUTO_PRECOMPILE_ENABLED[] = false
+        @test !withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+            API.should_autoprecompile()
+        end
+        API.AUTO_PRECOMPILE_ENABLED[] = true
+
+        mktempdir() do dir
+            with_api_env(dir) do proj, depot
+                pkg = joinpath(dir, "AutoPrecompilePkg")
+                mkpath(joinpath(pkg, "src"))
+                mkpath(joinpath(pkg, "deps"))
+                project_file = joinpath(pkg, "Project.toml")
+                source_file = joinpath(pkg, "src", "AutoPrecompilePkg.jl")
+                write(
+                    project_file, """
+                    name = "AutoPrecompilePkg"
+                    uuid = "dddddddd-aaaa-bbbb-cccc-111111111111"
+                    version = "0.1.0"
+                    """
+                )
+                write(source_file, "module AutoPrecompilePkg\nconst VALUE = 1\nend\n")
+                write(joinpath(pkg, "deps", "build.jl"), "nothing\n")
+
+                repo = LibGit2.init(pkg)
+                try
+                    sig = LibGit2.Signature("fixture", "fixture@localhost")
+                    LibGit2.add!(repo, ".")
+                    LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+                    head = LibGit2.head(repo)
+                    branch = try
+                        LibGit2.shortname(head)
+                    finally
+                        close(head)
+                    end
+
+                    function assert_triggered_then_noop(f)
+                        io = IOBuffer()
+                        f(io)
+                        @test occursin("Precompiling", String(take!(io)))
+                        VibePkg.precompile(; io)
+                        @test !occursin("Precompiling", String(take!(io)))
+                    end
+
+                    withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+                        # add precompiles only the requested package/closure
+                        assert_triggered_then_noop() do io
+                            VibePkg.add(PackageSpec(path = pkg, rev = branch); io)
+                        end
+
+                        # Clearing the cache makes build's auto-precompile
+                        # observable without relying on source timestamp granularity.
+                        cache = joinpath(
+                            depot, "compiled", "v$(VERSION.major).$(VERSION.minor)",
+                            "AutoPrecompilePkg",
+                        )
+                        Base.rm(cache; force = true, recursive = true)
+                        assert_triggered_then_noop() do io
+                            VibePkg.build("AutoPrecompilePkg"; io)
+                        end
+
+                        # Move the tracked branch. `up` must fetch the new tree and
+                        # precompile it; the follow-up manual call must see it cached.
+                        write(
+                            project_file, """
+                            name = "AutoPrecompilePkg"
+                            uuid = "dddddddd-aaaa-bbbb-cccc-111111111111"
+                            version = "0.1.1"
+                            """
+                        )
+                        write(source_file, "module AutoPrecompilePkg\nconst VALUE = 2\nend\n")
+                        LibGit2.add!(repo, ".")
+                        LibGit2.commit(repo, "update"; author = sig, committer = sig)
+                        assert_triggered_then_noop() do io
+                            VibePkg.update("AutoPrecompilePkg"; io)
+                        end
+                    end
+                finally
+                    close(repo)
+                end
+            end
+        end
+    finally
+        API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+    end
+end
+
 # Pkg.jl api.jl "Pkg.precompile" (no-op detection) + "waiting for trailing
 # tasks" — precompiling twice is a no-op the second time; precompile-time
 # stderr from a package (trailing IO) is surfaced; and a package that errors
@@ -409,6 +644,82 @@ end
             end
             @test err !== nothing
             @test occursin("BrokenDep", sprint(showerror, err))
+        end
+    end
+end
+
+# Pkg.jl api.jl's circular-precompile regression: Base.Precompilation must
+# diagnose a cycle instead of trying to schedule it (and potentially
+# deadlocking).  Keep the graph entirely local; the manifest is all Base needs
+# to discover the cycle, so this test never resolves or contacts a registry.
+@testset "precompile diagnoses circular dependencies" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        packages = mkpath(joinpath(dir, "packages"))
+        names = ["CircularDep1", "CircularDep2", "CircularDep3"]
+        uuids = [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+        ]
+
+        for (i, name) in pairs(names)
+            next = mod1(i + 1, length(names))
+            pkg = mkpath(joinpath(packages, name))
+            mkpath(joinpath(pkg, "src"))
+            write(
+                joinpath(pkg, "Project.toml"),
+                "name = \"$name\"\nuuid = \"$(uuids[i])\"\nversion = \"0.1.0\"\n\n" *
+                    "[deps]\n$(names[next]) = \"$(uuids[next])\"\n",
+            )
+            write(joinpath(pkg, "src", "$name.jl"), "module $name\nend\n")
+        end
+
+        write(
+            joinpath(envdir, "Project.toml"),
+            "[deps]\n" * join(
+                ("$(names[i]) = \"$(uuids[i])\"" for i in eachindex(names)), "\n"
+            ) * "\n",
+        )
+        entries = String[]
+        for (i, name) in pairs(names)
+            next = mod1(i + 1, length(names))
+            push!(
+                entries, """
+                [[deps.$name]]
+                deps = ["$(names[next])"]
+                path = "../packages/$name"
+                uuid = "$(uuids[i])"
+                version = "0.1.0"
+                """
+            )
+        end
+        write(
+            joinpath(envdir, "Manifest.toml"),
+            "julia_version = \"$VERSION\"\nmanifest_format = \"2.0\"\n\n" *
+                join(entries, "\n"),
+        )
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depot_path = copy(Base.DEPOT_PATH)
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            copy!(Base.DEPOT_PATH, [depot])
+            precompile_output = IOBuffer()
+            log_output = IOBuffer()
+            withenv("JULIA_PKG_OFFLINE" => "true") do
+                # Julia 1.12 emits the diagnostic with @warn; newer Base
+                # versions may write it to `io`. Capture both public channels.
+                with_logger(SimpleLogger(log_output, Logging.Warn)) do
+                    VibePkg.precompile(; io = precompile_output)
+                end
+            end
+            output = String(take!(precompile_output)) * String(take!(log_output))
+            @test occursin("Circular dependency detected", output)
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depot_path)
         end
     end
 end
@@ -544,5 +855,77 @@ end
         holding, maxv, _ = cinfo
         @test maxv == v"0.9.0"
         @test "julia" in holding                  # RegB must not vouch for 0.9.0
+    end
+end
+
+if :version in fieldnames(Base.PkgOrigin)
+    @testset "sysimage functionality" begin
+        old_sysimage_modules = copy(Base._sysimage_modules)
+        old_pkgorigins = copy(Base.pkgorigins)
+        old_respect = API.RESPECT_SYSIMAGE_VERSIONS[]
+        pkgid = Base.PkgId(EXAMPLE_UUID, "Example")
+        try
+            # Base.in_sysimage consults these mutable tables, so this exercises
+            # the real public-operation branches without building a custom
+            # sysimage. The local package server supplies every registry/tree
+            # involved below.
+            pkgid in Base._sysimage_modules || push!(Base._sysimage_modules, pkgid)
+            Base.pkgorigins[pkgid] = Base.PkgOrigin(nothing, nothing, v"0.5.1")
+
+            LocalPkgServer.ensure!()
+            mktempdir() do dir
+                depot = mkpath(joinpath(dir, "depot"))
+                project = mkpath(joinpath(dir, "project"))
+                old_active = Base.ACTIVE_PROJECT[]
+                old_depot_path = copy(Base.DEPOT_PATH)
+                old_gate = API.UPDATED_REGISTRY_THIS_SESSION[]
+                try
+                    Base.ACTIVE_PROJECT[] = joinpath(project, "Project.toml")
+                    copy!(Base.DEPOT_PATH, [depot])
+                    # Bootstrap General from the local server, then avoid an
+                    # unnecessary second registry refresh in each operation.
+                    API.UPDATED_REGISTRY_THIS_SESSION[] = true
+
+                    VibePkg.respect_sysimage_versions()
+                    @test API.RESPECT_SYSIMAGE_VERSIONS[]
+                    VibePkg.add("Example"; io = devnull)
+                    env = load_environment(; depots = depot_stack([depot]))
+                    @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.1"
+
+                    output = sprint(io -> VibePkg.status(; outdated = true, io))
+                    @test occursin("Example v0.5.1", output)
+                    @test occursin("[sysimage]", output)
+
+                    @test_throws PkgError VibePkg.add(
+                        ; name = "Example", rev = "master", io = devnull,
+                    )
+                    @test_throws PkgError VibePkg.develop("Example"; io = devnull)
+
+                    # Disabling the guard restores ordinary resolution and
+                    # permits both repository tracking operations.
+                    VibePkg.respect_sysimage_versions(false)
+                    @test !API.RESPECT_SYSIMAGE_VERSIONS[]
+                    VibePkg.add("Example"; io = devnull)
+                    env = load_environment(; depots = depot_stack([depot]))
+                    @test entry_version(env.manifest[EXAMPLE_UUID]) != v"0.5.1"
+
+                    VibePkg.add(; name = "Example", rev = "master", io = devnull)
+                    env = load_environment(; depots = depot_stack([depot]))
+                    @test VibePkg.EnvFiles.is_repo_tracked(env.manifest[EXAMPLE_UUID])
+
+                    VibePkg.develop("Example"; io = devnull)
+                    env = load_environment(; depots = depot_stack([depot]))
+                    @test VibePkg.EnvFiles.is_path_tracked(env.manifest[EXAMPLE_UUID])
+                finally
+                    Base.ACTIVE_PROJECT[] = old_active
+                    copy!(Base.DEPOT_PATH, old_depot_path)
+                    API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+                end
+            end
+        finally
+            copy!(Base._sysimage_modules, old_sysimage_modules)
+            copy!(Base.pkgorigins, old_pkgorigins)
+            VibePkg.respect_sysimage_versions(old_respect)
+        end
     end
 end

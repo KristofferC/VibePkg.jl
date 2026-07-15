@@ -9,6 +9,7 @@ using Test
 using Sockets
 using LibGit2
 import Dates
+import TOML
 using Base: UUID, SHA1
 using VibePkg
 using VibePkg.Configs: Config
@@ -270,6 +271,66 @@ end
     end
 end
 
+@testset "corrupt server-registry tree hash forces refresh" begin
+    state = LocalPkgServer.ensure!()
+    expected_hash = SHA1(state.registry_hash)
+    corrupt_hash = "179182faa6a80b3cf24445e6f55c954938d57941"
+    @test SHA1(corrupt_hash) != expected_hash
+
+    for unpack in (nothing, "true")
+        mktempdir() do depot
+            depots = depot_stack([depot])
+            withenv("JULIA_PKG_UNPACK_REGISTRY" => unpack) do
+                @test Registries.add_default_registries!(depots; io = devnull) == ["General"]
+
+                registries = joinpath(depot, "registries")
+                reg_dir = joinpath(registries, "General")
+                stub_file = joinpath(registries, "General.toml")
+                tarballs = filter(
+                    isfile,
+                    [joinpath(registries, "General$ext") for ext in (".tar.gz", ".tar.zst")],
+                )
+                @test isempty(tarballs) == (unpack == "true")
+
+                # Forge only the recorded content identity. The registry data
+                # remain usable, but update must not mistake them for current.
+                if unpack == "true"
+                    open(joinpath(reg_dir, ".tree_info.toml"), "w") do io
+                        TOML.print(io, Dict("git-tree-sha1" => corrupt_hash))
+                    end
+                else
+                    @test length(tarballs) == 1
+                    open(stub_file, "w") do io
+                        TOML.print(
+                            io,
+                            Dict(
+                                "git-tree-sha1" => corrupt_hash,
+                                "uuid" => LocalPkgServer.GENERAL_UUID,
+                                "path" => basename(only(tarballs)),
+                            ),
+                        )
+                    end
+                end
+
+                @test Registries.update_registries!(depots; io = devnull) == ["General"]
+                tree_info_file = unpack == "true" ?
+                    joinpath(reg_dir, ".tree_info.toml") : stub_file
+                @test SHA1(TOML.parsefile(tree_info_file)["git-tree-sha1"]) == expected_hash
+
+                regs = reachable_registries(depots; read_from_tarball = unpack != "true")
+                general = only(filter(r -> registry_name(r) == "General", regs))
+                @test general.tree_info == expected_hash
+                @test !isempty(Registries.uuids_from_name(general, "Example"))
+
+                Registries.remove_registry!(
+                    depots, "General", UUID(LocalPkgServer.GENERAL_UUID); io = devnull,
+                )
+                @test readdir(registries) == ["CACHEDIR.TAG"]
+            end
+        end
+    end
+end
+
 # A counting front for the fixture server: serves the same files, tallying
 # hits on the /registries endpoint (the request every registry update makes).
 function start_counting_server(files::String, hits::Ref{Int})
@@ -494,6 +555,150 @@ end
     end
 end
 
+# Pkg.jl manifests.jl "Instantiate with non-default registry from manifest"
+# (line 417) — registry provenance is actionable, not just metadata. A fresh
+# depot which has some other registry installed must install the custom
+# registry named by Manifest.toml before materializing a registry-tracked
+# package. Both registry and package sources are local git repositories, so
+# this exercises the public API without network access.
+@testset "instantiate installs non-default registry from manifest" begin
+    mktempdir() do dir
+        pkg_uuid = UUID("19c274d2-4aeb-4c41-a775-86db79acb842")
+        reg_uuid = UUID("4d88b79e-6e4c-4f2c-b57b-6c413f0295de")
+        sentinel_uuid = UUID("87bc0461-8087-488d-a175-5f47cfb3d491")
+
+        # The registered package source and its exact git tree hash.
+        pkg_src = mkpath(joinpath(dir, "TestPkg"))
+        mkpath(joinpath(pkg_src, "src"))
+        write(
+            joinpath(pkg_src, "Project.toml"),
+            "name = \"TestPkg\"\nuuid = \"$pkg_uuid\"\nversion = \"0.1.0\"\n",
+        )
+        write(
+            joinpath(pkg_src, "src", "TestPkg.jl"),
+            "module TestPkg\ngreet() = \"Hello from TestPkg!\"\nend\n",
+        )
+        pkg_repo = LibGit2.init(pkg_src)
+        LibGit2.add!(pkg_repo, ".")
+        sig = LibGit2.Signature("fixture", "fixture@localhost")
+        LibGit2.commit(pkg_repo, "initial"; author = sig, committer = sig)
+        pkg_obj = LibGit2.GitObject(pkg_repo, "HEAD")
+        pkg_tree = LibGit2.peel(LibGit2.GitTree, pkg_obj)
+        pkg_hash = SHA1(string(LibGit2.GitHash(pkg_tree)))
+        close(pkg_tree)
+        close(pkg_obj)
+        close(pkg_repo)
+
+        # A custom git-backed registry whose source path is recorded as the
+        # manifest registry URL.
+        reg_src = mkpath(joinpath(dir, "CustomReg-source"))
+        reg_pkg = mkpath(joinpath(reg_src, "T", "TestPkg"))
+        open(joinpath(reg_src, "Registry.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    "name" => "CustomReg",
+                    "uuid" => string(reg_uuid),
+                    "repo" => reg_src,
+                    "packages" => Dict(
+                        string(pkg_uuid) => Dict("name" => "TestPkg", "path" => "T/TestPkg"),
+                    ),
+                ),
+            )
+        end
+        open(joinpath(reg_pkg, "Package.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict("name" => "TestPkg", "uuid" => string(pkg_uuid), "repo" => pkg_src),
+            )
+        end
+        open(joinpath(reg_pkg, "Versions.toml"), "w") do io
+            TOML.print(io, Dict("0.1.0" => Dict("git-tree-sha1" => string(pkg_hash))))
+        end
+        reg_repo = LibGit2.init(reg_src)
+        LibGit2.add!(reg_repo, ".")
+        LibGit2.commit(reg_repo, "initial"; author = sig, committer = sig)
+        close(reg_repo)
+
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        depots = depot_stack([depot])
+
+        # Suppress default-General bootstrap without installing CustomReg.
+        # This also proves instantiate handles one missing registry among an
+        # already nonempty reachable-registry set.
+        sentinel = mkpath(joinpath(dir, "Sentinel-source"))
+        open(joinpath(sentinel, "Registry.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    "name" => "Sentinel",
+                    "uuid" => string(sentinel_uuid),
+                    "repo" => sentinel,
+                    "packages" => Dict{String, Any}(),
+                ),
+            )
+        end
+        Registries.add_registry_from_source!(depots, sentinel; io = devnull)
+
+        open(joinpath(envdir, "Project.toml"), "w") do io
+            TOML.print(io, Dict("deps" => Dict("TestPkg" => string(pkg_uuid))))
+        end
+        open(joinpath(envdir, "Manifest.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    "julia_version" => string(VERSION),
+                    "manifest_format" => "2.1",
+                    "deps" => Dict(
+                        "TestPkg" => [
+                            Dict(
+                                "uuid" => string(pkg_uuid),
+                                "version" => "0.1.0",
+                                "git-tree-sha1" => string(pkg_hash),
+                                "registries" => ["CustomReg"],
+                            ),
+                        ],
+                    ),
+                    "registries" => Dict(
+                        "CustomReg" => Dict(
+                            "uuid" => string(reg_uuid),
+                            "url" => reg_src,
+                        ),
+                    ),
+                ),
+            )
+        end
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            withenv("JULIA_PKG_SERVER" => "") do
+                @test !any(r -> registry_uuid(r) == reg_uuid, reachable_registries(depot_stack()))
+
+                VibePkg.instantiate(; io = devnull)
+
+                regs = reachable_registries(depot_stack())
+                @test any(r -> registry_uuid(r) == reg_uuid, regs)
+                @test isfile(joinpath(depot, "registries", "CustomReg", "Registry.toml"))
+                installed = only(filter(isdir, readdir(joinpath(depot, "packages", "TestPkg"); join = true)))
+                @test occursin(
+                    "Hello from TestPkg!",
+                    read(joinpath(installed, "src", "TestPkg.jl"), String),
+                )
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+    end
+end
+
 # a git registry fixture with a configurable name/uuid (Pkg.jl#3249 needs
 # two distinct git-backed registries in one depot)
 function make_named_git_registry(dir::String; name::String, uuid::String)
@@ -526,6 +731,195 @@ function make_named_git_registry(dir::String; name::String, uuid::String)
     LibGit2.commit(repo, "registry"; author = sig, committer = sig)
     close(repo)
     return dir
+end
+
+# Pkg.jl registry.jl "registries" — exercise the complete lifecycle through
+# both public string API and the executed REPL driver. RegistrySpec objects and
+# vector overloads are not part of VibePkg's API; its equivalent spellings are
+# name, bare uuid, and name=uuid strings.
+@testset "registry lifecycle identity spellings" begin
+    mktempdir() do dir
+        reg_name = "LifecycleReg"
+        reg_uuid = UUID("8c6f2c42-9126-4f21-bfe5-a51d6962227b")
+        example_uuid = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+        source = make_named_git_registry(
+            joinpath(dir, "source"); name = reg_name, uuid = string(reg_uuid),
+        )
+        depot = mkpath(joinpath(dir, "depot"))
+        old_depots = copy(Base.DEPOT_PATH)
+        old_defaults = copy(Registries.DEFAULT_REGISTRIES)
+        revision = Ref(0)
+
+        function publish_version!()
+            revision[] += 1
+            version = VersionNumber(0, 6, revision[])
+            tree_hash = lpad(string(revision[]; base = 16), 40, '0')
+            versions_file = joinpath(source, "E", "Example", "Versions.toml")
+            write(
+                versions_file, read(versions_file, String) * """
+
+                    ["$version"]
+                    git-tree-sha1 = "$tree_hash"
+                    """
+            )
+            repo = LibGit2.GitRepo(source)
+            try
+                LibGit2.add!(repo, ".")
+                sig = LibGit2.Signature("fixture", "fixture@localhost")
+                LibGit2.commit(repo, "add $version"; author = sig, committer = sig)
+            finally
+                close(repo)
+            end
+            return version
+        end
+
+        function assert_installed(version = v"0.5.0")
+            regs = reachable_registries(depot_stack())
+            @test length(regs) == 1
+            reg = only(regs)
+            @test registry_name(reg) == reg_name && registry_uuid(reg) == reg_uuid
+            @test haskey(reg, example_uuid)
+            @test haskey(registry_info(reg, reg[example_uuid]).version_info, version)
+            return
+        end
+
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            empty!(Registries.DEFAULT_REGISTRIES)
+            push!(
+                Registries.DEFAULT_REGISTRIES,
+                (name = reg_name, uuid = reg_uuid, url = source),
+            )
+            withenv("JULIA_PKG_SERVER" => "") do
+                spellings = (reg_name, string(reg_uuid), "$reg_name=$reg_uuid")
+
+                # Public facade: add, targeted update, and rm all accept each
+                # supported identity spelling.
+                for spec in spellings
+                    VibePkg.Registry.add(spec; io = devnull)
+                    assert_installed()
+                    version = publish_version!()
+                    Base.rm(Registries.registry_update_log_file(depot); force = true)
+                    VibePkg.Registry.update(spec; io = devnull)
+                    assert_installed(version)
+                    VibePkg.Registry.rm(spec; io = devnull)
+                    @test isempty(reachable_registries(depot_stack()))
+                end
+
+                # No-argument API add installs the configured defaults.
+                VibePkg.Registry.add(; io = devnull)
+                assert_installed()
+                VibePkg.Registry.rm(reg_name; io = devnull)
+                @test isempty(reachable_registries(depot_stack()))
+
+                # Execute the same round trips through the real REPL driver.
+                for spec in spellings
+                    VibePkg.REPLMode.do_cmd("registry add $spec"; io = devnull)
+                    assert_installed()
+                    version = publish_version!()
+                    Base.rm(Registries.registry_update_log_file(depot); force = true)
+                    VibePkg.REPLMode.do_cmd("registry up $spec"; io = devnull)
+                    assert_installed(version)
+                    VibePkg.REPLMode.do_cmd("registry rm $spec"; io = devnull)
+                    @test isempty(reachable_registries(depot_stack()))
+                end
+
+                # The REPL no-argument spelling follows the same bootstrap path.
+                VibePkg.REPLMode.do_cmd("registry add"; io = devnull)
+                assert_installed()
+                VibePkg.REPLMode.do_cmd("registry rm $reg_name"; io = devnull)
+                @test isempty(reachable_registries(depot_stack()))
+            end
+        finally
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            append!(empty!(Registries.DEFAULT_REGISTRIES), old_defaults)
+        end
+    end
+end
+
+# UUID selectors must remain UUID selectors below the public facade. In
+# particular, registries in different depots may share a declared name;
+# resolving a later-depot UUID back to that name would wrongly update the
+# same-named registry in the primary depot.
+@testset "registry update preserves UUID identity" begin
+    mktempdir() do dir
+        reg_name = "SharedName"
+        uuid_a = UUID("58e09b9d-877b-470f-95c9-7d2aa51c0ad1")
+        uuid_b = UUID("7108527d-3576-4111-9d63-99d296a2d51a")
+        example_uuid = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+        source_a = make_named_git_registry(
+            joinpath(dir, "source-a"); name = reg_name, uuid = string(uuid_a),
+        )
+        source_b = make_named_git_registry(
+            joinpath(dir, "source-b"); name = reg_name, uuid = string(uuid_b),
+        )
+        depot_a = mkpath(joinpath(dir, "depot-a"))
+        depot_b = mkpath(joinpath(dir, "depot-b"))
+        installed_a = joinpath(mkpath(joinpath(depot_a, "registries")), reg_name)
+        installed_b = joinpath(mkpath(joinpath(depot_b, "registries")), reg_name)
+        close(LibGit2.clone(source_a, installed_a))
+        close(LibGit2.clone(source_b, installed_b))
+        old_depots = copy(Base.DEPOT_PATH)
+
+        function publish_version!(source, version, tree_hash)
+            versions_file = joinpath(source, "E", "Example", "Versions.toml")
+            write(
+                versions_file, read(versions_file, String) * """
+
+                    ["$version"]
+                    git-tree-sha1 = "$tree_hash"
+                    """
+            )
+            repo = LibGit2.GitRepo(source)
+            try
+                LibGit2.add!(repo, ".")
+                sig = LibGit2.Signature("fixture", "fixture@localhost")
+                LibGit2.commit(repo, "add $version"; author = sig, committer = sig)
+            finally
+                close(repo)
+            end
+            return
+        end
+        function has_version(path, version)
+            reg = Registries.RegistryInstance(path)
+            return haskey(registry_info(reg, reg[example_uuid]).version_info, version)
+        end
+
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot_a, depot_b])
+            withenv("JULIA_PKG_SERVER" => "") do
+                regs = reachable_registries(depot_stack())
+                @test Set(registry_name.(regs)) == Set([reg_name])
+                @test Set(registry_uuid.(regs)) == Set([uuid_a, uuid_b])
+
+                version_a = v"0.6.1"
+                version_b = v"0.7.1"
+                publish_version!(source_a, version_a, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                publish_version!(source_b, version_b, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+                # B is reachable but not primary. Its UUID must not collapse
+                # to the shared name and accidentally update primary A.
+                VibePkg.Registry.update(string(uuid_b); io = devnull)
+                @test !has_version(installed_a, version_a)
+                @test !has_version(installed_b, version_b)
+
+                # Once B is primary, name=uuid reaches exactly B; UUID is
+                # authoritative, matching Pkg's RegistrySpec search rule.
+                append!(empty!(Base.DEPOT_PATH), [depot_b, depot_a])
+                VibePkg.REPLMode.do_cmd("registry up $reg_name=$uuid_b"; io = devnull)
+                @test !has_version(installed_a, version_a)
+                @test has_version(installed_b, version_b)
+
+                # Switching back lets the bare UUID advance only A.
+                append!(empty!(Base.DEPOT_PATH), [depot_a, depot_b])
+                VibePkg.Registry.update(string(uuid_a); io = devnull)
+                @test has_version(installed_a, version_a)
+                @test has_version(installed_b, version_b)
+            end
+        finally
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+        end
+    end
 end
 
 # Pkg.jl#3249 — a registry whose remote is broken must not abort updating
@@ -566,7 +960,7 @@ end
         close(repo)
 
         # the broken one is reported (not thrown), the good one updates
-        updated = @test_logs (:error, r"failed to update") match_mode = :any begin
+        updated = @test_logs (:error, r"(?i)failed to update") match_mode = :any begin
             Registries.update_registries!(depots; server = nothing, io = devnull)
         end
         @test updated == ["ZGood"]
@@ -575,28 +969,87 @@ end
     end
 end
 
-# Pkg.jl registry.jl "multiple registries in one command" — the variadic
-# Registry.add / Registry.rm operate on several registries in a single call.
-@testset "add/rm multiple registries in one call" begin
+# Pkg.jl registry.jl "multiple registries in one command" — VibePkg's
+# variadic string API and REPL driver operate on several registries per call.
+@testset "add/update/rm multiple registries in one call" begin
     mktempdir() do dir
-        mkreg(name, uuid) = (
-            src = mkpath(joinpath(dir, name));
-            write(
-                joinpath(src, "Registry.toml"),
-                "name = \"$name\"\nuuid = \"$uuid\"\nrepo = \"https://example.com/$name.git\"\n\n[packages]\n",
-            );
-            src
+        s1 = make_named_git_registry(
+            joinpath(dir, "source-one");
+            name = "RegOne", uuid = "11111111-1111-1111-1111-111111111111",
         )
-        s1 = mkreg("RegOne", "11111111-1111-1111-1111-111111111111")
-        s2 = mkreg("RegTwo", "22222222-2222-2222-2222-222222222222")
+        s2 = make_named_git_registry(
+            joinpath(dir, "source-two");
+            name = "RegTwo", uuid = "22222222-2222-2222-2222-222222222222",
+        )
+        depot = mkpath(joinpath(dir, "depot"))
+        old_depots = copy(Base.DEPOT_PATH)
+        example_uuid = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
 
-        VibePkg.Registry.add(s1, s2; io = devnull)          # one call → two registries
-        out = sprint(io -> VibePkg.Registry.status(; io))
-        @test occursin("RegOne", out) && occursin("RegTwo", out)
+        function publish_version!(source, version, tree_hash)
+            versions_file = joinpath(source, "E", "Example", "Versions.toml")
+            write(
+                versions_file, read(versions_file, String) * """
 
-        VibePkg.Registry.rm("RegOne", "RegTwo"; io = devnull) # one call → both removed
-        out2 = sprint(io -> VibePkg.Registry.status(; io))
-        @test !occursin("RegOne", out2) && !occursin("RegTwo", out2)
+                    ["$version"]
+                    git-tree-sha1 = "$tree_hash"
+                    """
+            )
+            repo = LibGit2.GitRepo(source)
+            try
+                LibGit2.add!(repo, ".")
+                sig = LibGit2.Signature("fixture", "fixture@localhost")
+                LibGit2.commit(repo, "add $version"; author = sig, committer = sig)
+            finally
+                close(repo)
+            end
+            return
+        end
+        function registry_has_version(name, version)
+            reg = only(filter(r -> registry_name(r) == name, reachable_registries(depot_stack())))
+            return haskey(registry_info(reg, reg[example_uuid]).version_info, version)
+        end
+
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            withenv("JULIA_PKG_SERVER" => "") do
+                # Public API: each lifecycle operation is one variadic call.
+                VibePkg.Registry.add(s1, s2; io = devnull)
+                out = sprint(io -> VibePkg.Registry.status(; io))
+                @test occursin("RegOne", out) && occursin("RegTwo", out)
+
+                publish_version!(s1, v"0.6.0", "2222222222222222222222222222222222222222")
+                publish_version!(s2, v"0.6.0", "3333333333333333333333333333333333333333")
+                VibePkg.Registry.update("RegOne", "RegTwo"; io = devnull)
+                @test registry_has_version("RegOne", v"0.6.0")
+                @test registry_has_version("RegTwo", v"0.6.0")
+
+                VibePkg.Registry.rm("RegOne", "RegTwo"; io = devnull)
+                out = sprint(io -> VibePkg.Registry.status(; io))
+                @test !occursin("RegOne", out) && !occursin("RegTwo", out)
+
+                # REPL driver: execute the combined add/up/rm forms, not just
+                # parser introspection, and prove both registries move.
+                VibePkg.REPLMode.do_cmd("registry add \"$s1\" \"$s2\""; io = devnull)
+                @test registry_has_version("RegOne", v"0.6.0")
+                @test registry_has_version("RegTwo", v"0.6.0")
+
+                publish_version!(s1, v"0.7.0", "4444444444444444444444444444444444444444")
+                publish_version!(s2, v"0.7.0", "5555555555555555555555555555555555555555")
+                # The preceding API update stamped these UUIDs less than the
+                # one-second duplicate-update cooldown ago. Model a new REPL
+                # session so this explicit command performs its fetches.
+                Base.rm(Registries.registry_update_log_file(depot); force = true)
+                VibePkg.REPLMode.do_cmd("registry up RegOne RegTwo"; io = devnull)
+                @test registry_has_version("RegOne", v"0.7.0")
+                @test registry_has_version("RegTwo", v"0.7.0")
+
+                VibePkg.REPLMode.do_cmd("registry rm RegOne RegTwo"; io = devnull)
+                out = sprint(io -> VibePkg.Registry.status(; io))
+                @test !occursin("RegOne", out) && !occursin("RegTwo", out)
+            end
+        finally
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+        end
     end
 end
 
@@ -631,7 +1084,7 @@ end
             end
             @test err isa PkgError
             @test occursin(string(bogus), err.msg)
-            @test occursin("declares uuid", err.msg)
+            @test occursin("declares uuid", lowercase(err.msg))
             # nothing was installed
             @test !isfile(joinpath(depot, "registries", "General.toml"))
             @test !isfile(joinpath(depot, "registries", "General.tar.gz"))

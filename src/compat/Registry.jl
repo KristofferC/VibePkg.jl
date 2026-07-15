@@ -34,7 +34,7 @@ function parse_registry_spec(spec::String)
     i === nothing && return spec, nothing
     name = String(strip(spec[1:prevind(spec, i)]))
     uuid_str = String(strip(spec[nextind(spec, i):end]))
-    occursin(uuid_re, uuid_str) || pkgerror("`$spec` is not a valid registry specification")
+    occursin(uuid_re, uuid_str) || pkgerror("Invalid registry specification $(repr(spec)); expected NAME, UUID, or NAME=UUID")
     return name, UUID(uuid_str)
 end
 
@@ -46,7 +46,7 @@ Remove registries from the depot. `spec` is a name, `name=uuid`, or a
 bare uuid; a name shared by several registries requires the uuid form.
 """
 function rm(specs::AbstractString...; io::IO = stderr_f())
-    isempty(specs) && pkgerror("`registry rm` requires at least one registry")
+    isempty(specs) && pkgerror("registry rm requires at least one registry name or UUID")
     for spec in specs
         name, uuid = parse_registry_spec(String(spec))
         Registries.remove_registry!(depot_stack(), name, uuid; io)
@@ -60,19 +60,29 @@ function rm(; name = nothing, uuid = nothing, io::IO = stderr_f())
 end
 
 """
-    update(names...; io)
+    update(specs...; io)
 
-Update installed registries (all of them, or only the named ones).
+Update installed registries (all of them, or those selected by name, uuid,
+or `name=uuid`).
 """
-function update(names::String...; io::IO = stderr_f())
+function update(specs::String...; io::IO = stderr_f())
     if API.is_offline()
         # offline mode issues no network requests at all (Pkg.jl#4579)
         printpkgstyle(io, :Offline, "skipping registry update", color = Base.info_color())
         return nothing
     end
-    Registries.update_registries!(
-        depot_stack(); names = isempty(names) ? nothing : collect(String, names), io,
-    )
+    depots = depot_stack()
+    selectors = if isempty(specs)
+        nothing
+    else
+        resolved = Registries.RegistrySelector[]
+        for spec in specs
+            name, uuid = parse_registry_spec(spec)
+            push!(resolved, (name, uuid))
+        end
+        unique(resolved)
+    end
+    Registries.update_registries!(depots; selectors, io)
     return nothing
 end
 

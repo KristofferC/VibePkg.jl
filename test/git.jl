@@ -30,6 +30,34 @@ using VibePkg.EnvFiles: entry_version, entry_repo_url, entry_repo_rev,
 # IO; tests run it against devnull
 quiet(f) = Base.ScopedValues.with(f, DEFAULT_IO => devnull)
 
+@testset "Git diagnostics redact credentials" begin
+    mktempdir() do dir
+        secret = "super-secret-password"
+        remote = "https://user:$secret@127.0.0.1:1/private.git?token=query-secret"
+        output = IOBuffer()
+        err = withenv("JULIA_PKG_USE_CLI_GIT" => "true") do
+            try
+                Git.clone(
+                    output, remote, joinpath(dir, "clone");
+                    header = "Package source: $remote",
+                )
+                nothing
+            catch caught
+                caught
+            end
+        end
+        @test err isa PkgError
+        message = sprint(showerror, err)
+        @test occursin("Could not clone repository", message)
+        @test occursin("127.0.0.1", message)
+        @test !occursin(secret, message)
+        @test !occursin("query-secret", message)
+        progress = String(take!(output))
+        @test !occursin(secret, progress)
+        @test !occursin("query-secret", progress)
+    end
+end
+
 # embed a native filesystem path in a hand-written TOML basic string: a Windows
 # path's backslash separators (and any quotes) must be escaped so the parsed
 # value round-trips to the exact string (`\Users` would otherwise be read as an
@@ -272,6 +300,51 @@ end
             append!(empty!(Base.DEPOT_PATH), old_depots)
             VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
             VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end
+
+# Pkg.jl#913 — a cached branch-tracked repository must remain addable after
+# the environment files are removed. The second add rebuilds the environment
+# from the same local revision instead of confusing cached state with an
+# already-present manifest entry.
+@testset "re-add the same revision after deleting the environment (#913)" begin
+    mktempdir() do dir
+        src, _, branch = make_track_repo(dir)
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        envdir = mkpath(joinpath(dir, "env"))
+        project_file = joinpath(envdir, "Project.toml")
+        manifest_file = joinpath(envdir, "Manifest.toml")
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        try
+            Base.ACTIVE_PROJECT[] = project_file
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            withenv("JULIA_PKG_SERVER" => "") do
+                VibePkg.add(; url = src, rev = branch, io = devnull)
+                first_entry = read_manifest(manifest_file)[TRACKPKG_UUID]
+                first_tree = entry_tree_hash(first_entry)
+                @test entry_repo_rev(first_entry) == branch
+                @test isfile(project_file) && isfile(manifest_file)
+
+                Base.rm(project_file)
+                Base.rm(manifest_file)
+                @test !isfile(project_file) && !isfile(manifest_file)
+
+                @test VibePkg.add(; url = src, rev = branch, io = devnull) === nothing
+                second_entry = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test entry_repo_rev(second_entry) == branch
+                @test entry_tree_hash(second_entry) == first_tree
+                @test isfile(project_file) && isfile(manifest_file)
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
         end
     end
 end
@@ -576,6 +649,61 @@ end
         path, installed = find_installed(depots2, "TrackPkg", TRACKPKG_UUID, rp2.tree_hash)
         @test installed
         @test occursin("f() = 613", read(joinpath(path, "src", "TrackPkg.jl"), String))
+    end
+end
+
+# Pkg.jl#2931: source installation must not depend on a manifest version. A
+# repo/tree entry can legitimately omit `version`; removing its content-addressed
+# install must therefore make a later instantiate fetch the recorded tree again.
+@testset "instantiate re-fetches a versionless repo entry (#2931)" begin
+    mktempdir() do dir
+        dir = realpath(dir)
+        src, commit, branch = make_track_repo(dir)
+        hash = git_tree_hash(src, commit)
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        envdir = mkpath(joinpath(dir, "env"))
+        write(joinpath(envdir, "Project.toml"), "[deps]\nTrackPkg = \"$TRACKPKG_UUID\"\n")
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.TrackPkg]]
+            git-tree-sha1 = "$hash"
+            repo-rev = "$branch"
+            repo-url = "$(toml_str(src))"
+            uuid = "$TRACKPKG_UUID"
+            """
+        )
+
+        env = load_environment(envdir; depots)
+        entry = env.manifest[TRACKPKG_UUID]
+        @test entry_version(entry) === nothing
+        @test entry_repo_url(entry) == src
+        @test entry_tree_hash(entry) == hash
+
+        # The empty server setting proves both installs use only the local Git
+        # repository recorded in the manifest (no registry or PkgServer).
+        withenv("JULIA_PKG_SERVER" => "") do
+            installed = instantiate!(env, RegistryInstance[], Config(depots); io = devnull)
+            pkgdir, present = find_installed(depots, "TrackPkg", TRACKPKG_UUID, hash)
+            @test present
+            @test only(installed).path == pkgdir
+            @test isfile(joinpath(pkgdir, "src", "TrackPkg.jl"))
+
+            Base.rm(pkgdir; recursive = true, force = true)
+            @test !isdir(pkgdir)
+            reinstalled = instantiate!(env, RegistryInstance[], Config(depots); io = devnull)
+            @test only(reinstalled).path == pkgdir
+            @test isfile(joinpath(pkgdir, "src", "TrackPkg.jl"))
+            # A Windows checkout cannot reproduce Unix executable mode bits
+            # from the canonical Git tree; installation already verified the
+            # tree hash before placing the content-addressed directory.
+            if !Sys.iswindows()
+                @test SHA1(tree_hash(pkgdir)) == hash
+            end
+        end
     end
 end
 

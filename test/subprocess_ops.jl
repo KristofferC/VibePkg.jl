@@ -40,6 +40,80 @@ function vibepkg_cmd(code::AbstractString; test_depot::Union{Nothing, String} = 
     return addenv(`$(joinpath(Sys.BINDIR, "julia")) --startup-file=no --color=no -e $(prelude * code)`, env...)
 end
 
+# Pkg.jl new.jl "test entryfile entries" — neither package has the conventional
+# src/Name.jl entry point. Resolving must copy the path dependency's `entryfile`
+# into the manifest so Julia's package loader can find both packages in a brand
+# new process that has never loaded either module.
+@testset "entryfile packages load in a fresh subprocess" begin
+    mktempdir() do dir
+        root = joinpath(dir, "ProjectPath")
+        dep = joinpath(root, "ProjectPathDep")
+        mkpath(dep)
+        write(
+            joinpath(root, "Project.toml"),
+            """
+            name = "ProjectPath"
+            uuid = "32833bde-7fc1-4d28-8365-9d01e1bcbc1b"
+            version = "0.1.0"
+            entryfile = "CustomPath.jl"
+
+            [deps]
+            ProjectPathDep = "f18633fc-8799-43ff-aa06-99ed830dc572"
+
+            [sources]
+            ProjectPathDep = {path = "ProjectPathDep"}
+            """,
+        )
+        write(
+            joinpath(root, "CustomPath.jl"),
+            """
+            module ProjectPath
+            using ProjectPathDep
+            value() = "root/" * ProjectPathDep.value()
+            end
+            """,
+        )
+        write(
+            joinpath(dep, "Project.toml"),
+            """
+            name = "ProjectPathDep"
+            uuid = "f18633fc-8799-43ff-aa06-99ed830dc572"
+            version = "0.1.0"
+            entryfile = "CustomPath.jl"
+            """,
+        )
+        write(
+            joinpath(dep, "CustomPath.jl"),
+            """
+            module ProjectPathDep
+            value() = "dependency"
+            end
+            """,
+        )
+
+        old_project = Base.ACTIVE_PROJECT[]
+        try
+            VibePkg.activate(root; io = devnull)
+            VibePkg.resolve(; io = devnull)
+        finally
+            Base.ACTIVE_PROJECT[] = old_project
+        end
+
+        raw_manifest = TOML.parsefile(joinpath(root, "Manifest.toml"))
+        dep_entry = only(raw_manifest["deps"]["ProjectPathDep"])
+        @test dep_entry["entryfile"] == "CustomPath.jl"
+
+        code = "using ProjectPath, ProjectPathDep; print(ProjectPath.value(), \"|\", ProjectPathDep.value())"
+        cmd = `$(joinpath(Sys.BINDIR, "julia")) --startup-file=no --compiled-modules=no --color=no --project=$root -e $code`
+        iob = IOBuffer()
+        process = run(pipeline(ignorestatus(cmd); stdout = iob, stderr = iob))
+        out = String(take!(iob))
+        success(process) || println(out)
+        @test success(process)
+        @test out == "root/dependency|dependency"
+    end
+end
+
 # Pkg.jl new.jl "Concurrent setup/installation/precompilation across processes"
 # — several processes adding the same package into one shared depot must not
 # corrupt it; exactly one actually installs the tree (the rest block on its

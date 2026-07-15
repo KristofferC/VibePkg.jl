@@ -7,10 +7,12 @@ LocalPkgServer.isolate!()
 
 using Test
 using Base: UUID, SHA1
+import LibGit2
 using TOML
 using VibePkg.Depots: depot_stack, log_usage, log_scratch_usage
 using VibePkg.GCOps
 using VibePkg.EnvFiles
+import VibePkg.Git
 using VibePkg.Configs: Config
 using VibePkg.Registries: RegistryInstance
 import VibePkg.API
@@ -81,6 +83,68 @@ const FOO_HASH = SHA1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     end
 end
 
+@testset "gc reaps unreachable repo clone caches" begin
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+
+        # Materialize a real bare clone cache from a completely local package
+        # repository. This exercises the cache shape created by add-by-URL,
+        # rather than standing in for it with an arbitrary directory.
+        src = joinpath(dir, "Foo")
+        mkpath(joinpath(src, "src"))
+        write(
+            joinpath(src, "Project.toml"),
+            "name = \"Foo\"\nuuid = \"$FOO_UUID\"\nversion = \"1.0.0\"\n",
+        )
+        write(joinpath(src, "src", "Foo.jl"), "module Foo end\n")
+        repo = LibGit2.init(src)
+        try
+            LibGit2.add!(repo, ".")
+            sig = LibGit2.Signature("tester", "tester@example.com")
+            LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+        finally
+            close(repo)
+        end
+
+        package = Git.materialize_repo_package!(depots, src; io = devnull)
+        cache = Git.repo_cache_path(depots, src)
+        @test isdir(cache)
+        @test isfile(joinpath(cache, "HEAD")) # an actual bare Git repository
+
+        # A live manifest usage root must mark the URL-keyed clone cache.
+        envdir = mkpath(joinpath(dir, "env"))
+        manifest_file = joinpath(envdir, "Manifest.toml")
+        manifest = Dict(
+            "julia_version" => string(VERSION),
+            "manifest_format" => "2.1",
+            "deps" => Dict(
+                "Foo" => [
+                    Dict(
+                        "git-tree-sha1" => string(package.tree_hash),
+                        "repo-rev" => package.rev,
+                        "repo-url" => src,
+                        "uuid" => string(FOO_UUID),
+                        "version" => "1.0.0",
+                    ),
+                ],
+            ),
+        )
+        open(manifest_file, "w") do io
+            TOML.print(io, manifest; sorted = true)
+        end
+        log_usage(depots, manifest_file, "manifest_usage.toml")
+        GCOps.gc(depots; io = devnull)
+        @test isdir(cache)
+
+        # Once that usage root is gone, the same real cache is unreachable and
+        # must be reaped (the clone-specific half of Pkg's add/rm/gc test).
+        Base.rm(manifest_file)
+        GCOps.gc(depots; io = devnull)
+        @test !ispath(cache)
+    end
+end
+
 @testset "auto-gc (JULIA_PKG_GC_AUTO)" begin
     mktempdir() do dir
         depot = mkpath(joinpath(dir, "depot"))
@@ -142,7 +206,7 @@ end
         pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
         clone = mkpath(joinpath(depot, "clones", "some-clone"))
         dead_art = mkpath(joinpath(depot, "artifacts", "feedfacefeedfacefeedfacefeedfacefeedface"))
-        @test_logs (:warn, r"Failed to parse usage file") match_mode = :any GCOps.gc(depots; io = devnull)
+        @test_logs (:warn, r"Could not parse usage log") match_mode = :any GCOps.gc(depots; io = devnull)
         @test isdir(pkg)                                    # liveness unknown -> kept
         @test isdir(clone)                                  # clones come from manifests too
         @test !isdir(dead_art)                              # artifact log fine -> still swept
@@ -168,7 +232,7 @@ end
         dead_pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
         art = mkpath(joinpath(depot, "artifacts", "feedfacefeedfacefeedfacefeedfacefeedface"))
         space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), "space1"))
-        @test_logs (:warn, r"Failed to parse usage file") match_mode = :any GCOps.gc(depots; io = devnull)
+        @test_logs (:warn, r"Could not parse (scratch )?usage log") match_mode = :any GCOps.gc(depots; io = devnull)
         @test isdir(art)        # liveness unknown -> kept
         @test isdir(space)      # liveness unknown -> kept
         @test !isdir(dead_pkg)  # manifest log fine -> still swept
@@ -232,7 +296,7 @@ end
         write(usage_file, "]]] this is not toml [==")
         manifest_file = joinpath(dir, "Manifest.toml")
         write(manifest_file, "")
-        @test_logs (:warn, r"Failed to parse usage file") log_usage(depots, manifest_file, "manifest_usage.toml")
+        @test_logs (:warn, r"Could not parse usage log") log_usage(depots, manifest_file, "manifest_usage.toml")
         @test haskey(TOML.parsefile(usage_file), manifest_file)   # valid again + new entry
     end
 end
@@ -308,21 +372,61 @@ end
     end
 end
 
-# Pkg.jl registry.jl "gc runs git gc on registries" — VibePkg's gc does not run
-# git gc on registries, but (the important half) it must never remove or corrupt
-# an installed registry while collecting unused packages/artifacts.
-@testset "gc leaves registries intact" begin
-    if !@isdefined(make_test_registry)
-        include("testhelpers.jl")
-    end
-    mktempdir() do dir
-        depot = mkpath(joinpath(dir, "depot"))
-        reg = make_test_registry(depot)
-        depots = depot_stack([depot])
-        @test isfile(joinpath(reg, "Registry.toml"))
-        GCOps.gc(depots; io = devnull)              # must not error or delete it
-        @test isfile(joinpath(reg, "Registry.toml"))
-        @test isfile(joinpath(reg, "E", "Example", "Package.toml"))
+# Pkg.jl registry.jl "gc runs git gc on registries". Unlike the upstream test,
+# this also proves the command ran: a freshly committed registry starts with
+# loose objects, while `git gc` packs those reachable objects.
+@testset "gc runs git gc on registries" begin
+    if Sys.which("git") === nothing
+        @test_skip "git CLI not available"
+    else
+        if !@isdefined(make_test_registry)
+            include("testhelpers.jl")
+        end
+        mktempdir() do dir
+            depot = mkpath(joinpath(dir, "depot"))
+            reg = make_test_registry(depot)
+            repo = LibGit2.init(reg)
+            try
+                LibGit2.add!(repo, ".")
+                sig = LibGit2.Signature("tester", "tester@example.com")
+                LibGit2.commit(repo, "initial registry"; author = sig, committer = sig)
+            finally
+                close(repo)
+            end
+
+            git_objects = joinpath(reg, ".git", "objects")
+            loose_objects() = sum(
+                length(readdir(joinpath(git_objects, fanout))) for fanout in readdir(git_objects)
+                    if occursin(r"^[0-9a-f]{2}$", fanout);
+                init = 0,
+            )
+            loose_before = loose_objects()
+            @test loose_before > 0
+            @test isempty(filter(f -> endswith(f, ".pack"), readdir(joinpath(git_objects, "pack"))))
+
+            old_depots = copy(Base.DEPOT_PATH)
+            output = IOBuffer()
+            try
+                empty!(Base.DEPOT_PATH)
+                push!(Base.DEPOT_PATH, depot)
+                @test_nowarn API.gc(; verbose = true, io = output)
+            finally
+                empty!(Base.DEPOT_PATH)
+                append!(Base.DEPOT_PATH, old_depots)
+            end
+
+            @test occursin("running git gc on registry TestRegistry", String(take!(output)))
+            @test isfile(joinpath(reg, "Registry.toml"))
+            @test isfile(joinpath(reg, "E", "Example", "Package.toml"))
+            @test isdir(joinpath(reg, ".git"))
+            @test loose_objects() < loose_before
+            pack_files = readdir(joinpath(git_objects, "pack"))
+            @test any(endswith(".pack"), pack_files)
+            @test any(endswith(".idx"), pack_files)
+            @test LibGit2.with(LibGit2.GitRepo(reg)) do packed_repo
+                LibGit2.head_oid(packed_repo) isa LibGit2.GitHash
+            end
+        end
     end
 end
 

@@ -14,7 +14,8 @@ import UUIDs
 using Dates: Dates
 
 using ..Errors: PkgError, pkgerror
-using ..Utils: stderr_f, stdout_f, precompile_io, precompile_detach_kwargs
+using ..Utils: stderr_f, stdout_f, precompile_io, precompile_detach_kwargs,
+    expanduser_path
 using ..Timing: @operation, @timeit, TIMER
 import ..Depots
 import ..Stdlibs
@@ -36,9 +37,11 @@ using ..Display: print_env_diff, print_status, print_compat, printpkgstyle, path
 import ..Display
 import ..EnvFiles
 import ..Resolve
+using ..Versions: VersionSpec
 
 export add, develop, rm, up, update, pin, free, resolve, instantiate, status,
-    compat, activate, generate, why, offline, precompile, readonly
+    compat, activate, generate, why, offline, respect_sysimage_versions,
+    precompile, readonly
 
 ##################
 # Session state  #
@@ -51,7 +54,7 @@ const UPDATED_REGISTRY_THIS_SESSION = Ref(false)
 const AUTO_PRECOMPILE_ENABLED = Ref(true)
 const AUTO_GC_ENABLED = Ref(true)
 # resolution skips versions differing from sysimage-baked packages; folded
-# into every op's Config (no public toggle yet, Pkg parity pending)
+# into every op's Config
 const RESPECT_SYSIMAGE_VERSIONS = Ref(true)
 
 # `pkg>` dispatch runs under this scope; `add` prefers already-loaded package
@@ -91,10 +94,14 @@ record_undo!(old_env::Environment, new_env::Environment) =
 
 function undo_redo_target(env::Environment, direction::Int)
     state = get(UNDO_STACKS, env.project_file, nothing)
-    state === nothing && pkgerror("no undo information for this project")
+    state === nothing && pkgerror("No undo information is available for project $(repr(env.project_file))")
     target_idx = state.idx + direction
     1 <= target_idx <= length(state.entries) ||
-        pkgerror(direction < 0 ? "no more undo information" : "no more redo information")
+        pkgerror(
+        direction < 0 ?
+            "No more undo information is available for project $(repr(env.project_file))" :
+            "No more redo information is available for project $(repr(env.project_file))"
+    )
     return state, target_idx, state.entries[target_idx]
 end
 
@@ -107,6 +114,18 @@ end
 "`offline(b = true)`: no registry updates, resolve against installed versions only."
 function offline(b::Bool = true)
     OFFLINE_MODE[] = b
+    return nothing
+end
+
+"""
+    respect_sysimage_versions(b::Bool = true)
+
+Enable or disable respecting package versions baked into the sysimage. When
+enabled, resolution keeps such packages at their sysimage versions and rejects
+repository adds or develops of them.
+"""
+function respect_sysimage_versions(b::Bool = true)
+    RESPECT_SYSIMAGE_VERSIONS[] = b
     return nothing
 end
 
@@ -160,6 +179,43 @@ function op_context(; io::IO = stderr_f(), update_registry::Symbol = :none)
     return OpContext(config, registries)
 end
 
+# Best-effort installation of custom registries recorded by Manifest.toml.
+# A manifest can remain usable when one provenance URL is stale (for example,
+# because the package source is already installed), so match Pkg's behavior:
+# warn on installation failure and let the operation itself decide whether the
+# available registry set is sufficient.
+function ensure_manifest_registries!(ctx::OpContext, env::Environment; io::IO = ctx.config.io)
+    isempty(env.manifest.registries) && return nothing
+    installed = Set(Registries.registry_uuid(reg) for reg in ctx.registries)
+    missing = sort!(
+        [
+            ref for ref in values(env.manifest.registries) if
+                !(ref.uuid in installed) && ref.url !== nothing
+        ];
+        by = ref -> ref.id,
+    )
+    isempty(missing) && return nothing
+
+    try
+        for ref in missing
+            Registries.add_registry_from_source!(ctx.config.depots, ref.url::String; io)
+            refreshed = reachable_registries(
+                ctx.config.depots; read_from_tarball = ctx.config.server !== nothing,
+            )
+            any(reg -> Registries.registry_uuid(reg) == ref.uuid, refreshed) || pkgerror(
+                "registry source `$(ref.url)` did not provide the registry `$(ref.id)` ",
+                "with uuid `$(ref.uuid)` recorded in the manifest",
+            )
+            append!(empty!(ctx.registries), refreshed)
+            push!(installed, ref.uuid)
+        end
+    catch err
+        err isa InterruptException && rethrow()
+        @warn "Failed to install some registries from manifest" exception = (err, catch_backtrace())
+    end
+    return nothing
+end
+
 requests(pkgs::AbstractVector{<:AbstractString}) = [PackageRequest(String(pkg)) for pkg in pkgs]
 
 # The repo-source fetch capability handed to planning (offline plans get
@@ -191,7 +247,7 @@ function _auto_gc(ctx::OpContext)
     should_auto_gc() || return
     time() - mtime(GCOps.gc_stamp(depots1(ctx.config.depots))) > AUTO_GC_PERIOD_SECS || return
     io = ctx.config.io
-    printpkgstyle(io, :Info, "We haven't cleaned this depot up for a bit, running Pkg.gc()...", color = Base.info_color())
+    printpkgstyle(io, :Info, "This depot has not been cleaned recently; running VibePkg.gc()...", color = Base.info_color())
     try
         GCOps.gc(ctx.config.depots; io)
     catch err
@@ -246,7 +302,7 @@ Pkg's, it is an immutable *input* value: it never flows past normalization.
 struct PackageSpec
     name::Union{Nothing, String}
     uuid::Union{Nothing, UUID}
-    version::Union{Nothing, VersionNumber, String}
+    version::Union{Nothing, VersionNumber, VersionSpec, String}
     url::Union{Nothing, String}
     rev::Union{Nothing, String}
     path::Union{Nothing, String}
@@ -258,10 +314,10 @@ function PackageSpec(;
         repo = nothing,
     )
     repo === nothing ||
-        pkgerror("`repo` is a private field of PackageSpec and should not be set directly")
+        pkgerror("PackageSpec(repo=...) is unsupported; specify url, rev, and subdir instead")
     uuid isa AbstractString && (uuid = UUID(uuid))
-    version isa VersionNumber || version isa AbstractString || version === nothing ||
-        pkgerror("`version` must be a version number or string")
+    version isa VersionNumber || version isa VersionSpec || version isa AbstractString || version === nothing ||
+        pkgerror("Invalid version $(repr(version)); expected a VersionNumber, version string, VersionSpec, or nothing")
     return PackageSpec(
         name === nothing ? nothing : String(name), uuid,
         version isa AbstractString ? String(version) : version,
@@ -270,7 +326,7 @@ function PackageSpec(;
 end
 PackageSpec(name::AbstractString) = PackageSpec(; name)
 PackageSpec(name::AbstractString, uuid::UUID) = PackageSpec(; name, uuid)
-PackageSpec(name::AbstractString, version::Union{VersionNumber, AbstractString}) = PackageSpec(; name, version)
+PackageSpec(name::AbstractString, version::Union{VersionNumber, VersionSpec, AbstractString}) = PackageSpec(; name, version)
 
 Base.:(==)(a::PackageSpec, b::PackageSpec) =
     all(isequal(getfield(a, i), getfield(b, i)) for i in 1:nfields(a))
@@ -285,14 +341,14 @@ to_request(s::PackageSpec) = PackageRequest(s.name, s.uuid, s.version)
 function check_package_name(x::AbstractString, mode::Union{Nothing, String, Symbol} = nothing)
     if !Base.isidentifier(x)
         message = sprint() do iostr
-            print(iostr, "`$x` is not a valid package name")
+            print(iostr, "Invalid package name $(repr(x))")
             if endswith(lowercase(x), ".jl")
                 print(iostr, ". Perhaps you meant `$(chop(x; tail = 3))`")
             end
             if mode !== nothing && any(occursin.(['\\', '/'], x)) # maybe a url or a path
                 print(
                     iostr, "\nThe argument appears to be a URL or path, perhaps you meant ",
-                    "`Pkg.$mode(url=\"...\")` or `Pkg.$mode(path=\"...\")`."
+                    "`VibePkg.$mode(url=\"...\")` or `VibePkg.$mode(path=\"...\")`."
                 )
             end
         end
@@ -316,26 +372,26 @@ function validate_specs(specs::Vector{PackageSpec}, mode::String)
     for s in specs
         check_package_name(s.name, mode)
         # if julia is passed as a package the solver gets tricked
-        s.name == "julia" && pkgerror("`julia` is not a valid package name")
+        s.name == "julia" && pkgerror("Package name \"julia\" is reserved for the Julia runtime")
         if s.name === nothing && s.uuid === nothing && s.url === nothing && s.path === nothing
-            pkgerror("name, UUID, URL, or filesystem path specification required when calling `$mode`")
+            pkgerror("Package specification must include a name, UUID, URL, or filesystem path")
         end
         if s.name !== nothing && count(x -> x.name == s.name, specs) > 1
-            pkgerror("it is invalid to specify multiple packages with the same name: $(err_rep(s))")
+            matches = [x for x in specs if x.name == s.name]
+            pkgerror("Duplicate package name $(repr(s.name)) in specifications $(err_rep(matches[1])) and $(err_rep(matches[2]))")
         end
         if s.uuid !== nothing && count(x -> x.uuid == s.uuid, specs) > 1
-            pkgerror("it is invalid to specify multiple packages with the same UUID: $(err_rep(s))")
+            matches = [x for x in specs if x.uuid == s.uuid]
+            pkgerror("Duplicate package UUID $(s.uuid) in specifications $(err_rep(matches[1])) and $(err_rep(matches[2]))")
         end
         if mode == "develop"
-            s.rev === nothing || pkgerror("rev argument not supported by `develop`; consider using `add` instead")
+            s.rev === nothing || pkgerror("develop does not accept rev; use add to track a repository revision")
             s.version === nothing || pkgerror(
-                "version specification invalid when calling `develop`:",
-                " `$(s.version)` specified for package $(err_rep(s))"
+                "develop does not accept version $(repr(s.version)) for package $(err_rep(s))"
             )
         elseif (s.url !== nothing || s.path !== nothing || s.rev !== nothing) && s.version !== nothing
             pkgerror(
-                "version specification invalid when tracking a repository:",
-                " `$(s.version)` specified for package $(err_rep(s))"
+                "Cannot specify version $(repr(s.version)) for repository-tracked package $(err_rep(s))"
             )
         end
     end
@@ -351,29 +407,34 @@ function split_specs(specs::Vector{PackageSpec})
     name_rev = PackageSpec[]
     for s in specs
         s.url !== nothing && s.path !== nothing &&
-            pkgerror("`path` and `url` are conflicting specifications")
+            pkgerror("Cannot specify both path and URL")
         if s.url !== nothing || s.path !== nothing
             push!(repo_like, s)
         elseif s.rev !== nothing
-            s.name === nothing && s.uuid === nothing && pkgerror("`rev` requires a package name, `url`, or `path`")
+            s.name === nothing && s.uuid === nothing && pkgerror("rev $(repr(s.rev)) requires a package name, UUID, URL, or path")
             push!(name_rev, s)
         else
-            s.name === nothing && s.uuid === nothing && pkgerror("package spec requires a name or uuid")
+            s.name === nothing && s.uuid === nothing && pkgerror("Package specification must include a name or UUID")
             push!(reqs, to_request(s))
         end
     end
     return reqs, repo_like, name_rev
 end
 
-"The registry-declared repository url of a package."
-function registry_repo_url(registries::Vector{RegistryInstance}, uuid::UUID)
+"The registry-declared repository url and optional subdirectory of a package."
+function registry_repo_source(registries::Vector{RegistryInstance}, uuid::UUID)
     for reg in registries
         p = get(reg, uuid, nothing)
         p === nothing && continue
         info = Registries.registry_info(reg, p)
-        info.repo !== nothing && return info.repo
+        info.repo !== nothing && return (url = info.repo, subdir = info.subdir)
     end
     return nothing
+end
+
+function registry_repo_url(registries::Vector{RegistryInstance}, uuid::UUID)
+    source = registry_repo_source(registries, uuid)
+    return source === nothing ? nothing : source.url
 end
 
 @operation function add(
@@ -387,8 +448,13 @@ end
     # input validation must not have side effects: bad paths error before
     # any registry update runs (Pkg checks paths before touching the world)
     for s in repo_like
-        s.path === nothing || isdir(abspath(s.path)) ||
-            pkgerror("Path `$(abspath(s.path))` does not exist.")
+        s.path === nothing && continue
+        path = abspath(s.path)
+        isdir(path) || pkgerror("Package path $(repr(path)) does not exist")
+        if !ispath(joinpath(path, ".git")) &&
+                (isfile(joinpath(path, "Project.toml")) || isfile(joinpath(path, "JuliaProject.toml")))
+            pkgerror("Did not find a git repository at `$path`, perhaps you meant `VibePkg.develop`?")
+        end
     end
     ctx = op_context(; io, update_registry = :auto)
     env = load_environment(; depots = ctx.config.depots)
@@ -399,18 +465,23 @@ end
             ) for s in repo_like
     ]
     for s in name_rev
-        # `add Name#rev`: the repo url comes from the registry
+        # `add Name#rev`: both the repository url and its package subdir come
+        # from the registry (an explicit PackageSpec subdir still wins).
         name, uuid = Planning.resolve_request(env, ctx.registries, to_request(s))
-        url = registry_repo_url(ctx.registries, uuid)
-        url === nothing && pkgerror("could not find a repository url for package `$name` in any registry")
-        push!(repos, Git.materialize_repo_package!(ctx.config.depots, url; rev = s.rev, subdir = s.subdir, io))
+        source = registry_repo_source(ctx.registries, uuid)
+        source === nothing && pkgerror("No repository URL is recorded for package $name [$uuid] in the configured registries")
+        subdir = s.subdir === nothing ? source.subdir : s.subdir
+        push!(repos, Git.materialize_repo_package!(ctx.config.depots, source.url; rev = s.rev, subdir, io))
     end
     # already-present fast path: when every requested package is already a
     # compatible registry-tracked manifest entry (and nothing is repo-tracked),
     # just promote it to [deps] and write it out — no resolve, install, or
     # precompile (Pkg's `can_skip_resolve_for_add`).
     if isempty(repos)
-        promoted = Planning.plan_promote(env, ctx.registries, reqs)
+        promoted = Planning.plan_promote(
+            env, ctx.registries, reqs;
+            respect_sysimage_versions = ctx.config.respect_sysimage_versions,
+        )
         if promoted !== nothing
             planned, names = promoted
             planned, compat_added = compat_on_add(planned, names)
@@ -527,10 +598,10 @@ end
 # `add(target = :weakdeps/:extras)` (`add --weak`/`--extra`): record the
 # packages under `[weakdeps]`/`[extras]` — nothing is resolved or installed.
 function _add_to_target(specs::Vector{PackageSpec}, target::Symbol; io::IO)
-    target in (:weakdeps, :extras) || pkgerror("Unrecognized target $(target)")
+    target in (:weakdeps, :extras) || pkgerror("Unsupported target $(repr(target)); expected :deps, :weakdeps, or :extras")
     for s in specs
         (s.url === nothing && s.path === nothing && s.rev === nothing) ||
-            pkgerror("`target = :$(target)` only supports registered packages")
+            pkgerror("Target $(repr(target)) supports only registered packages; $(err_rep(s)) specifies a repository or path")
     end
     ctx = op_context(; io, update_registry = :auto)
     env = load_environment(; depots = ctx.config.depots)
@@ -575,8 +646,14 @@ end
         if s.path !== nothing
             # honor `subdir`: the tracked project lives below the given path
             # (`plan_develop` validates the joined path exists and has a
-            # project file)
-            push!(paths, s.subdir === nothing ? s.path : joinpath(s.path, s.subdir))
+            # project file). Relative API/REPL paths are cwd-relative, while
+            # `plan_develop` consumes paths relative to the active project;
+            # translate between those two frames without making the recorded
+            # source absolute (so moving the project with its package works).
+            requested = s.subdir === nothing ? s.path : joinpath(s.path, s.subdir)
+            track_path = isabspath(requested) ? requested :
+                relpath(abspath(requested), dirname(env.project_file))
+            push!(paths, track_path)
         elseif s.url !== nothing
             name = splitext(basename(rstrip(s.url, '/')))[1]
             clone_dir, track_path = dev_clone_target(ctx.config, name; shared)
@@ -586,8 +663,24 @@ end
         elseif s.name !== nothing
             push!(paths, _develop_name_path(ctx, env, s.name; shared, io))
         else
-            pkgerror("`develop` requires a name, url, or path")
+            pkgerror("Package specification must include a name, UUID, URL, or filesystem path")
         end
+    end
+    # Pkg validates a package's load entry point at the public develop
+    # boundary. Keep the lower-level planner usable with metadata-only
+    # synthetic packages while rejecting real API/REPL develops that could
+    # never be loaded.
+    for path in paths
+        dev_dir = isabspath(path) ? path : normpath(joinpath(dirname(env.project_file), path))
+        project_file = EnvFiles.projectfile_path(dev_dir; strict = true)
+        project_file === nothing && continue # plan_develop emits the structural error
+        project = EnvFiles.read_project(project_file)
+        project.name === nothing && continue # likewise for missing identity
+        entry_point = something(project.entryfile, joinpath("src", "$(project.name).jl"))
+        package_source = joinpath(dev_dir, entry_point)
+        isfile(package_source) || pkgerror(
+            "expected the file `$package_source` to exist for package `$(project.name)` at `$dev_dir`"
+        )
     end
     printpkgstyle(io, :Resolving, "package versions...")
     planned = plan_develop(env, ctx.registries, ctx.config, paths; preserve, fetcher = source_fetcher(ctx.config))
@@ -622,9 +715,9 @@ function spec_names(specs::Vector{PackageSpec})
         if s.name !== nothing
                 s.name
         else
-                s.uuid === nothing && pkgerror("`name` or `uuid` is required in a `PackageSpec`")
+                s.uuid === nothing && pkgerror("Package specification must include a name or UUID")
                 entry = get(env.manifest, s.uuid, nothing)
-                entry === nothing && pkgerror("could not find package with uuid `$(s.uuid)` in the manifest")
+                entry === nothing && pkgerror("Package with UUID $(s.uuid) was not found in manifest $(repr(env.manifest_file))")
                 entry.name
         end
             for s in specs
@@ -663,10 +756,13 @@ function _develop_name_path(ctx::OpContext, env::Environment, pkg::String; share
     url = entry === nothing ? nothing : EnvFiles.entry_repo_url(entry)
     subdir = entry === nothing ? nothing : EnvFiles.entry_repo_subdir(entry)
     if url === nothing
-        url = registry_repo_url(ctx.registries, uuid)
-        subdir = nothing
+        source = registry_repo_source(ctx.registries, uuid)
+        if source !== nothing
+            url = source.url
+            subdir = source.subdir
+        end
     end
-    url === nothing && pkgerror("could not find a repository url for package `$pkg` in any registry")
+    url === nothing && pkgerror("No repository URL is recorded for package $name [$uuid] in the configured registries")
     clone_dir, track_path = dev_clone_target(ctx.config, name; shared)
     if !isdir(clone_dir)
         Git.ensure_clone(io, clone_dir, url)
@@ -696,7 +792,7 @@ end
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     if all_pkgs
-        isempty(reqs) || pkgerror("cannot specify packages when operating on all packages")
+        isempty(reqs) || pkgerror("Cannot specify individual packages together with all_pkgs=true")
         reqs = all_requests(env, mode)
         isempty(reqs) && (println(io, "No changes"); return nothing)
     end
@@ -830,7 +926,7 @@ pin(pkgs::AbstractVector{<:AbstractString}; kwargs...) = pin(requests(pkgs); kwa
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     if all_pkgs
-        isempty(reqs) || pkgerror("cannot specify packages when operating on all packages")
+        isempty(reqs) || pkgerror("Cannot specify individual packages together with all_pkgs=true")
         # Pkg parity: `all_pkgs` operates on the whole manifest, which spans
         # the workspace already (members share the root manifest)
         reqs = all_requests(env, :manifest)
@@ -848,7 +944,7 @@ free(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _free_requests(request
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     if all_pkgs
-        isempty(reqs) || pkgerror("cannot specify packages when operating on all packages")
+        isempty(reqs) || pkgerror("Cannot specify individual packages together with all_pkgs=true")
         reqs = all_requests(env, :manifest)
         isempty(reqs) && (println(io, "No changes"); return nothing)
     end
@@ -893,6 +989,7 @@ minor version. `verbose` sends build output of newly-installed packages to
     )
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
+    ensure_manifest_registries!(ctx, env; io)
     # decision tree: no manifest (or `manifest = false`) ⇒
     # full `up()`; a mismatched manifest under `update_on_mismatch` too.
     # `instantiate` delegates to `up` with `update_registry = :auto` so it
@@ -1087,10 +1184,10 @@ status(reqs::Vector{PackageRequest}; kwargs...) =
     filter_uuids = UUID[s.uuid for s in specs if s.uuid !== nothing]
     filter_names = String[s.name for s in specs if s.name !== nothing]
     if compat
-        diff && pkgerror("Compat status has no `diff` mode")
-        outdated && pkgerror("Compat status has no `outdated` mode")
-        deprecated && pkgerror("Compat status has no `deprecated` mode")
-        extensions && pkgerror("Compat status has no `extensions` mode")
+        unsupported = diff ? "diff" : outdated ? "outdated" : deprecated ? "deprecated" : extensions ? "extensions" : nothing
+        unsupported === nothing || pkgerror(
+            "Compat status does not support $(repr(unsupported)); supported options are package filters and current compatibility entries"
+        )
         env = load_environment(; depots = depot_stack())
         print_compat(io, env, filter_names)
         return nothing
@@ -1121,10 +1218,19 @@ basename, fresh uuid, authors from git config, version 0.1.0) and
 `src/<Name>.jl`.
 """
 function generate(path::String; io::IO = stderr_f())
-    base = basename(path)
+    path = normpath(expanduser_path(path))
+    # `abspath(".")` retains a trailing separator, for which `basename`
+    # is empty; `splitpath` still ends in the cwd's directory name.
+    base = last(splitpath(abspath(path)))
     pkg_name = endswith(lowercase(base), ".jl") ? chop(base, tail = 3) : base
-    Base.isidentifier(pkg_name) || pkgerror("$(repr(pkg_name)) is not a valid package name")
-    isdir(path) && pkgerror("$(abspath(path)) already exists")
+    Base.isidentifier(pkg_name) || pkgerror(
+        "Cannot generate a package from path $(repr(path)): derived name $(repr(pkg_name)) is not a valid Julia identifier"
+    )
+    if ispath(path)
+        isdir(path) && isempty(readdir(path)) || pkgerror(
+            "Cannot generate a package at $(repr(abspath(path))): the path exists and is not an empty directory"
+        )
+    end
     printpkgstyle(io, :Generating, " project $pkg_name:")
 
     uuid = UUIDs.uuid4()
@@ -1186,7 +1292,7 @@ function why(specs::Vector{PackageSpec}; kwargs...)
         else
             # a UUID names the package exactly — resolving it to a name and
             # re-looking that up could pick a same-named different package
-            s.uuid === nothing && pkgerror("name or UUID required when calling `why`")
+            s.uuid === nothing && pkgerror("why requires a package name or UUID")
             why(s.uuid; kwargs...)
         end
     end
@@ -1198,7 +1304,7 @@ why(pkg::AbstractString; kwargs...) = why(String(pkg); kwargs...)
     # bootstrapped with registries just to answer it
     env = load_environment(; depots = depot_stack())
     targets = UUID[uuid for (uuid, entry) in env.manifest if entry.name == pkg]
-    isempty(targets) && pkgerror("could not find package $pkg in the manifest")
+    isempty(targets) && pkgerror("Package named $(repr(pkg)) was not found in manifest $(repr(env.manifest_file))")
     length(targets) > 1 && pkgerror(
         "multiple packages named `$pkg` in the manifest; disambiguate with " *
             "`why(PackageSpec(uuid = ...))`: " * join(targets, ", ")
@@ -1207,7 +1313,7 @@ why(pkg::AbstractString; kwargs...) = why(String(pkg); kwargs...)
 end
 @operation function why(uuid::UUID; workspace::Bool = false, io::IO = stdout_f())
     env = load_environment(; depots = depot_stack())
-    haskey(env.manifest, uuid) || pkgerror("could not find package $uuid in the manifest")
+    haskey(env.manifest, uuid) || pkgerror("Package with UUID $uuid was not found in manifest $(repr(env.manifest_file))")
     return _why(env, uuid; workspace, io)
 end
 function _why(env, target::UUID; workspace::Bool, io::IO)
@@ -1314,7 +1420,7 @@ test(pkgs::AbstractVector{<:AbstractString}; kwargs...) = test(String.(pkgs); kw
     uuids = UUID[]
     if isempty(pkgs)
         env.project.uuid === nothing && pkgerror(
-            "trying to test unnamed project" # the active project is not a package
+            "Cannot test the active project: Project.toml does not define a uuid"
         )
         push!(uuids, env.project.uuid)
     else
@@ -1518,8 +1624,8 @@ installs anything.
 """
 function activate(path::Union{Nothing, String} = nothing; temp::Bool = false, shared::Bool = false, prev::Bool = false, io::IO = stderr_f())
     if temp
-        path === nothing || pkgerror("cannot specify both a path and `temp = true`")
-        shared && pkgerror("cannot use `temp` and `shared` together")
+        path === nothing || pkgerror("Cannot specify both a path and temp=true")
+        shared && pkgerror("Cannot combine temp=true with shared=true")
         path = mktempdir()
     end
     if prev
@@ -1532,9 +1638,9 @@ function activate(path::Union{Nothing, String} = nothing; temp::Bool = false, sh
         path = PREV_ENV_PATH[]
     end
     if shared
-        path === nothing && pkgerror("Must give a name for a shared environment")
-        occursin(r"[/\\]", path) &&
-            pkgerror("shared environment name must not contain a path separator")
+        path === nothing && pkgerror("A shared environment requires a name")
+        (isempty(path) || path in (".", "..") || occursin(r"[/\\]", path)) &&
+            pkgerror("Invalid shared environment name $(repr(path)); expected a single path component")
         # first existing shared environment in the depot stack, else the
         # first depot
         stack = depot_stack()

@@ -37,6 +37,7 @@ using ..Environments
 using ..Planning
 using ..Planning: PackageRequest
 using ..Execution
+import ..Git
 using ..Utils: printpkgstyle, pathrepr
 
 export app_add, app_develop, app_rm, app_update, app_status
@@ -261,19 +262,19 @@ function declared_apps(pkg_root::String, pkg_name::String)
             info.julia_flags, Dict{String, Any}(),
         )
     end
-    isempty(apps) && pkgerror("package `$pkg_name` at `$pkg_root` does not declare any apps (no `[apps]` section)")
+    isempty(apps) && pkgerror("Package $pkg_name has no [apps] table in $(repr(projectfile_path(pkg_root)))")
     return apps
 end
 
-function validate_app_collisions(manifest::Manifest, uuid::UUID, apps::Dict{String, AppInfo})
+function validate_app_collisions(manifest::Manifest, uuid::UUID, incoming::String, apps::Dict{String, AppInfo})
     for (other_uuid, entry) in manifest
         other_uuid == uuid && continue
         collisions = sort!(collect(intersect(keys(apps), keys(entry.apps))))
         isempty(collisions) && continue
-        noun = length(collisions) == 1 ? "app name" : "app names"
-        pkgerror(
-            "$noun $(join(repr.(collisions), ", ")) already installed by package `$(entry.name)`"
-        )
+        if length(collisions) == 1
+            pkgerror("Cannot install package $incoming: app name $(repr(only(collisions))) is already provided by installed package $(entry.name)")
+        end
+        pkgerror("Cannot install package $incoming: app names $(join(repr.(collisions), ", ")) are already provided by installed package $(entry.name)")
     end
     return nothing
 end
@@ -289,7 +290,7 @@ end
 
 function record_app_package!(d::DepotStack, entry::ManifestEntry)
     manifest = read_app_manifest(d)
-    validate_app_collisions(manifest, entry.uuid, entry.apps)
+    validate_app_collisions(manifest, entry.uuid, entry.name, entry.apps)
     previous = get(manifest, entry.uuid, nothing)
     deps = Dict{UUID, ManifestEntry}(manifest.deps)
     deps[entry.uuid] = entry
@@ -346,12 +347,12 @@ function app_develop(config::Config, registries::Vector{RegistryInstance}, path:
         migrate_shims!(d; io)
         dev_dir = abspath(path)
         project_file = projectfile_path(dev_dir; strict = true)
-        project_file === nothing && pkgerror("could not find project file in package at `$path`")
+        project_file === nothing && pkgerror("No Project.toml or JuliaProject.toml was found under $(repr(dev_dir))")
         project = read_project(project_file)
         (project.name === nothing || project.uuid === nothing) &&
-            pkgerror("expected a `name` and `uuid` entry in project file at `$project_file`")
+            pkgerror("App package project $(repr(project_file)) must define string name and UUID uuid fields")
         apps = declared_apps(dev_dir, project.name)
-        validate_app_collisions(read_app_manifest(d), project.uuid, apps)
+        validate_app_collisions(read_app_manifest(d), project.uuid, project.name, apps)
 
         # make the dev'd project itself loadable
         env = Environments.load_environment_from(project_file; depots = d)
@@ -375,23 +376,31 @@ function app_develop(config::Config, registries::Vector{RegistryInstance}, path:
 end
 
 """
-    app_add(config, registries, request; io)
+    app_add(config, registries, target; io)
 
-Install a registered package as an app: a dedicated environment under
-`environments/apps/<Name>/` is resolved and instantiated, and shims are
-written for every app the package declares.
+Install a registered request or materialized git repository as an app: a
+dedicated environment under `environments/apps/<Name>/` is resolved and
+instantiated, and shims are written for every app the package declares.
 """
-function app_add(config::Config, registries::Vector{RegistryInstance}, request::PackageRequest; io::IO = stderr_f())
+function app_add(
+        config::Config, registries::Vector{RegistryInstance}, target::AddTarget;
+        io::IO = stderr_f(),
+    )
     d = config.depots
     return app_lock(d) do
         migrate_shims!(d; io)
-        # resolve the request up-front (against an empty environment, so
-        # purely from registries/stdlibs): the environment directory and the
-        # shim load path must use the same name, also for uuid-only requests
-        name, uuid = Planning.resolve_request(
-            Environments.load_environment_from(joinpath(apps_dir(d), "Project.toml"); depots = d),
-            registries, request,
-        )
+        # Resolve registry requests up-front (against an empty environment, so
+        # purely from registries/stdlibs). A materialized repo already carries
+        # its verified identity. In both cases the environment directory and
+        # shim load path use the resolved package name.
+        name, uuid = if target isa PackageRequest
+            Planning.resolve_request(
+                Environments.load_environment_from(joinpath(apps_dir(d), "Project.toml"); depots = d),
+                registries, target,
+            )
+        else
+            (target.name, target.uuid)
+        end
         # Build the per-package environment off to the side. A failed resolve,
         # download, or metadata check must leave the currently installed app
         # runnable.
@@ -400,12 +409,12 @@ function app_add(config::Config, registries::Vector{RegistryInstance}, request::
         # destructuring (a shared binding assigned in both scopes would box)
         entry, apps = mktempdir(apps_dir(d); prefix = ".install-") do staging
             env = Environments.load_environment_from(joinpath(staging, "Project.toml"); depots = d)
-            planned = plan_add(env, registries, config, [request])
+            planned = plan_add(env, registries, config, AddTarget[target])
             result = Execution.apply!(env, planned, registries, config; io)
             ent = result.env.manifest[uuid]
             source = Execution.entry_source_path(result.env.manifest_file, ent, d)
             aps = declared_apps(source, name)
-            validate_app_collisions(read_app_manifest(d), uuid, aps)
+            validate_app_collisions(read_app_manifest(d), uuid, name, aps)
             replace_app_environment!(staging, env_dir)
             (ent, aps)
         end
@@ -448,7 +457,7 @@ function app_rm(d::DepotStack, name::String; io::IO = stderr_f())
             end
         end
         isempty(removed_apps) && isempty(removed_pkgs) &&
-            pkgerror("no app or app-providing package named `$name` is installed")
+            pkgerror("No installed app or app-providing package is named $(repr(name)); run `vpkg> app status` to list installed apps")
         for uuid in removed_pkgs
             entry = deps[uuid]
             entry_path(entry) === nothing && Base.rm(joinpath(apps_dir(d), entry.name); force = true, recursive = true)
@@ -467,9 +476,10 @@ end
     app_update(config, registries, [name]; io)
 
 Update installed apps: registry-tracked app packages are reinstalled at
-their latest resolvable version, path-tracked ones re-resolve in place;
-shims are rewritten either way. `name` (a package or app name) restricts
-the update; with no name every installed app updates.
+their latest resolvable version, repo-tracked ones fetch and reinstall their
+recorded revision, and path-tracked ones re-resolve in place. Shims are
+rewritten either way. `name` (a package or app name) restricts the update;
+with no name every installed app updates.
 """
 function app_update(
         config::Config, registries::Vector{RegistryInstance},
@@ -485,7 +495,7 @@ function app_update(
     end
     if isempty(targets)
         name === nothing ||
-            pkgerror("no app or app-providing package named `$name` is installed")
+            pkgerror("No installed app or app-providing package is named $(repr(name)); run `vpkg> app status` to list installed apps")
         printpkgstyle(io, :Info, "no apps installed", color = Base.info_color())
         return nothing
     end
@@ -494,6 +504,13 @@ function app_update(
         path = entry_path(entry)
         if path !== nothing
             app_develop(config, registries, path; io)
+        elseif is_repo_tracked(entry)
+            repo = Git.materialize_repo_package!(
+                d, entry_repo_url(entry);
+                rev = entry_repo_rev(entry), subdir = entry_repo_subdir(entry),
+                refresh = true, io,
+            )
+            app_add(config, registries, repo; io)
         else
             app_add(config, registries, PackageRequest(entry.name, entry.uuid, nothing); io)
         end

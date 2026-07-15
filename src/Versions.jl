@@ -27,7 +27,7 @@ struct VersionBound
 end
 
 function VersionBound(tin::NTuple{n, Integer}) where {n}
-    n <= 3 || throw(ArgumentError("VersionBound: you can only specify major, minor and patch versions"))
+    n <= 3 || throw(ArgumentError("VersionBound accepts at most three components (major, minor, patch); got $n"))
     n == 0 && return VersionBound((0, 0, 0), 0)
     n == 1 && return VersionBound((tin[1], 0, 0), 1)
     n == 2 && return VersionBound((tin[1], tin[2], 0), 2)
@@ -110,28 +110,31 @@ end
 function VersionBound(s::AbstractString)
     s = strip(s)
     s == "*" && return VersionBound()
-    isempty(s) && throw(ArgumentError("invalid VersionBound string $(repr(s))"))
+    isempty(s) && throw(ArgumentError("Invalid version bound $(repr(s)); expected major, major.minor, or major.minor.patch"))
     first(s) == 'v' && (s = SubString(s, 2))
     l = lastindex(s)
 
     p = findnext('.', s, 1)
     b = p === nothing ? l : (p - 1)
-    i = parse(Int64, SubString(s, 1, b))
+    i = tryparse(Int64, SubString(s, 1, b))
+    i === nothing && throw(ArgumentError("Invalid version bound $(repr(s)); expected major, major.minor, or major.minor.patch"))
     p === nothing && return VersionBound(i)
 
     a = p + 1
     p = findnext('.', s, a)
     b = p === nothing ? l : (p - 1)
-    j = parse(Int64, SubString(s, a, b))
+    j = tryparse(Int64, SubString(s, a, b))
+    j === nothing && throw(ArgumentError("Invalid version bound $(repr(s)); expected major, major.minor, or major.minor.patch"))
     p === nothing && return VersionBound(i, j)
 
     a = p + 1
     p = findnext('.', s, a)
     b = p === nothing ? l : (p - 1)
-    k = parse(Int64, SubString(s, a, b))
+    k = tryparse(Int64, SubString(s, a, b))
+    k === nothing && throw(ArgumentError("Invalid version bound $(repr(s)); expected major, major.minor, or major.minor.patch"))
     p === nothing && return VersionBound(i, j, k)
 
-    throw(ArgumentError("invalid VersionBound string $(repr(s))"))
+    throw(ArgumentError("Invalid version bound $(repr(s)); expected major, major.minor, or major.minor.patch"))
 end
 
 ################
@@ -171,7 +174,7 @@ function VersionRange(s::AbstractString)
     s == "1" && return VersionRange_1
     p = split(s, "-")
     if (length(p) != 1 && length(p) != 2) || any(x -> isempty(strip(x)), p)
-        throw(ArgumentError("invalid version range: $(repr(s))"))
+        throw(ArgumentError("Invalid version range $(repr(s)); expected a bound such as 1.2 or a range such as 1.2-2"))
     end
     lower = VersionBound(p[1])
     upper = length(p) == 1 ? lower : VersionBound(p[2])
@@ -420,9 +423,9 @@ function semver_spec(s::String; throw::Bool = true)
                     # ArgumentError: semantic reject (e.g. "0.0.0"); Inexact/Overflow:
                     # version number too large to fit a VersionBound component.
                     if err isa ArgumentError
-                        throw ? error(err.msg) : return nothing
+                        throw ? error("Invalid version specifier $(repr(s)): $(err.msg)") : return nothing
                     elseif err isa InexactError || err isa OverflowError
-                        throw ? error("invalid version specifier: \"$s\"") : return nothing
+                        throw ? error("Invalid version specifier $(repr(s)): a component is outside the supported range") : return nothing
                     else
                         rethrow()
                     end
@@ -433,7 +436,7 @@ function semver_spec(s::String; throw::Bool = true)
             end
         end
         if !found_match
-            throw ? error("invalid version specifier: \"$s\"") : return nothing
+            throw ? error("Invalid version specifier $(repr(s)); expected ^, ~, =, <, >=, ≥, or a version/range") : return nothing
         end
     end
     return make_spec(ranges)
@@ -447,7 +450,7 @@ function semver_interval(m::RegexMatch)
     minor = (n_significant < 2) ? 0 : parse(Int, _minor)
     patch = (n_significant < 3) ? 0 : parse(Int, _patch)
     if n_significant == 3 && major == 0 && minor == 0 && patch == 0
-        throw(ArgumentError("invalid version: \"0.0.0\""))
+        throw(ArgumentError("0.0.0 cannot be used as a compatibility lower bound because no release satisfies a caret or tilde interval starting there"))
     end
     # Default type is :caret
     vertyp = (typ == "" || typ == "^") ? :caret : :tilde
@@ -485,13 +488,13 @@ function inequality_interval(m::RegexMatch)
     minor = (n_significant < 2) ? 0 : parse(Int, _minor)
     patch = (n_significant < 3) ? 0 : parse(Int, _patch)
     if n_significant == 3 && major == 0 && minor == 0 && patch == 0
-        throw(ArgumentError("invalid version: \"0.0.0\""))
+        throw(ArgumentError("0.0.0 cannot be used as a compatibility boundary in this grammar"))
     end
     v = VersionBound(major, minor, patch)
     if occursin(r"^<\s*$", typ)
         # `< v` = everything strictly below v at three-component precision
         if major == 0 && minor == 0 && patch == 0
-            throw(ArgumentError("invalid version specifier: there are no versions below \"0\""))
+            throw(ArgumentError("there are no versions below 0"))
         end
         nil = VersionBound(0, 0, 0)
         if v[3] == 0
@@ -509,7 +512,7 @@ function inequality_interval(m::RegexMatch)
     elseif occursin(r"^>=\s*$", typ) || occursin(r"^≥\s*$", typ)
         return range_of(v, _inf)
     else
-        throw(ArgumentError("invalid prefix $typ"))
+        throw(ArgumentError("Invalid compatibility operator $(repr(typ)); expected ^, ~, =, <, >=, or ≥"))
     end
 end
 

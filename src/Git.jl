@@ -16,7 +16,7 @@ using FileWatching: mkpidlock
 
 using ..Errors: PkgError, pkgerror
 using ..Utils: stderr_f, can_fancyprint, mv_temp_dir_retries,
-    create_cachedir_tag
+    create_cachedir_tag, sanitize_url, sanitize_external_error
 using ..Timing: @timeit, TIMER
 using ..MiniProgressBars
 using ..TreeHash
@@ -114,7 +114,9 @@ function clone(io::IO, url, source_path; header = nothing, credentials = nothing
         depth = 0
     end
     printstyled(io, lpad("Cloning", 12); color = :green, bold = true)
-    println(io, " ", header === nothing ? "git-repo `$url`" : header)
+    safe_url = sanitize_url(url)
+    safe_header = header === nothing ? "Git repository $(repr(safe_url))" : sanitize_url(string(header))
+    println(io, " ", safe_header)
     bar = MiniProgressBar(header = "Cloning:", color = Base.info_color())
     fancyprint = can_fancyprint(io)
     fancyprint && start_progress(io, bar)
@@ -128,10 +130,15 @@ function clone(io::IO, url, source_path; header = nothing, credentials = nothing
             isbare && push!(args, "--bare")
             push!(args, url, source_path)
             cmd = `git clone $args`
+            error_output = IOBuffer()
             try
-                run(pipeline(cmd; stdout = devnull))
+                run(pipeline(cmd; stdout = devnull, stderr = error_output))
             catch err
-                pkgerror("The command $(cmd) failed, error: $err")
+                cause = strip(String(take!(error_output)))
+                pkgerror(
+                    "Could not clone repository $(repr(safe_url)): " *
+                        sanitize_url(isempty(cause) ? sanitize_external_error(err) : cause)
+                )
             end
             LibGit2.GitRepo(source_path)
         else
@@ -147,12 +154,9 @@ function clone(io::IO, url, source_path; header = nothing, credentials = nothing
         Base.rm(source_path; force = true, recursive = true)
         err isa LibGit2.GitError || err isa InterruptException || rethrow()
         if err isa InterruptException
-            pkgerror("git clone of `$url` interrupted")
-        elseif (err.class == LibGit2.Error.Net && err.code == LibGit2.Error.EINVALIDSPEC) ||
-                (err.class == LibGit2.Error.Repository && err.code == LibGit2.Error.ENOTFOUND)
-            pkgerror("git repository not found at `$(url)`: ($(err.msg))")
+            pkgerror("Cloning repository $(repr(safe_url)) was interrupted")
         else
-            pkgerror("failed to clone from $(url): ($(err.msg))")
+            pkgerror("Could not clone repository $(repr(safe_url)): $(sanitize_external_error(err))")
         end
     finally
         Base.shred!(credentials)
@@ -183,7 +187,9 @@ function fetch(io::IO, repo::LibGit2.GitRepo, remoteurl = nothing; header = noth
     end
     remoteurl = normalize_url(remoteurl)
     printstyled(io, lpad("Updating", 12); color = :green, bold = true)
-    println(io, " ", header === nothing ? "git-repo `$remoteurl`" : header)
+    safe_remote = sanitize_url(remoteurl)
+    safe_header = header === nothing ? "Git repository $(repr(safe_remote))" : sanitize_url(string(header))
+    println(io, " ", safe_header)
     bar = MiniProgressBar(header = "Fetching:", color = Base.info_color())
     fancyprint = can_fancyprint(io)
     fancyprint && start_progress(io, bar)
@@ -196,10 +202,15 @@ function fetch(io::IO, repo::LibGit2.GitRepo, remoteurl = nothing; header = noth
             depth > 0 && push!(args, "--depth=$depth")
             push!(args, remoteurl, only(refspecs))
             cmd = `git $args`
+            error_output = IOBuffer()
             try
-                run(pipeline(cmd; stdout = devnull))
+                run(pipeline(cmd; stdout = devnull, stderr = error_output))
             catch err
-                pkgerror("The command $(cmd) failed, error: $err")
+                cause = strip(String(take!(error_output)))
+                pkgerror(
+                    "Could not fetch repository $(repr(safe_remote)): " *
+                        sanitize_url(isempty(cause) ? sanitize_external_error(err) : cause)
+                )
             end
         else
             callbacks = transfer_callbacks(fancyprint, io, bar)
@@ -211,11 +222,7 @@ function fetch(io::IO, repo::LibGit2.GitRepo, remoteurl = nothing; header = noth
         end
     catch err
         err isa LibGit2.GitError || rethrow()
-        if (err.class == LibGit2.Error.Repository && err.code == LibGit2.Error.ERROR)
-            pkgerror("Git repository not found at '$(remoteurl)': ($(err.msg))")
-        else
-            pkgerror("failed to fetch from $(remoteurl): ($(err.msg))")
-        end
+        pkgerror("Could not fetch repository $(repr(safe_remote)): $(sanitize_external_error(err))")
     finally
         Base.shred!(credentials)
         fancyprint && end_progress(io, bar)
@@ -380,12 +387,8 @@ function install_tree_from_git!(
     )
     if isempty(urls)
         pkgerror(
-            "Package $name [$uuid] has no repository URL available. This could happen if:\n" *
-                "  - The package is not registered in any configured registry\n" *
-                "  - The package exists in a registry but lacks repository information\n" *
-                "  - Registry files are corrupted or incomplete\n" *
-                "  - Network issues prevented registry updates\n" *
-                "Please check that the package name is correct and that your registries are up to date."
+            "No repository URL is recorded for package $name [$uuid]. " *
+                "Verify that the package is registered correctly, update the configured registries, and retry"
         )
     end
     cdir = mkpath(clones_dir(depots1(depots)))
@@ -402,7 +405,7 @@ function install_tree_from_git!(
             first_url = first(urls)
             repo = ensure_clone(
                 io, repo_path, first_url; isbare = true,
-                header = "[$uuid] $name from $first_url", depth = 1
+                header = "[$uuid] $name from $(sanitize_url(first_url))", depth = 1
             )
             git_hash = LibGit2.GitHash(hash.bytes)
             for url in urls
@@ -422,10 +425,13 @@ function install_tree_from_git!(
                 LibGit2.GitObject(repo, git_hash)
             catch err
                 err isa LibGit2.GitError && err.code == LibGit2.Error.ENOTFOUND || rethrow()
-                error("$name: git object $(string(hash)) could not be found")
+                pkgerror("Revision $(string(hash)) was not found for package $name [$uuid]")
             end
             tree isa LibGit2.GitTree ||
-                error("$name: git object $(string(hash)) should be a tree, not $(typeof(tree))")
+                pkgerror(
+                "Expected revision $(string(hash)) for package $name [$uuid] to be a tree, " *
+                    "but found $(typeof(tree))"
+            )
             # stage the checkout in the depot's temp area (same filesystem) and
             # move it into place atomically: checking out into `version_path`
             # directly would leave an interrupted checkout to be accepted as a
@@ -535,7 +541,11 @@ store, and read the package's Project.toml for its identity.
                 # picked up by a re-add
                 close(repo)
                 Base.rm(cache; force = true, recursive = true)
-                pkgerror("invalid git HEAD in $url ($(err.msg))")
+                pkgerror(
+                    "Repository $(repr(sanitize_url(url))) has no valid HEAD. Ensure it contains at least " *
+                        "one commit and has a valid default branch. Git reported: " *
+                        sanitize_external_error(err)
+                )
             end
             actual_rev = LibGit2.shortname(head)
             obj = LibGit2.peel(LibGit2.GitCommit, LibGit2.GitObject(repo, LibGit2.GitHash(head)))
@@ -565,7 +575,10 @@ store, and read the package's Project.toml for its identity.
                 fetch(io, repo, url; refspecs = refspecs_fallback)
                 obj, kind = lookup_rev(repo, rev)
             end
-            obj === nothing && pkgerror("git object $(repr(rev)) could not be found in `$url`")
+            obj === nothing && pkgerror(
+                "Revision $(repr(rev)) was not found in repository $(repr(sanitize_url(url))). " *
+                    "Check the branch, tag, or commit spelling and your access permissions"
+            )
         end
 
         # Check the (sub)tree out to a scoped temp dir and move it into the
@@ -585,21 +598,26 @@ store, and read the package's Project.toml for its identity.
             try
                 checkout_tree_to_path(checkout_repo, tree, temp)
                 pkg_root = subdir === nothing ? temp : joinpath(temp, subdir)
-                isdir(pkg_root) || pkgerror("path `$subdir` does not exist in the repository at `$url`")
+                isdir(pkg_root) || pkgerror(
+                    "Subdirectory $(repr(subdir)) does not exist in repository $(repr(sanitize_url(url)))"
+                )
                 git_subdir = subdir === nothing ? "." : replace(normpath(subdir), '\\' => '/')
                 package_tree = git_subdir == "." ? tree : tree[git_subdir]
                 package_tree isa LibGit2.GitTree || pkgerror(
-                    "path `$subdir` is not a directory in the repository at `$url`"
+                    "Revision $(repr(checkout_rev)) at subdirectory $(repr(subdir)) in repository " *
+                        "$(repr(sanitize_url(url))) is not a tree"
                 )
                 tree_hash = SHA1(string(LibGit2.GitHash(package_tree)))
 
                 project_file = projectfile_path(pkg_root; strict = true)
                 project_file === nothing && pkgerror(
-                    "could not find project file (Project.toml or JuliaProject.toml) in package at `$url` maybe `subdir` needs to be specified"
+                    "No Project.toml or JuliaProject.toml was found in subdirectory " *
+                        "$(repr(something(subdir, "."))) of repository $(repr(sanitize_url(url)))"
                 )
                 project = read_project(project_file)
                 (project.name === nothing || project.uuid === nothing) && pkgerror(
-                    "expected a `name` and `uuid` entry in project file at `$project_file`"
+                    "Project file $(repr(project_file)) in repository $(repr(sanitize_url(url))) " *
+                        "must define both name and uuid"
                 )
 
                 path, installed = find_installed(depots, project.name, project.uuid, tree_hash)

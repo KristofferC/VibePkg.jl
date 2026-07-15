@@ -185,11 +185,11 @@ fetched; path/repo-tracked entries are always materialized.
         if tracking isa PathTracked
             path = entry_source_path(env.manifest_file, entry, depots)
             isdir(path) || pkgerror(
-                "expected package `$(entry.name) [$(string(uuid)[1:8])]` to exist at path `$path`"
+                "Package $(entry.name) [$uuid] is expected at path $(repr(path)), but that path does not exist; correct it or run VibePkg.resolve()"
             )
         elseif tracking isa RepoTracked
             hash = tracking.tree_hash
-            hash === nothing && pkgerror("manifest entry for `$(entry.name)` tracks a repository without a tree hash")
+            hash === nothing && pkgerror("Manifest entry for $(entry.name) [$uuid] tracks a repository without git-tree-sha1")
             _, installed = find_installed(depots, entry.name, uuid, hash)
             # tarballs of a subdir package's repo can't verify against the
             # subdir tree hash; the git fallback handles those
@@ -213,8 +213,8 @@ fetched; path/repo-tracked entries are always materialized.
         # load without them, so this is an error
         names = join(sort!(String[w.name for w in work]), ", ")
         pkgerror(
-            "cannot download missing package sources in offline mode: $names. " *
-                "Unset `JULIA_PKG_OFFLINE` (or `Pkg.offline(false)`) to allow downloads."
+            "Cannot download missing package sources in offline mode: $names. " *
+                "Unset JULIA_PKG_OFFLINE or call VibePkg.offline(false) to allow downloads"
         )
     end
     parallel_foreach_progress(
@@ -440,10 +440,11 @@ end
 """
     instantiate!(env, registries, config; julia_version_strict, workspace, io) -> installed
 
-Make everything the manifest records present on disk:
+Make the active project's loadable dependency closure present on disk:
 never rewrites the manifest. Errors when a direct dependency is missing
-from the manifest; warns on a stale project hash. `workspace = true` also
-requires every workspace member's direct dependencies to have entries.
+from the manifest; warns on a stale project hash. `workspace = true` widens
+installation to the whole manifest and also requires every workspace member's
+direct dependencies to have entries.
 """
 function instantiate!(
         env::Environment, registries::Vector{RegistryInstance}, config::Config;
@@ -457,19 +458,20 @@ function instantiate!(
     for (name, uuid) in direct
         if !haskey(env.manifest, uuid)
             pkgerror(
-                "`$name` is a direct dependency, but does not appear in the manifest. " *
-                    "If you intend `$name` to be a direct dependency, run `Pkg.resolve()` to populate the manifest."
+                "Direct dependency $name [$uuid] is missing from manifest $(repr(env.manifest_file)). " *
+                    "Run VibePkg.resolve() to populate the manifest"
             )
         end
     end
     current = is_manifest_current(env)
     if current === false
-        @warn """The project environment's manifest does not match its Project.toml.
-        It is advised to run `Pkg.resolve()` (or `Pkg.update()`) to synchronize them.""" maxlog = 1
+        @warn """Manifest $(repr(env.manifest_file)) does not match project $(repr(env.project_file)).
+        Run VibePkg.resolve() or VibePkg.up() to synchronize them.""" maxlog = 1
     end
     check_manifest_julia_version_compat(env.manifest, env.manifest_file; julia_version_strict)
-    installed = ensure_sources_installed!(env, registries, config; io)
-    ensure_artifacts!(env, config; io)
+    loadable = workspace ? nothing : loadable_uuids(env)
+    installed = ensure_sources_installed!(env, registries, config; io, loadable)
+    ensure_artifacts!(env, config; io, only = loadable)
     return installed
 end
 

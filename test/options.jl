@@ -9,6 +9,8 @@ LocalPkgServer.isolate!()
 
 using Test
 using Base: UUID
+import LibGit2
+import TOML
 using VibePkg
 using VibePkg.Configs: Config, UPLEVEL_FIXED, default_preserve
 using VibePkg.Depots: depot_stack
@@ -27,6 +29,7 @@ end
 const TOP_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 const DEP_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 const OLD_UUID = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+const LEVEL_UUID = UUID("12121212-3434-5656-7878-909090909090")
 
 # Top → Dep (both with a 1.0.0 and a 1.0.1), plus Oldie which the registry
 # marks deprecated: enough structure to tell the up modes apart and to
@@ -98,6 +101,69 @@ function add_new_versions!(depot)
                 """
             )
         end
+    end
+    return
+end
+
+# A real local package repository plus an unpacked registry with one patch and
+# one minor release. Public `up` can therefore exercise planning, fetching,
+# installation, and manifest writing without contacting the network.
+function make_update_level_fixture(dir, depot)
+    src = joinpath(dir, "LevelPkg")
+    mkpath(joinpath(src, "src"))
+    repo = LibGit2.init(src)
+    hashes = Dict{VersionNumber, String}()
+    sig = LibGit2.Signature("options test", "options@localhost")
+    try
+        for version in (v"1.0.0", v"1.0.1", v"1.1.0")
+            write(
+                joinpath(src, "Project.toml"),
+                "name = \"LevelPkg\"\nuuid = \"$LEVEL_UUID\"\nversion = \"$version\"\n",
+            )
+            write(
+                joinpath(src, "src", "LevelPkg.jl"),
+                "module LevelPkg\nconst FIXTURE_VERSION = v\"$version\"\nend\n",
+            )
+            LibGit2.add!(repo, ".")
+            LibGit2.commit(
+                repo, "release $version"; author = sig, committer = sig,
+            )
+            obj = LibGit2.GitObject(repo, "HEAD")
+            tree = LibGit2.peel(LibGit2.GitTree, obj)
+            try
+                hashes[version] = string(LibGit2.GitHash(tree))
+            finally
+                close(tree)
+                close(obj)
+            end
+        end
+    finally
+        close(repo)
+    end
+
+    reg = joinpath(depot, "registries", "LevelRegistry")
+    pkg = mkpath(joinpath(reg, "L", "LevelPkg"))
+    mkpath(reg)
+    open(joinpath(reg, "Registry.toml"), "w") do io
+        TOML.print(
+            io,
+            Dict(
+                "name" => "LevelRegistry",
+                "uuid" => "23338594-aafe-5451-b93e-139f81909109",
+                "packages" => Dict(
+                    string(LEVEL_UUID) => Dict("name" => "LevelPkg", "path" => "L/LevelPkg"),
+                ),
+            ),
+        )
+    end
+    open(joinpath(pkg, "Package.toml"), "w") do io
+        TOML.print(io, Dict("name" => "LevelPkg", "uuid" => string(LEVEL_UUID), "repo" => src))
+    end
+    open(joinpath(pkg, "Versions.toml"), "w") do io
+        TOML.print(
+            io,
+            Dict(string(version) => Dict("git-tree-sha1" => hash) for (version, hash) in hashes),
+        )
     end
     return
 end
@@ -263,6 +329,11 @@ end
                 VibePkg.API.activate("optenv"; shared = true, io = devnull)
                 @test Base.ACTIVE_PROJECT[] ==
                     joinpath(depot, "environments", "optenv", "Project.toml")
+                shared_project = Base.ACTIVE_PROJECT[]
+                for bad in ("", ".", "..", "./Foo", "Foo/Bar", "../Bar")
+                    @test_throws PkgError VibePkg.API.activate(bad; shared = true, io = devnull)
+                    @test Base.ACTIVE_PROJECT[] == shared_project
+                end
                 # an existing shared env in a later depot wins over creating anew
                 mktempdir() do depot2
                     depot2 = realpath(depot2)
@@ -272,7 +343,6 @@ end
                     @test Base.ACTIVE_PROJECT[] ==
                         joinpath(depot2, "environments", "optenv2", "Project.toml")
                 end
-                @test_throws PkgError VibePkg.API.activate("bad/name"; shared = true, io = devnull)
                 @test_throws PkgError VibePkg.API.activate(; shared = true, io = devnull)
                 @test_throws PkgError VibePkg.API.activate("x"; shared = true, temp = true, io = devnull)
             finally
@@ -281,24 +351,90 @@ end
             end
         end
 
-        @testset "develop --local clone target" begin
+        @testset "shared develop honors JULIA_PKG_DEVDIR; local ignores it" begin
             old_active = Base.ACTIVE_PROJECT[]
             try
                 mktempdir() do projdir
                     projdir = realpath(projdir)
                     write(joinpath(projdir, "Project.toml"), "")
                     Base.ACTIVE_PROJECT[] = joinpath(projdir, "Project.toml")
-                    clone_dir, track = VibePkg.API.dev_clone_target(Config(depots), "Example"; shared = false)
-                    @test clone_dir == joinpath(projdir, "dev", "Example")
-                    @test track == joinpath("dev", "Example")
-                    clone_shared, track_shared = VibePkg.API.dev_clone_target(Config(depots), "Example"; shared = true)
-                    @test isabspath(track_shared) && clone_shared == track_shared
-                    @test endswith(track_shared, joinpath("dev", "Example"))
+                    custom_devdir = joinpath(projdir, "custom-shared-dev")
+                    withenv("JULIA_PKG_DEVDIR" => custom_devdir) do
+                        config = Config(depots)
+
+                        clone_shared, track_shared =
+                            VibePkg.API.dev_clone_target(config, "Example"; shared = true)
+                        @test clone_shared == track_shared == joinpath(custom_devdir, "Example")
+
+                        clone_local, track_local =
+                            VibePkg.API.dev_clone_target(config, "Example"; shared = false)
+                        @test clone_local == joinpath(projdir, "dev", "Example")
+                        @test track_local == joinpath("dev", "Example")
+                        @test !startswith(clone_local, custom_devdir)
+                    end
                 end
             finally
                 Base.ACTIVE_PROJECT[] = old_active
             end
         end
+    end
+end
+
+@testset "public up: patch/minor levels and missing manifest" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depot_path = copy(Base.DEPOT_PATH)
+    old_auto_precompile = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+    old_auto_gc = VibePkg.API.AUTO_GC_ENABLED[]
+    old_registry_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        VibePkg.API.AUTO_GC_ENABLED[] = false
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        mktempdir() do dir
+            dir = realpath(dir)
+            depot = mkpath(joinpath(dir, "depot"))
+            make_update_level_fixture(dir, depot)
+            copy!(Base.DEPOT_PATH, [depot])
+            depots = depot_stack([depot])
+
+            withenv("JULIA_PKG_SERVER" => "", "JULIA_PKG_OFFLINE" => nothing) do
+                envdir = mkpath(joinpath(dir, "levels"))
+                write(joinpath(envdir, "Project.toml"), "")
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+
+                VibePkg.add(PackageSpec(name = "LevelPkg", version = v"1.0.0"); io = devnull)
+                env = load_environment(envdir; depots)
+                @test entry_version(env.manifest[LEVEL_UUID]) == v"1.0.0"
+
+                VibePkg.up(; level = UPLEVEL_PATCH, io = devnull)
+                env = load_environment(envdir; depots)
+                @test entry_version(env.manifest[LEVEL_UUID]) == v"1.0.1"
+
+                VibePkg.up(; level = UPLEVEL_MINOR, io = devnull)
+                env = load_environment(envdir; depots)
+                @test entry_version(env.manifest[LEVEL_UUID]) == v"1.1.0"
+
+                # A project-only environment is enough input for public `up`:
+                # it resolves, installs, and writes a new manifest.
+                fresh = mkpath(joinpath(dir, "no-manifest"))
+                write(
+                    joinpath(fresh, "Project.toml"),
+                    "[deps]\nLevelPkg = \"$LEVEL_UUID\"\n",
+                )
+                @test !isfile(joinpath(fresh, "Manifest.toml"))
+                Base.ACTIVE_PROJECT[] = joinpath(fresh, "Project.toml")
+                VibePkg.up(; io = devnull)
+                @test isfile(joinpath(fresh, "Manifest.toml"))
+                fresh_env = load_environment(fresh; depots)
+                @test entry_version(fresh_env.manifest[LEVEL_UUID]) == v"1.1.0"
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        copy!(Base.DEPOT_PATH, old_depot_path)
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto_precompile
+        VibePkg.API.AUTO_GC_ENABLED[] = old_auto_gc
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_registry_gate
     end
 end
 
@@ -488,7 +624,7 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("update", sprint(showerror, err))
+            @test occursin("VibePkg.up", sprint(showerror, err))
 
             # widened compat still conflicts with the manifest as-is, but
             # `up` re-resolves and lands on the newest allowed version

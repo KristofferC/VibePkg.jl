@@ -1,7 +1,7 @@
 # Pkg.build.
 #
 # Packages with a `deps/build.jl` are built deps-first in a julia
-# subprocess; output goes to `scratchspaces/<uuid>/<treehash>/build.log`
+# subprocess; output goes to Pkg's `scratchspaces/<uuid>/<treehash>/build.log`
 # (dev'd packages: `deps/build.log`) and failures surface the log.
 
 module BuildOps
@@ -9,7 +9,7 @@ module BuildOps
 using Base: UUID
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f
+using ..Utils: stderr_f, create_cachedir_tag
 using ..Timing: @timeit, TIMER
 using ..EnvFiles
 using ..EnvFiles: ManifestEntry, entry_tree_hash, is_path_tracked, with_project
@@ -23,13 +23,19 @@ export build!
 
 build_file(source::String) = joinpath(source, "deps", "build.jl")
 
+# Pkg owns build-log scratchspaces even when a different package is being
+# built; this is the same stable scratchspace UUID used by Pkg itself.
+const PKG_SCRATCH_UUID = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+
 function build_log_file(d::DepotStack, entry::ManifestEntry, source::String)
     if is_path_tracked(entry)
         return joinpath(source, "deps", "build.log")
     end
     hash = entry_tree_hash(entry)
     key = hash === nothing ? "unknown" : string(hash)
-    dir = mkpath(joinpath(scratchspaces_dir(depots1(d)), string(entry.uuid), key))
+    scratch_root = scratchspaces_dir(depots1(d))
+    dir = mkpath(joinpath(scratch_root, PKG_SCRATCH_UUID, key))
+    create_cachedir_tag(scratch_root)
     return joinpath(dir, "build.log")
 end
 
@@ -102,12 +108,13 @@ function run_build(
         end
     end
     if !ok && verbose
-        pkgerror("Error building `$(entry.name)`")
+        pkgerror("Build failed for $(entry.name)")
     elseif !ok
         tail = isfile(log_file) ? last(readlines(log_file), min(50, countlines(log_file))) : String[]
+        detail = isempty(tail) ? "Build log is missing or empty" :
+            "Error building $(entry.name); showing the last $(length(tail)) lines of the build log:\n" * join(tail, "\n")
         pkgerror(
-            "Error building `$(entry.name)`" *
-                (isempty(tail) ? "" : ": \n" * join(tail, "\n"))
+            "$detail\nFull log: $log_file"
         )
     end
     return
@@ -134,12 +141,13 @@ With an empty `uuids`, builds the project's direct dependencies that need it.
         (source === nothing || !isdir(source)) && continue
         isfile(build_file(source)) || continue
         log_file = build_log_file(depots, entry, source)
-        run_build(env, entry, source, log_file, depots; io, verbose)
         # a scratch-usage entry keyed by the log's scratchspace keeps it
         # alive in gc while the parent project exists (path-tracked entries
-        # log into the package itself — no scratchspace involved)
+        # log into the package itself — no scratchspace involved). Record it
+        # before running: failed builds retain their diagnostic log too.
         is_path_tracked(entry) ||
             log_scratch_usage(depots, dirname(log_file), env.project_file)
+        run_build(env, entry, source, log_file, depots; io, verbose)
     end
     return
 end

@@ -434,6 +434,56 @@ end
     """
     m = read_manifest(IOBuffer(manifest))
     @test haskey(m, UUID("7876af07-990d-54b4-ab0e-23690620f79a"))
+
+    project_file = "/tmp/audited/Project.toml"
+    source_err = try
+        E.parse_project(
+            Dict{String, Any}(
+                "sources" => Dict{String, Any}(
+                    "Foo" => Dict{String, Any}("path" => 1),
+                ),
+            );
+            file = project_file,
+        )
+        nothing
+    catch err
+        err
+    end
+    @test source_err isa PkgError
+    source_message = sprint(showerror, source_err)
+    @test occursin(project_file, source_message)
+    @test occursin("[sources]", source_message)
+    @test occursin("path", source_message)
+    @test occursin("1", source_message)
+
+    compat_err = try
+        E.parse_project(
+            Dict{String, Any}("compat" => Dict{String, Any}("Foo" => 1));
+            file = project_file,
+        )
+        nothing
+    catch err
+        err
+    end
+    @test compat_err isa PkgError
+    compat_message = sprint(showerror, compat_err)
+    @test occursin(project_file, compat_message)
+    @test occursin("[compat]", compat_message)
+    @test occursin("Foo", compat_message)
+
+    manifest_err = try
+        E.parse_manifest(
+            Dict{String, Any}("manifest_format" => "2.0", "deps" => "not-a-table"),
+            IOBuffer(),
+        )
+        nothing
+    catch err
+        err
+    end
+    @test manifest_err isa PkgError
+    manifest_message = sprint(showerror, manifest_err)
+    @test occursin("deps", lowercase(manifest_message))
+    @test occursin("table", lowercase(manifest_message))
 end
 
 # Pkg.jl manifests.jl "v3.0: unknown format, warn" — a manifest declaring a

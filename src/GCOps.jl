@@ -17,7 +17,7 @@ using ..Utils: stderr_f
 using ..EnvFiles
 using ..EnvFiles: entry_tree_hash, entry_repo_url
 using ..Depots: DepotStack, depots, depots1, logdir, packages_dir, clones_dir,
-    artifacts_dir, scratchspaces_dir, atomic_toml_write
+    registries_dir, artifacts_dir, scratchspaces_dir, atomic_toml_write
 using ..Utils: printpkgstyle, pathrepr
 import ..Git
 
@@ -38,7 +38,7 @@ function condense_usage!(usage_file::String)
     usage = try
         TOML.parsefile(usage_file)
     catch err
-        @warn "Failed to parse usage file `$usage_file`; the content it tracks will not be collected." err
+        @warn "Could not parse usage log $(repr(usage_file)); its tracked content will be retained and the dependent garbage-collection sweep will be skipped" exception = err
         return nothing
     end
     # entries may have any shape (foreign writers, torn writes): salvage what
@@ -65,7 +65,7 @@ function condense_usage!(usage_file::String)
     try
         atomic_toml_write(usage_file, usage, sorted = true)
     catch err
-        @error "Failed to write valid usage file `$usage_file`" exception = err
+        @error "Could not rewrite usage log $(repr(usage_file)); the next garbage collection may retain unreachable content" exception = err
     end
     return collect(keys(usage))
 end
@@ -86,7 +86,7 @@ function artifact_hashes(artifacts_toml::String)
     raw = try
         TOML.parsefile(artifacts_toml)
     catch err
-        @warn "Reading artifacts file at $artifacts_toml failed with error" err
+        @warn "Could not read $(repr(artifacts_toml)) while determining live artifacts; entries referenced only by this file may be collected. Fix the file before running gc" exception = err
         return hashes
     end
     artifact_walk!(hashes, raw)
@@ -124,6 +124,31 @@ function sweep!(dir::String, keep::Set{String}; verbose::Bool, io::IO, label::St
         deleted += 1
     end
     return deleted, freed
+end
+
+# Directory registries installed from Git retain their repository so updates can
+# fast-forward them. Match Pkg's maintenance step: compact each such repository
+# after the depot sweep, while leaving packed registries and plain directories
+# alone. Registry maintenance is best-effort and must not make package garbage
+# collection fail.
+function gc_registries!(gc_depots::Vector{String}; verbose::Bool, io::IO)
+    git = Sys.which("git")
+    git === nothing && return
+    for depot in gc_depots
+        reg_dir = registries_dir(depot)
+        isdir(reg_dir) || continue
+        for reg_name in readdir(reg_dir)
+            reg_path = joinpath(reg_dir, reg_name)
+            isdir(joinpath(reg_path, ".git")) || continue
+            try
+                verbose && printpkgstyle(io, :GC, "running git gc on registry $reg_name")
+                run(pipeline(`$git -C $reg_path gc --quiet`; stdout = devnull, stderr = devnull))
+            catch err
+                verbose && @warn "git gc failed for registry $reg_name" exception = err
+            end
+        end
+    end
+    return
 end
 
 """
@@ -164,7 +189,7 @@ function gc(
             raw = try
                 TOML.parsefile(scratch_file)
             catch err
-                @warn "Failed to parse usage file `$scratch_file`; the content it tracks will not be collected." err
+                @warn "Could not parse scratch usage log $(repr(scratch_file)); its tracked content will be retained and scratchspace collection will be skipped" exception = err
                 sweep_scratch = false
                 Dict{String, Any}()
             end
@@ -198,7 +223,7 @@ function gc(
         manifest = try
             read_manifest(manifest_file)
         catch err
-            @warn "Reading manifest file at $manifest_file failed with error" err
+            @warn "Could not read $(repr(manifest_file)) while determining live packages; entries referenced only by this file may be collected. Fix the file before running gc" exception = err
             continue
         end
         for (uuid, entry) in manifest
@@ -290,6 +315,7 @@ function gc(
     else
         printpkgstyle(io, :Deleted, join(parts, ", ") * " ($(format_mib(freed)))")
     end
+    gc_registries!(gc_depots; verbose, io)
     touch(gc_stamp(depots1(d)))
     return nothing
 end

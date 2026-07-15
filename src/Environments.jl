@@ -70,10 +70,12 @@ function find_project_file(env::Union{Nothing, String} = nothing)
     project_file = nothing
     if env isa Nothing
         project_file = Base.active_project()
-        project_file === nothing && pkgerror("no active project")
+        project_file === nothing && pkgerror("No active project was found in the current load path")
     elseif startswith(env, '@')
         project_file = Base.load_path_expand(env)
-        project_file === nothing && pkgerror("package environment does not exist: $env")
+        project_file === nothing && pkgerror(
+            "Package environment $(repr(env)) does not exist; expected Project.toml or JuliaProject.toml in a matching shared environment"
+        )
     elseif env isa String
         if isdir(env)
             # activate semantics: a directory with a project file targets that
@@ -82,7 +84,9 @@ function find_project_file(env::Union{Nothing, String} = nothing)
             if existing !== nothing
                 project_file = existing
             else
-                isempty(readdir(env)) || pkgerror("environment is a package directory: $env")
+                isempty(readdir(env)) || pkgerror(
+                    "Environment directory $(repr(abspath(env))) is non-empty but contains neither Project.toml nor JuliaProject.toml"
+                )
                 project_file = joinpath(env, Base.project_names[end])
             end
         else
@@ -91,12 +95,7 @@ function find_project_file(env::Union{Nothing, String} = nothing)
         end
     end
     if isfile(project_file) && !contains(basename(project_file), "Project")
-        pkgerror(
-            """
-            The active project has been set to a file that isn't a Project file: $project_file
-            The project path must be to a Project file or directory.
-            """
-        )
+        pkgerror("Active project path $(repr(project_file)) is not Project.toml or JuliaProject.toml; select a project file or directory")
     end
     # canonicalize the parent directory but keep a symlinked project file
     # itself: resolving it would move the environment's identity to the link
@@ -153,7 +152,8 @@ function collect_workspace_members!(
     for rel in get(project.workspace, "projects", String[])
         pf = projectfile_path(joinpath(dirname(file), rel); strict = true)
         if pf === nothing
-            @warn "workspace member `$rel` of $(file) has no project file" maxlog = 1
+            member_path = abspath(joinpath(dirname(file), rel))
+            @warn "Workspace member $(repr(member_path)) listed by $(repr(file)) contains neither Project.toml nor JuliaProject.toml" maxlog = 1
             continue
         end
         rp = safe_realpath(pf)
@@ -370,7 +370,7 @@ changes touch nothing on disk). Returns whether anything was written.
     # target value would let an older undo snapshot with `readonly = false`
     # disable the guard while rewriting the current readonly project.
     if old.project.readonly && !skip_readonly_check
-        pkgerror("Cannot modify a readonly environment. The project at $(new.project_file) is marked as readonly.")
+        pkgerror("Cannot modify read-only environment: project $(repr(new.project_file)) sets readonly = true")
     end
 
     wrote = false

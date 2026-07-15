@@ -8,6 +8,7 @@ LocalPkgServer.isolate!()
 using Test
 using UUIDs: UUID
 using TOML
+import VibePkg
 using VibePkg.Depots
 using VibePkg.Configs: Config
 using VibePkg.Stdlibs
@@ -174,41 +175,111 @@ end
 end
 
 # Pkg.jl new.jl "Issue #4345: pidfile in writable location when depot is
-# readonly" — with an actually read-only depot behind a writable one, a package
-# already present in the readonly depot is served without writing a pidfile
-# there, and a new package installs into the writable depot without a
-# permission error.
+# readonly" — exercise the public operation boundary, not just depot lookup.
+# The exact version added to the second environment already lives in the
+# read-only depot; the add must use it without putting its source pidlock (or
+# any other write) there. A subsequent version change also proves that a
+# genuinely new source tree is installed into the writable first depot.
 @testset "readonly depot: pidfiles stay writable (#4345)" begin
     fx = LocalPkgServer.ensure!()
     example_uuid = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
-    h4 = Base.SHA1(fx.version_hashes["0.5.4"])
+    h3 = Base.SHA1(fx.version_hashes["0.5.3"])
     h5 = Base.SHA1(fx.version_hashes["0.5.5"])
     mktempdir() do dir
         ro = mkpath(joinpath(dir, "ro"))
         wr = mkpath(joinpath(dir, "wr"))
-        # seed 0.5.4 into the depot that will become read-only
-        Fetch.ensure_package_installed!(
-            depot_stack([ro]), "Example", example_uuid, h4, String[]; readonly = false, io = devnull,
-        )
-        chmod(ro, 0o555; recursive = true)
+        seed_env = mkpath(joinpath(dir, "seed_env"))
+        add_env = mkpath(joinpath(dir, "add_env"))
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_registry_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+
+        # Compare names, modes, symlink targets, and every file's bytes. This
+        # catches even a lock parent or other write that survives the public
+        # operation; the permissions make an attempted pidfile creation fail
+        # before it could be removed.
+        snapshot_depot = function (root)
+            entries = Pair{String, Any}[
+                "." => (filemode(root), :directory, nothing),
+            ]
+            for (parent, dirs, files) in walkdir(root)
+                for name in [dirs; files]
+                    path = joinpath(parent, name)
+                    payload = if islink(path)
+                        (:symlink, readlink(path))
+                    elseif isfile(path)
+                        (:file, read(path))
+                    else
+                        (:directory, nothing)
+                    end
+                    push!(entries, relpath(path, root) => (filemode(path), payload...))
+                end
+            end
+            return sort!(entries; by = first)
+        end
+
         try
-            d = depot_stack([wr, ro])
-            # 0.5.4 is already in the readonly depot: served as-is, no pidfile there
-            p4, new4 = Fetch.ensure_package_installed!(
-                d, "Example", example_uuid, h4, String[]; readonly = false, io = devnull,
+            # Seed the registry and Example 0.5.3 using the same public API as
+            # upstream, but entirely from LocalPkgServer.
+            append!(empty!(Base.DEPOT_PATH), [ro; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(seed_env, "Project.toml")
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+            VibePkg.add(
+                VibePkg.PackageSpec(name = "Example", version = v"0.5.3"); io = devnull,
             )
-            @test !new4
-            @test startswith(p4, ro)
-            @test !isfile(joinpath(ro, "packages", "Example", Base.version_slug(example_uuid, h4)) * ".pid")
-            # 0.5.5 is new: installs into the writable depot without erroring
-            p5, new5 = Fetch.ensure_package_installed!(
-                d, "Example", example_uuid, h5, String[]; readonly = false, io = devnull,
+            ro_source = joinpath(
+                ro, "packages", "Example", Base.version_slug(example_uuid, h3),
             )
-            @test new5
-            @test startswith(p5, wr)
-            @test isfile(joinpath(p5, "Project.toml"))
+            @test isfile(joinpath(ro_source, "src", "Example.jl"))
+
+            chmod(ro, 0o555; recursive = true)
+            @test filemode(ro) & 0o222 == 0
+            readonly_snapshot = snapshot_depot(ro)
+            @test all(entry -> entry.second[1] & 0o222 == 0, readonly_snapshot)
+
+            # A pre-existing manifest makes environment-usage logging perform
+            # a real pidlocked depot write; it must land in the writable first
+            # depot while the package source is read from the later depot.
+            write(joinpath(add_env, "Project.toml"), "")
+            write(joinpath(add_env, "Manifest.toml"), "")
+            append!(empty!(Base.DEPOT_PATH), [wr, ro, old_depots[2:end]...])
+            Base.ACTIVE_PROJECT[] = joinpath(add_env, "Project.toml")
+
+            VibePkg.add(
+                VibePkg.PackageSpec(name = "Example", version = v"0.5.3"); io = devnull,
+            )
+            info3 = VibePkg.dependencies()[example_uuid]
+            @test info3.version == v"0.5.3"
+            @test info3.source == ro_source
+            @test isfile(joinpath(add_env, "Manifest.toml"))
+            usage_file = joinpath(wr, "logs", "manifest_usage.toml")
+            @test isfile(usage_file)
+            expected_manifest = joinpath(add_env, "Manifest.toml")
+            @test any(
+                path -> isfile(path) && Base.Filesystem.samefile(path, expected_manifest),
+                keys(TOML.parsefile(usage_file)),
+            )
+            @test snapshot_depot(ro) == readonly_snapshot
+            @test isempty(filter(p -> endswith(p, ".pid"), first.(readonly_snapshot)))
+
+            # Installing content which is not in the read-only depot still
+            # targets the first depot; it must not be placed beside 0.5.3.
+            VibePkg.add(
+                VibePkg.PackageSpec(name = "Example", version = v"0.5.5"); io = devnull,
+            )
+            wr_source = joinpath(
+                wr, "packages", "Example", Base.version_slug(example_uuid, h5),
+            )
+            info5 = VibePkg.dependencies()[example_uuid]
+            @test info5.version == v"0.5.5"
+            @test info5.source == wr_source
+            @test isfile(joinpath(wr_source, "src", "Example.jl"))
+            @test snapshot_depot(ro) == readonly_snapshot
         finally
-            chmod(ro, 0o755; recursive = true)      # restore so mktempdir can clean up
+            ispath(ro) && chmod(ro, 0o755; recursive = true)
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_registry_gate
         end
     end
 end
