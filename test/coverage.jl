@@ -97,7 +97,11 @@ end
         @test isfile(tracefile)
         @test filesize(tracefile) > 0
         lcov = read(tracefile, String)
-        @test occursin("SF:$source_file", lcov)
+        source_paths = [line[4:end] for line in eachline(IOBuffer(lcov)) if startswith(line, "SF:")]
+        @test any(
+            path -> isfile(path) && Base.Filesystem.samefile(path, source_file),
+            source_paths,
+        )
         @test occursin(r"(?m)^DA:\d+,[1-9]\d*", lcov)
         @test occursin(r"(?m)^end_of_record$", lcov)
     end

@@ -1380,7 +1380,7 @@ end
 
 """
     plan_promote(env, registries, requests; respect_sysimage_versions) ->
-        Union{Nothing, Tuple{Environment, Vector{String}}}
+    Union{Nothing, Tuple{Environment, Vector{String}}}
 
 Add's already-present fast path. If every request names a package that is
 already a registry-tracked, unpinned manifest entry whose version satisfies

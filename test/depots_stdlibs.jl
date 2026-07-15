@@ -254,7 +254,11 @@ end
             @test isfile(joinpath(add_env, "Manifest.toml"))
             usage_file = joinpath(wr, "logs", "manifest_usage.toml")
             @test isfile(usage_file)
-            @test haskey(TOML.parsefile(usage_file), joinpath(add_env, "Manifest.toml"))
+            expected_manifest = joinpath(add_env, "Manifest.toml")
+            @test any(
+                path -> isfile(path) && Base.Filesystem.samefile(path, expected_manifest),
+                keys(TOML.parsefile(usage_file)),
+            )
             @test snapshot_depot(ro) == readonly_snapshot
             @test isempty(filter(p -> endswith(p, ".pid"), first.(readonly_snapshot)))
 

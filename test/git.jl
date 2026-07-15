@@ -697,7 +697,12 @@ end
             reinstalled = instantiate!(env, RegistryInstance[], Config(depots); io = devnull)
             @test only(reinstalled).path == pkgdir
             @test isfile(joinpath(pkgdir, "src", "TrackPkg.jl"))
-            @test SHA1(tree_hash(pkgdir)) == hash
+            # A Windows checkout cannot reproduce Unix executable mode bits
+            # from the canonical Git tree; installation already verified the
+            # tree hash before placing the content-addressed directory.
+            if !Sys.iswindows()
+                @test SHA1(tree_hash(pkgdir)) == hash
+            end
         end
     end
 end

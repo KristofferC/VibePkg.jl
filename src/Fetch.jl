@@ -258,16 +258,11 @@ end
 # Download #
 ############
 
-function download(
-        url::String, dest::String;
-        io::IO = stderr_f(), progress_header::Union{Nothing, String} = nothing,
-        depots::Union{Nothing, DepotStack} = nothing,
-        show_progress::Bool = true,
+function _download_sanitized(
+        url::String, dest::String, headers::Vector{Pair{String, String}};
+        io::IO, progress_header::Union{Nothing, String}, show_progress::Bool,
     )
-    server = pkg_server()
-    is_server_url = server !== nothing && url_is_pkg_server(url, server)
-    headers = is_server_url ? pkg_server_headers(server::String; depots) : Pair{String, String}[]
-    perform_download() = try
+    return try
         _download(url, dest, headers; io, progress_header, show_progress)
     catch err
         if err isa Downloads.RequestError
@@ -279,12 +274,25 @@ function download(
         end
         rethrow()
     end
-    resp = perform_download()
+end
+
+function download(
+        url::String, dest::String;
+        io::IO = stderr_f(), progress_header::Union{Nothing, String} = nothing,
+        depots::Union{Nothing, DepotStack} = nothing,
+        show_progress::Bool = true,
+    )
+    server = pkg_server()
+    is_server_url = server !== nothing && url_is_pkg_server(url, server)
+    headers = is_server_url ? pkg_server_headers(server::String; depots) : Pair{String, String}[]
+    resp = _download_sanitized(url, dest, headers; io, progress_header, show_progress)
     if is_server_url && resp.status == 401
         # HTTP 401: the token was stale or revoked — refresh it and retry
         # once; a second 401 surfaces the server's response body
-        headers = pkg_server_headers(server::String; depots, force_auth_refresh = true)
-        resp = perform_download()
+        refreshed_headers = pkg_server_headers(server::String; depots, force_auth_refresh = true)
+        resp = _download_sanitized(
+            url, dest, refreshed_headers; io, progress_header, show_progress,
+        )
         if resp.status == 401
             body = isfile(dest) ? String(read(dest)) : ""
             body = sanitize_url(first(body, min(length(body), 4096)))

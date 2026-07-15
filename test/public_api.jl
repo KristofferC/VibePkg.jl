@@ -13,6 +13,7 @@ LocalPkgServer.isolate!()
 using Test
 using Logging
 using LibGit2
+import TOML
 using Base: UUID
 using VibePkg
 using VibePkg.Configs: Config
@@ -340,13 +341,16 @@ end
             $EXAMPLE_UUID = { name = "Example", path = "E/Example" }
             """
         )
-        write(
-            joinpath(regpkg, "Package.toml"), """
-            name = "Example"
-            uuid = "$EXAMPLE_UUID"
-            repo = "$(fx.git_repo)"
-            """
-        )
+        open(joinpath(regpkg, "Package.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    "name" => "Example",
+                    "uuid" => string(EXAMPLE_UUID),
+                    "repo" => fx.git_repo,
+                ),
+            )
+        end
         write(
             joinpath(regpkg, "Versions.toml"), """
             ["0.5.0"]

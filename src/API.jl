@@ -14,7 +14,8 @@ import UUIDs
 using Dates: Dates
 
 using ..Errors: PkgError, pkgerror
-using ..Utils: stderr_f, stdout_f, precompile_io, precompile_detach_kwargs
+using ..Utils: stderr_f, stdout_f, precompile_io, precompile_detach_kwargs,
+    expanduser_path
 using ..Timing: @operation, @timeit, TIMER
 import ..Depots
 import ..Stdlibs
@@ -1217,7 +1218,7 @@ basename, fresh uuid, authors from git config, version 0.1.0) and
 `src/<Name>.jl`.
 """
 function generate(path::String; io::IO = stderr_f())
-    path = normpath(expanduser(path))
+    path = normpath(expanduser_path(path))
     # `abspath(".")` retains a trailing separator, for which `basename`
     # is empty; `splitpath` still ends in the cwd's directory name.
     base = last(splitpath(abspath(path)))

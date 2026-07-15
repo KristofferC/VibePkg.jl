@@ -6,7 +6,8 @@ using TOML: TOML
 export isurl, normalize_path_for_toml, denormalize_path_from_toml, stdout_f, stderr_f,
     unstableio, can_fancyprint, precompile_io, precompile_detach_kwargs,
     printpkgstyle, pkgstyle_indent, pathrepr, sanitize_url, sanitize_external_error,
-    set_readonly, create_cachedir_tag, mv_temp_dir_retries, atomic_write, atomic_toml_write
+    set_readonly, create_cachedir_tag, mv_temp_dir_retries, atomic_write, atomic_toml_write,
+    expanduser_path
 
 # IO indirection points. Lower layers must go through these so that
 # redirecting output stays a one-place change. The stream is wrapped in
@@ -27,6 +28,21 @@ const DEFAULT_IO = Base.ScopedValues.ScopedValue{IO}()
 
 stdout_f() = something(Base.ScopedValues.get(DEFAULT_IO), unstableio(stdout))
 stderr_f() = something(Base.ScopedValues.get(DEFAULT_IO), unstableio(stderr))
+
+# `Base.expanduser` does not consistently consult an overridden HOME on
+# Windows. Pkg commands use HOME as an explicit, process-local override (and
+# tests rely on that), so handle the current-user forms before delegating the
+# unsupported `~user` forms to Base for their usual error.
+function expanduser_path(path::AbstractString)
+    value = String(path)
+    if value == "~"
+        return get(ENV, "HOME", homedir())
+    elseif startswith(value, "~/") || startswith(value, "~\\")
+        home = get(ENV, "HOME", homedir())
+        return ncodeunits(value) == 2 ? home : joinpath(home, value[3:end])
+    end
+    return expanduser(value)
+end
 
 "Fancy terminal output (progress bars, ANSI updates): TTY and not CI."
 is_tty(io::IO) = io isa Base.TTY || (io isa IOContext{IO} && io.io isa Base.TTY)

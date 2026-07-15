@@ -15,7 +15,7 @@ module REPLMode
 using Base: UUID
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f, unstableio, URL_SCHEME_RE
+using ..Utils: stderr_f, unstableio, URL_SCHEME_RE, expanduser_path
 using ..Configs: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR,
     PRESERVE_ALL_INSTALLED, PRESERVE_ALL, PRESERVE_DIRECT, PRESERVE_SEMVER,
     PRESERVE_NONE, PRESERVE_TIERED_INSTALLED, PRESERVE_TIERED
@@ -439,10 +439,10 @@ end
 function identifier_fields(word::String)
     looks_like_url(word) && return (; url = word)
     if is_path_like(word)
-        # `expanduser` throws a bare ArgumentError for unsupported `~user`
+        # Path expansion throws a bare ArgumentError for unsupported `~user`
         # forms; surface it as a clean pkgerror instead.
         path = try
-            expanduser(word)
+            expanduser_path(word)
         catch err
             err isa ArgumentError || rethrow()
             pkgerror("Could not expand path $(repr(word)): $(sprint(showerror, err))")
@@ -638,7 +638,7 @@ function parse_statement(words::Vector{Word})
         if spec.canonical in ("activate", "generate")
             for i in eachindex(vals)
                 vals[i] = try
-                    expanduser(vals[i])
+                    expanduser_path(vals[i])
                 catch err
                     err isa ArgumentError || rethrow()
                     pkgerror("Could not expand path $(repr(vals[i])): $(sprint(showerror, err))")
@@ -837,8 +837,8 @@ function completions_for(partial::AbstractString)
                 names = vcat(registered_package_names(), stdlib_names())
                 filter(n -> !startswith(n, word) || !is_deprecated_package_name(n), names)
             elseif spec.canonical == "activate"
-                base = isempty(word) ? "." : (isdir(expanduser(word)) ? word : dirname(word))
-                dir = expanduser(base)
+                base = isempty(word) ? "." : (isdir(expanduser_path(word)) ? word : dirname(word))
+                dir = expanduser_path(base)
                 isdir(dir) ? [joinpath(base == "." ? "" : base, d) for d in readdir(dir) if isdir(joinpath(dir, d))] : String[]
             else
                 String[]

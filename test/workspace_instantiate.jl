@@ -32,12 +32,20 @@ function make_root_dep_registry!(dir, depot)
         """
     )
     write(joinpath(repo_dir, "src", "RootDep.jl"), "module RootDep end\n")
-    tree_hash = bytes2hex(VibePkg.TreeHash.tree_hash(repo_dir))
     repo = LibGit2.init(repo_dir)
+    tree_hash = ""
     try
         LibGit2.add!(repo, ".")
         sig = LibGit2.Signature("fixture", "fixture@localhost")
         LibGit2.commit(repo, "RootDep v1.0.0"; author = sig, committer = sig)
+        obj = LibGit2.GitObject(repo, "HEAD")
+        tree = LibGit2.peel(LibGit2.GitTree, obj)
+        try
+            tree_hash = string(LibGit2.GitHash(tree))
+        finally
+            close(tree)
+            close(obj)
+        end
     finally
         close(repo)
     end

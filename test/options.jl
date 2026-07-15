@@ -128,7 +128,14 @@ function make_update_level_fixture(dir, depot)
             LibGit2.commit(
                 repo, "release $version"; author = sig, committer = sig,
             )
-            hashes[version] = bytes2hex(VibePkg.TreeHash.tree_hash(src))
+            obj = LibGit2.GitObject(repo, "HEAD")
+            tree = LibGit2.peel(LibGit2.GitTree, obj)
+            try
+                hashes[version] = string(LibGit2.GitHash(tree))
+            finally
+                close(tree)
+                close(obj)
+            end
         end
     finally
         close(repo)

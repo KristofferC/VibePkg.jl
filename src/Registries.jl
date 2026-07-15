@@ -938,9 +938,11 @@ function add_registry!(depots::DepotStack, spec::String; io::IO = stderr_f())
             uuid === nothing && pkgerror("Invalid registry specification $(repr(spec)); expected NAME, UUID, or NAME=UUID")
         end
     end
+    requested_name = name
+    requested_uuid = uuid
     idx = findfirst(
-        reg -> (name === nothing || reg.name == name) &&
-            (uuid === nothing || reg.uuid == uuid),
+        reg -> (requested_name === nothing || reg.name == requested_name) &&
+            (requested_uuid === nothing || reg.uuid == requested_uuid),
         DEFAULT_REGISTRIES,
     )
     idx === nothing && pkgerror(
@@ -954,13 +956,13 @@ function add_registry!(depots::DepotStack, spec::String; io::IO = stderr_f())
         if hash !== nothing
             depot = depots1(depots)
             mkpath(registries_dir(depot))
-            name = mkpidlock(joinpath(registries_dir(depot), ".pid"), stale_age = 10) do
+            installed_name = mkpidlock(joinpath(registries_dir(depot), ".pid"), stale_age = 10) do
                 install_server_registry!(depot, server, known.uuid, hash; io)
             end
             notify_registry_change!()
             printstyled(io, lpad("Installed", 12); color = :green, bold = true)
-            println(io, " registry `$name` into the depot")
-            return name
+            println(io, " registry `$installed_name` into the depot")
+            return installed_name
         end
     end
     return add_registry_from_source!(depots, known.url; io)
