@@ -87,6 +87,8 @@ function setprotocol!(;
     return GIT_USERS[domain] = user
 end
 
+Base.@deprecate setprotocol!(proto::Union{Nothing, AbstractString}) setprotocol!(protocol = proto) false
+
 function normalize_url(url::AbstractString)
     url = rstrip(url, '/')              # LibGit2 is fussy about trailing slash
     m = match(GIT_REGEX, url)
@@ -393,11 +395,17 @@ function install_tree_from_git!(
     end
     cdir = mkpath(clones_dir(depots1(depots)))
     create_cachedir_tag(cdir)
-    repo_path = joinpath(cdir, string(uuid))
-    # the uuid-keyed bare clone is shared by every version install in the
-    # depot: a per-cache pidlock serializes clone/fetch/lookup so concurrent
-    # processes (installing e.g. different versions of this package) never
-    # race a clone-in-progress
+    # An add-by-URL has already populated the stable URL-keyed cache used by
+    # `materialize_repo_package!`. Reuse that repository when present: apart
+    # from avoiding a redundant clone, this is what lets instantiate restore a
+    # deleted package tree while the origin is temporarily unavailable. Plain
+    # registered installs retain the UUID-keyed cache used by Pkg.
+    url_cache = findfirst(url -> isdir(repo_cache_path(depots, url)), urls)
+    repo_path = url_cache === nothing ? joinpath(cdir, string(uuid)) :
+        repo_cache_path(depots, urls[url_cache])
+    # The selected bare clone is shared across environments: a per-cache
+    # pidlock serializes clone/fetch/lookup so concurrent processes never race
+    # a clone-in-progress.
     return mkpidlock(repo_path * ".pid", stale_age = 10) do
         repo = nothing
         tree = nothing
@@ -560,7 +568,11 @@ store, and read the package's Project.toml for its identity.
                 close(obj)
                 refspec = pull === nothing ? branch_refspec(rev) :
                     pull_refspec(String(pull[1]::SubString{String}))
-                try_fetch(io, repo, url, [refspec], 1)
+                # An explicit update of a known moving ref must surface a
+                # broken source repository. Falling back to the stale cached
+                # object would make `up` report success after the local repo
+                # was deleted or ceased to be a Git repository.
+                fetch(io, repo, url; refspecs = [refspec], depth = 1)
                 obj, kind = lookup_rev(repo, rev)
             end
             if obj === nothing

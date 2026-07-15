@@ -330,25 +330,25 @@ end
 
 # Read the project file of a materialized package tree: its declared deps
 # (with compat) and weakdeps enter the fixed requirements.
-function collect_project(node::Union{Node, Nothing}, path::String, manifest_file::String, julia_version)
+function collect_project(
+        node::Union{Node, Nothing}, project::Project, project_file::String,
+        manifest_file::String, julia_version,
+    )
     deps = Node[]
     weakdeps = Set{UUID}()
-    project_file = projectfile_path(path; strict = true)
-    project = project_file === nothing ? Project() : read_project(project_file)
     julia_compat = get_compat_spec(project, "julia")
     if !isnothing(julia_compat) && !isnothing(julia_version) && !(julia_version in julia_compat)
-        pkgerror("Package at $(repr(path)) requires Julia $(repr(get_compat_str(project, "julia"))), but the selected Julia version is $julia_version")
+        pkgerror("Package at $(repr(dirname(project_file))) requires Julia $(repr(get_compat_str(project, "julia"))), but the selected Julia version is $julia_version")
     end
     for (name, uuid) in project.deps
-        dep_source = project_file === nothing ? nothing :
-            project_source(project, project_file, manifest_file, name)
-        vspec = get_compat_with_stdlib_check(project, something(project_file, path), name, uuid, julia_version)
+        dep_source = project_source(project, project_file, manifest_file, name)
+        vspec = get_compat_with_stdlib_check(project, project_file, name, uuid, julia_version)
         n = Node(; name, uuid, version = vspec)
         merge_node_source!(n, dep_source)
         push!(deps, n)
     end
     for (name, uuid) in merge(project.weakdeps, project.deps_weak)
-        vspec = get_compat_with_stdlib_check(project, something(project_file, path), name, uuid, julia_version)
+        vspec = get_compat_with_stdlib_check(project, project_file, name, uuid, julia_version)
         push!(deps, Node(; name, uuid, version = vspec))
         push!(weakdeps, uuid)
     end
@@ -356,6 +356,16 @@ function collect_project(node::Union{Node, Nothing}, path::String, manifest_file
         node.version = something(project.version, VersionNumber(0))
     end
     return deps, weakdeps
+end
+
+function collect_project(node::Union{Node, Nothing}, path::String, manifest_file::String, julia_version)
+    project_file = projectfile_path(path; strict = true)
+    project_file === nothing && return collect_project(
+        node, Project(), joinpath(path, "Project.toml"), manifest_file, julia_version,
+    )
+    return collect_project(
+        node, read_project(project_file), project_file, manifest_file, julia_version,
+    )
 end
 
 # Recursive closure of path-tracked packages: a dev'd package's dev'd deps
@@ -444,7 +454,9 @@ end
     proj_uuid = project_uuid(env)
     proj_node = env.project.uuid === nothing ? nothing :
         Node(; name = env.project.name, uuid = env.project.uuid, version = env.project.version)
-    deps, weakdeps = collect_project(proj_node, dirname(env.project_file), env.manifest_file, julia_version)
+    deps, weakdeps = collect_project(
+        proj_node, env.project, env.project_file, env.manifest_file, julia_version,
+    )
     deps_map[proj_uuid] = deps
     weak_map[proj_uuid] = weakdeps
     names[proj_uuid] = something(env.project.name, "project")
@@ -454,7 +466,9 @@ end
         member_uuid = something(member.uuid, Base.dummy_uuid(member_file))
         member_node = member.uuid === nothing ? nothing :
             Node(; name = member.name, uuid = member.uuid, version = member.version)
-        mdeps, mweak = collect_project(member_node, dirname(member_file), env.manifest_file, julia_version)
+        mdeps, mweak = collect_project(
+            member_node, member, member_file, env.manifest_file, julia_version,
+        )
         deps_map[member_uuid] = mdeps
         weak_map[member_uuid] = mweak
         names[member_uuid] = something(member.name, "project")
@@ -507,7 +521,18 @@ end
             end
             pkgerror(error_msg)
         end
-        deps, weakdeps = collect_project(n, path, env.manifest_file, julia_version)
+        deps, weakdeps = if haskey(project_nodes, n.uuid)
+            # Active/workspace projects may have been functionally updated by
+            # the operation but not written yet (for example `develop D`).
+            # Keep the snapshot collected above; rereading their path here
+            # would overwrite it with stale on-disk dependency metadata. The
+            # snapshot collection also normalizes a missing package version to
+            # v0.0.0; carry that fixup onto the queued self node.
+            n.version = project_nodes[n.uuid].version
+            deps_map[n.uuid], weak_map[n.uuid]
+        else
+            collect_project(n, path, env.manifest_file, julia_version)
+        end
         deps_map[n.uuid] = deps
         weak_map[n.uuid] = weakdeps
         for dep in deps
@@ -755,7 +780,16 @@ const PKGORIGIN_HAVE_VERSION = :version in fieldnames(Base.PkgOrigin)
     for uuid in uuids
         uuid == Registries.JULIA_UUID && continue
         if !haskey(uuid_to_name, uuid)
-            name = registered_name(registries, uuid)
+            # A dependency can be a stdlib in the selected historical Julia
+            # while no longer being a stdlib in the running Julia (for
+            # example MbedTLS_jll when adding Pkg for Julia 1.11 on 1.12+).
+            # Its historical table is authoritative and supplies the name;
+            # requiring a registry entry here makes the historical stdlib
+            # impossible to resolve when that registry is unavailable, even
+            # though its version/deps above came from that same table.
+            historical_info = get(stdlibs_for_julia_version, uuid, nothing)
+            name = historical_info === nothing ?
+                registered_name(registries, uuid) : historical_info.name
             if name === nothing
                 if uuid in all_weak_uuids
                     push!(unavailable_weak_uuids, uuid)
@@ -825,6 +859,17 @@ end
 # drops build detail in version but keeps the main prerelease context
 dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v.prerelease) ? () : (v.prerelease[1],))
 
+"Julia syntax version recorded for a package manifest entry."
+function get_project_syntax_version(project::Project)::VersionNumber
+    project.julia_syntax_version === nothing || return project.julia_syntax_version
+    julia_compat = get(project.compat, "julia", nothing)
+    if julia_compat !== nothing && !isempty(julia_compat.val.ranges)
+        lower = first(julia_compat.val.ranges).lower
+        return VersionNumber(lower.t[1], lower.t[2], lower.t[3])
+    end
+    return dropbuild(VERSION)
+end
+
 # The heart: turn seed nodes into concrete versions + a dependency map.
 # Returns (nodes, final_deps_map, julia_version_stamp).
 @timeit TIMER "resolve versions" function resolve_versions(
@@ -851,7 +896,14 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
         end
     end
 
-    names = Dict{UUID, String}(uuid => info.name for (uuid, info) in stdlib_infos())
+    # Seed names from the stdlib set being resolved, rather than the running
+    # Julia's set. A package can have been a stdlib only in the selected
+    # historical Julia, and those names must remain available throughout
+    # node/dependency construction without requiring a registry fallback.
+    stdlibs_for_julia_version = Stdlibs.get_last_stdlibs(julia_version)
+    names = Dict{UUID, String}(
+        uuid => info.name for (uuid, info) in stdlibs_for_julia_version
+    )
     # recursive search for packages tracking a path
     developed = collect_developed(env, nodes, depots)
     node_uuids = Set{UUID}(n.uuid::UUID for n in nodes)
@@ -940,7 +992,9 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
             # fixed packages are not returned by resolve
             n.version = vers[n.uuid]
         else
-            name = is_stdlib(uuid) ? stdlib_infos()[uuid].name : registered_name(registries, uuid)
+            historical_info = get(stdlibs_for_julia_version, uuid, nothing)
+            name = historical_info === nothing ?
+                registered_name(registries, uuid) : historical_info.name
             push!(nodes, Node(; name, uuid, version = ver))
         end
     end
@@ -1358,9 +1412,9 @@ end
 # The project [sources] with entries for freshly materialized repos: an
 # explicit `add url/rev` must win over a stale hand-written entry during
 # planning (the write re-derives [sources] from the manifest anyway).
-function add_repo_sources(project::Project, repos::Vector{RepoPackage})
-    isempty(repos) && return project.sources
-    sources = Dict{String, SourceSpec}(project.sources)
+function add_repo_sources(existing_sources, repos::Vector{RepoPackage})
+    isempty(repos) && return existing_sources
+    sources = Dict{String, SourceSpec}(existing_sources)
     for r in repos
         sources[r.name] = SourceSpec(nothing, r.url, r.rev, r.subdir)
     end
@@ -1433,11 +1487,32 @@ function error_if_in_sysimage(name::String, uuid::UUID, config::Config)
     )
 end
 
+# A fixed stdlib's version is selected by the running Julia, not by the
+# resolver. Reject an explicit incompatible request instead of silently
+# replacing it with that fixed version. Historical resolution is deliberately
+# left to the resolver: `julia_version` is a VibePkg extension and already has
+# pinned behavior for requests targeting another Julia release.
+function check_current_stdlib_version(name::String, uuid::UUID, version, julia_version)
+    julia_version == VERSION || return
+    version == VersionSpec() && return
+    is_stdlib(uuid, VERSION) || return
+    uuid in UPGRADABLE_STDLIBS_UUIDS && return
+
+    current = stdlib_version(uuid, VERSION)
+    current === nothing && return
+    compatible = version isa VersionNumber ? version == current : current in version
+    compatible && return
+    pkgerror(
+        "Cannot add stdlib `$name` with version specification `$version`.\n" *
+            "The current Julia version v$(VERSION) uses `$name` v$current."
+    )
+end
+
 # seed the resolve node (and the new direct dep) for one add target
 function add_target_node!(
         nodes::Vector{Node}, new_deps::Dict{String, UUID},
         env::Environment, registries::Vector{RegistryInstance},
-        r::PackageRequest, preserve::PreserveLevel,
+        r::PackageRequest, preserve::PreserveLevel, julia_version,
     )
     name, uuid = resolve_request(env, registries, r)
     if uuid == env.project.uuid
@@ -1445,6 +1520,7 @@ function add_target_node!(
     end
     check_registered(env, registries, name, uuid)
     version = request_version_spec(r, name)
+    check_current_stdlib_version(name, uuid, version, julia_version)
     # an explicit preserve=all holds an already-resolved package at its
     # manifest version (the request node would otherwise be unconstrained)
     if (preserve == PRESERVE_ALL || preserve == PRESERVE_ALL_INSTALLED) && version == VersionSpec()
@@ -1461,10 +1537,19 @@ end
 function add_target_node!(
         nodes::Vector{Node}, new_deps::Dict{String, UUID},
         env::Environment, ::Vector{RegistryInstance},
-        r::RepoPackage, ::PreserveLevel,
+        r::RepoPackage, ::PreserveLevel, ::Any,
     )
     if r.uuid == env.project.uuid
         pkgerror("Project $(repr(env.project_file)) cannot add itself as package $(err_rep(r.name, r.uuid))")
+    end
+    # `add(url=...)` does not free or retarget a pinned package. Keep the
+    # exact recorded node (including its tracking kind and tree) while still
+    # promoting it to a direct dependency below.
+    existing = get(env.manifest, r.uuid, nothing)
+    if existing !== nothing && existing.pinned
+        push!(nodes, entry_to_node(r.uuid, existing, entry_version(existing)))
+        new_deps[existing.name] = r.uuid
+        return
     end
     push!(
         nodes, Node(;
@@ -1497,13 +1582,31 @@ function plan_add(
     new_deps = Dict{String, UUID}(env.project.deps)
     for t in targets
         t isa RepoPackage && error_if_in_sysimage(t.name, t.uuid, config)
-        add_target_node!(nodes, new_deps, env, registries, t, preserve)
+        add_target_node!(nodes, new_deps, env, registries, t, preserve, julia_version)
     end
     repos = RepoPackage[t for t in targets if t isa RepoPackage]
+    source_updates = RepoPackage[
+        r for r in repos
+            if let entry = get(env.manifest, r.uuid, nothing)
+                entry === nothing || !entry.pinned
+        end
+    ]
+    sources = Dict{String, SourceSpec}(env.project.sources)
+    for t in targets
+        t isa PackageRequest || continue
+        t.version === nothing && continue
+        name, uuid = resolve_request(env, registries, t)
+        entry = get(env.manifest, uuid, nothing)
+        entry !== nothing && entry.pinned && continue
+        # An explicit registered version is a request to leave path/repo
+        # tracking. Dropping the stored source before resolution prevents it
+        # from being merged back onto the new registry node.
+        delete!(sources, name)
+    end
     # a name added as a real dep is promoted out of [weakdeps] (Pkg parity)
     added = setdiff(keys(new_deps), keys(env.project.deps))
     weakdeps = Dict{String, UUID}(k => v for (k, v) in env.project.weakdeps if k ∉ added)
-    project = with_project(env.project; deps = new_deps, weakdeps, sources = add_repo_sources(env.project, repos))
+    project = with_project(env.project; deps = new_deps, weakdeps, sources = add_repo_sources(sources, source_updates))
     env′ = Environment(env.project_file, env.manifest_file, project, env.manifest, env.workspace)
 
     resolved, deps_map = resolve_with_preserve(env′, registries, nodes, preserve, julia_version, config; preferred_versions, fetcher)
@@ -1744,6 +1847,23 @@ function plan_up(
             (entry === nothing || entry_isfixed(entry)) && continue
             push!(nodes, Node(; name, uuid, version = level_spec(entry_version(entry), level)))
         end
+        if mode === :project && !workspace
+            # The shared manifest contains every workspace member, but a
+            # plain project-scoped update must not move dependencies that are
+            # direct only in another member. Hold those at their recorded
+            # versions; `workspace=true` above instead seeds them at `level`.
+            targeted = Set(values(targets))
+            held = Set{UUID}()
+            for (_, member) in env.workspace, (name, uuid) in member.deps
+                (uuid in targeted || uuid in held) && continue
+                entry = get(env.manifest, uuid, nothing)
+                (entry === nothing || entry_isfixed(entry)) && continue
+                version = entry_version(entry)
+                version isa VersionNumber || continue
+                push!(nodes, Node(; name, uuid, version))
+                push!(held, uuid)
+            end
+        end
         effective_preserve = something(preserve, PRESERVE_NONE)
     else
         for r in requests
@@ -1833,9 +1953,11 @@ end
 """
     plan_free(env, registries, config, requests; julia_version) -> Environment
 
-Free packages: a pinned package is un-pinned in place with
+Free packages: a pinned registry-tracked package is un-pinned in place with
 NO resolve; a path/repo-tracked package returns to registry tracking via a
-full tiered resolve (erroring if it is not registered). With
+full tiered resolve when it is registered. A pinned unregistered path/repo
+package can still be freed once by unpinning it in place; a second free errors
+because there is no registry state to return to. With
 `err_if_free = false` (the `free(all_pkgs = true)` path), packages that are
 already free are skipped instead of erroring.
 """
@@ -1862,11 +1984,19 @@ function plan_free(
             push!(unpin_only, uuid)
         else
             registered = any(reg -> haskey(reg, uuid), registries)
-            registered || pkgerror(
-                "Cannot return package $(err_rep(name, uuid)) to registry tracking because no configured registry contains its UUID"
-            )
-            push!(to_resolve, Node(; name, uuid, version = VersionSpec()))
-            push!(freed_names, name)
+            if registered
+                push!(to_resolve, Node(; name, uuid, version = VersionSpec()))
+                push!(freed_names, name)
+            elseif entry.pinned
+                # There is no registry source to restore. Match Pkg's public
+                # `add <repo>; pin; free` behavior by preserving the tracking
+                # source and only removing the pin on the first call.
+                push!(unpin_only, uuid)
+            else
+                pkgerror(
+                    "Cannot return package $(err_rep(name, uuid)) to registry tracking because no configured registry contains its UUID"
+                )
+            end
         end
     end
 

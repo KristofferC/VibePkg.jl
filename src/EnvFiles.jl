@@ -80,9 +80,11 @@ end
 function validate_app_submodule(submodule, app_name::String; qualified::Bool = false)
     submodule === nothing && return nothing
     submodule isa String || pkgerror("App $(repr(app_name)) field submodule must be a string; got $(repr(submodule))")
-    valid = qualified ?
-        all(Base.isidentifier, split(submodule, '.'; keepempty = true)) :
-        Base.isidentifier(submodule)
+    # Project declarations may name nested entry modules (`CLI.Nested`), and
+    # manifest entries use the same grammar after the package name is
+    # prepended (`AppPkg.CLI.Nested`). Empty/leading/trailing segments remain
+    # invalid because `Base.isidentifier("")` is false.
+    valid = all(Base.isidentifier, split(submodule, '.'; keepempty = true))
     valid || pkgerror("Invalid submodule $(repr(submodule)) for app $(repr(app_name))")
     return submodule
 end

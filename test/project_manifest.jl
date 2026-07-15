@@ -66,27 +66,54 @@ end
         rootmanifest = joinpath(root, "Manifest.toml")
         c = joinpath(root, "packages", "C")
 
+        # Establish B as a root dependency first. The later subpackage-C
+        # operation must accumulate into this same manifest without pruning B.
+        with_env(root, depot) do
+            VibePkg.develop(; path = joinpath(root, "packages", "B"), io = devnull)
+        end
+
         # develop the local D from inside subpackage C, then run C's tests.
         # Resolution/dev inside a subpackage writes to the SHARED root manifest
         # (the `manifest = "../../Manifest.toml"` key), and the subpackage never
         # gets a manifest of its own.
         with_env(c, depot) do
             VibePkg.develop(; path = joinpath(root, "packages", "D"), io = devnull)
+            developed_manifest = read_manifest(rootmanifest)
+            @test haskey(developed_manifest[C_UUID].deps, "D")
             @test VibePkg.test(io = devnull) === nothing        # C's tests run + pass
         end
 
         @test isfile(rootmanifest)                              # shared root manifest
         @test !isfile(joinpath(c, "Manifest.toml"))             # not a per-subpackage one
         m = read_manifest(rootmanifest)
+        @test haskey(m, B_UUID)                                 # pre-existing root dep retained
         @test haskey(m, C_UUID)                                 # the tested subpackage
         @test haskey(m, D_UUID)                                 # its freshly dev'd local dep
-
+        @test haskey(m[C_UUID].deps, "D")                       # C → D recorded
         @test haskey(m[C_UUID].deps, "Test")                    # C's own declared dep tracked
 
-        # NOTE: VibePkg's accumulation/pruning here diverges from Pkg.jl: it
-        # prunes manifest entries unreachable from the active subpackage, whereas
-        # Pkg leaves them "sticky" and never prunes D on rm (its #3590 bug). We
-        # therefore do not assert Pkg's exact sticky/non-prune manifest contents.
+        # Make C a root dependency before adding Test, matching the upstream
+        # order that makes C/D's accumulated shared-manifest state sticky;
+        # then run the root package's real public test subprocess.
+        with_env(root, depot) do
+            VibePkg.develop(; path = c, io = devnull)
+            VibePkg.add("Test"; io = devnull)
+            @test VibePkg.test(io = devnull) === nothing
+        end
+        m = read_manifest(rootmanifest)
+        @test all(haskey(m, uuid) for uuid in (B_UUID, C_UUID, D_UUID))
+
+        # Upstream documents its stale D entry as #3590 with @test_broken.
+        # VibePkg resolves the shared root after removal, so pin the desired
+        # public behavior: C loses its edge and the now-unreachable D entry is
+        # actually pruned from the shared manifest.
+        with_env(c, depot) do
+            VibePkg.rm("D"; io = devnull)
+            @test VibePkg.test(io = devnull) === nothing
+        end
+        m = read_manifest(rootmanifest)
+        @test !haskey(m, D_UUID)
+        @test !haskey(m, C_UUID) || !haskey(m[C_UUID].deps, "D")
     end
 end
 

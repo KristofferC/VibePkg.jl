@@ -519,7 +519,7 @@ end
             version = "0.1.0"
 
             [apps]
-            subcli = { submodule = "CLI" }
+            subcli = { submodule = "CLI.Nested" }
             nthr = { julia_flags = ["--threads=2"] }
             """
         )
@@ -527,9 +527,11 @@ end
             joinpath(pkg, "src", "SubApp.jl"), """
             module SubApp
             module CLI
+            module Nested
             function (@main)(args)
-                println("cli submodule says: ", join(args, ","))
+                println("nested cli submodule says: ", join(args, ","))
                 return 0
+            end
             end
             end
             function (@main)(args)
@@ -544,13 +546,14 @@ end
         depots = depot_stack([depot])
         AppsOps.app_develop(Config(depots), RegistryInstance[], pkg; io = devnull)
 
-        # `submodule = "CLI"` resolves to the dotted entry module: the shim
-        # runs `julia -m SubApp.CLI` and the submodule's `@main` answers
+        # A dotted project declaration resolves to the fully qualified nested
+        # entry module: the shim runs `julia -m SubApp.CLI.Nested` and that
+        # submodule's `@main` answers.
         entry = read_manifest(AppsOps.app_manifest_file(depots))[SUBAPP_UUID]
-        @test entry.apps["subcli"].submodule == "SubApp.CLI"
+        @test entry.apps["subcli"].submodule == "SubApp.CLI.Nested"
         shim_sub = AppsOps.shim_path(depots, "subcli")
-        @test occursin("SubApp.CLI", read(shim_sub, String))
-        @test occursin("cli submodule says: x,y", run_shim(shim_sub, "x", "y"))
+        @test occursin("SubApp.CLI.Nested", read(shim_sub, String))
+        @test occursin("nested cli submodule says: x,y", run_shim(shim_sub, "x", "y"))
 
         # baked `julia_flags` reach the app process ...
         @test entry.apps["nthr"].julia_flags == ["--threads=2"]
@@ -582,7 +585,7 @@ end
             run_shim(shim_sub, "a")
         end
         @test occursin("WRAPPER-MARKER", out)
-        @test occursin("cli submodule says: a", out)
+        @test occursin("nested cli submodule says: a", out)
         # without the override the recorded executable runs, no wrapper
         @test !occursin("WRAPPER-MARKER", run_shim(shim_sub, "a"))
     end

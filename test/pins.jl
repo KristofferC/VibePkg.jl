@@ -108,7 +108,7 @@ end
         # path/dev-path messages
         missing_path = joinpath(dir, "definitely", "not", "a", "path")
         @test pin_msg(() -> VibePkg.add(path = missing_path)) ==
-            "Package path $(repr(missing_path)) does not exist"
+            "Path `$missing_path` does not exist."
         m = pin_msg(() -> Planning.plan_develop(env, regs, Config(depots), joinpath(dir, "nope")))
         @test m == "Development path $(repr(joinpath(dir, "nope"))) does not exist"
         f = joinpath(dir, "afile"); write(f, "x")
@@ -153,6 +153,19 @@ end
             buf = IOBuffer()
             VibePkg.up(io = buf)
             @test occursin("All dependencies are pinned - nothing to update.", String(take!(buf)))
+
+            # The same hold applies when the pinned version was subsequently
+            # yanked from its registry: update must not try to resolve it away.
+            yanked_pf = pin_env(
+                mkpath(joinpath(dir, "yanked-pinned"));
+                version = "0.5.1", pinned = true,
+            )
+            Base.ACTIVE_PROJECT[] = yanked_pf
+            @test VibePkg.up(io = devnull) === nothing
+            yanked_env = Environments.load_environment_from(yanked_pf; depots)
+            entry = yanked_env.manifest[UUID(PIN_EX)]
+            @test entry.pinned
+            @test VibePkg.EnvFiles.entry_version(entry) == v"0.5.1"
         finally
             Base.ACTIVE_PROJECT[] = old
         end

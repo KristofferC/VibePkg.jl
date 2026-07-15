@@ -29,7 +29,8 @@ import ..Git
 using FileWatching: mkpidlock
 
 export pkg_server, package_archive_urls, ensure_package_installed!, unpack,
-    get_extract_cmd, read_tarball_simple, uncompress_registry
+    package, list_tarball_files, get_extract_cmd, read_tarball_simple,
+    uncompress_registry
 
 ##############
 # Pkg server #
@@ -363,11 +364,61 @@ function get_extract_cmd(file::AbstractString)
     end
 end
 
+"""
+    copy_symlinks_mode() -> Union{Nothing, Bool}
+
+Compatibility switch used by the former PlatformEngines API.  When
+`BINARYPROVIDER_COPYDEREF` is true, archive symlinks are materialized as
+ordinary files/directories and broken symlinks are omitted.  `nothing`
+selects Tar's platform default.
+"""
+function copy_symlinks_mode()
+    value = lowercase(get(ENV, "BINARYPROVIDER_COPYDEREF", ""))
+    value in ("true", "t", "yes", "y", "1") && return true
+    value in ("false", "f", "no", "n", "0") && return false
+    return nothing
+end
+
 "Extract a (compressed) tarball into directory `dest`."
-function unpack(tarball::String, dest::String)
+function unpack(
+        tarball::String, dest::String;
+        copy_symlinks::Union{Nothing, Bool} = copy_symlinks_mode(),
+    )
     return open(get_extract_cmd(tarball)) do io
-        Tar.extract(io, dest)
+        Tar.extract(io, dest; copy_symlinks)
     end
+end
+
+"""
+    package(src_dir, tarball_path; io)
+
+Create a compressed tar archive of `src_dir`.  `.tar.zst`/`.zst` destinations
+use zstd; every other destination uses gzip, matching Pkg.PlatformEngines.
+"""
+function package(src_dir::AbstractString, tarball_path::AbstractString; io::IO = stderr_f())
+    isdir(src_dir) || error("Cannot package missing directory $(repr(src_dir))")
+    mkpath(dirname(tarball_path))
+    Base.rm(tarball_path; force = true)
+    lower = lowercase(tarball_path)
+    cmd = if endswith(lower, ".zst") || endswith(lower, ".tar.zst")
+        `$(Zstd_jll.zstd()) -19 -q -c -T -o $tarball_path`
+    else
+        `$(p7zip_jll.p7zip()) a -si -tgzip -mx9 $tarball_path`
+    end
+    return open(pipeline(cmd; stdout = devnull, stderr = io), write = true) do tar
+        Tar.create(src_dir, tar)
+    end
+end
+
+"Return the normalized entry paths stored in a compressed tar archive."
+function list_tarball_files(tarball_path::AbstractString)
+    names = String[]
+    open(get_extract_cmd(tarball_path)) do tar
+        Tar.list(tar) do header
+            push!(names, header.path)
+        end
+    end
+    return names
 end
 
 # Simplified tarball reader without path tracking overhead. Entries the
@@ -499,7 +550,10 @@ function install_archive(
 end
 
 """
-    ensure_package_installed!(depots, name, uuid, tree_hash, repo_urls; archive_urls, readonly, io)
+    ensure_package_installed!(depots, name, uuid, tree_hash, repo_urls;
+                              archive_urls, readonly,
+                              use_git_for_all_downloads,
+                              use_only_tarballs_for_downloads, io)
         -> (path, new::Bool)
 
 Idempotent content-addressed install: returns the existing tree if any depot
@@ -516,6 +570,8 @@ function ensure_package_installed!(
         archive_urls::Vector{String} = repo_urls,
         readonly::Bool = true, io::IO = stderr_f(),
         server::Union{Nothing, String} = pkg_server(),
+        use_git_for_all_downloads::Bool = false,
+        use_only_tarballs_for_downloads::Bool = false,
     )
     path, installed = find_installed(depots, name, uuid, tree_hash)
     installed && return path, false
@@ -527,9 +583,13 @@ function ensure_package_installed!(
     already = Ref(false)
     success = mkpidlock(path * ".pid", stale_age = 10) do
         isdir(path) && (already[] = true; return true)
+        use_git_for_all_downloads && return false
         isempty(urls) ? false : install_archive(urls, tree_hash, path; name, depots, io)
     end
     if !success
+        use_only_tarballs_for_downloads && !use_git_for_all_downloads && pkgerror(
+            "Failed to install $name [$uuid]: no package tarball source succeeded",
+        )
         # archives failed (or none available): fall back to git
         mkpidlock(path * ".pid", stale_age = 10) do
             isdir(path) && (already[] = true; return)

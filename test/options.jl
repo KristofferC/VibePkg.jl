@@ -30,6 +30,12 @@ const TOP_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 const DEP_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 const OLD_UUID = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 const LEVEL_UUID = UUID("12121212-3434-5656-7878-909090909090")
+const TIER_ROOT_UUID = UUID("31313131-3131-4131-8131-313131313131")
+const TIER_LEAF_UUID = UUID("32323232-3232-4232-8232-323232323232")
+const TIER_ALL_UUID = UUID("33333333-3333-4333-8333-333333333333")
+const TIER_DIRECT_UUID = UUID("34343434-3434-4434-8434-343434343434")
+const TIER_SEMVER_UUID = UUID("35353535-3535-4535-8535-353535353535")
+const TIER_NONE_UUID = UUID("36363636-3636-4636-8636-363636363636")
 
 # Top → Dep (both with a 1.0.0 and a 1.0.1), plus Oldie which the registry
 # marks deprecated: enough structure to tell the up modes apart and to
@@ -165,6 +171,131 @@ function make_update_level_fixture(dir, depot)
             Dict(string(version) => Dict("git-tree-sha1" => hash) for (version, hash) in hashes),
         )
     end
+    return
+end
+
+# A fully installed synthetic graph for public `add` fallback tests. The
+# starting manifest has TierRoot 1.0.0 -> TierLeaf 1.0.0, while the registry
+# also offers semver-compatible and breaking releases. Four target packages
+# respectively require no change, an indirect-only change, a semver change to
+# the direct root, and a breaking change to that root.
+function make_resolve_tier_fixture(dir, depot)
+    packages = [
+        ("TierRoot", TIER_ROOT_UUID, [v"1.0.0", v"1.1.0", v"2.0.0"]),
+        ("TierLeaf", TIER_LEAF_UUID, [v"1.0.0", v"1.1.0", v"2.0.0"]),
+        ("TierTargetAll", TIER_ALL_UUID, [v"1.0.0"]),
+        ("TierTargetDirect", TIER_DIRECT_UUID, [v"1.0.0"]),
+        ("TierTargetSemver", TIER_SEMVER_UUID, [v"1.0.0"]),
+        ("TierTargetNone", TIER_NONE_UUID, [v"1.0.0"]),
+    ]
+    hashes = Dict{Tuple{String, VersionNumber}, Base.SHA1}()
+    for (name, uuid, versions) in packages, version in versions
+        source = mkpath(joinpath(dir, "sources", name, string(version)))
+        mkpath(joinpath(source, "src"))
+        write(
+            joinpath(source, "Project.toml"),
+            "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"$version\"\n",
+        )
+        write(
+            joinpath(source, "src", "$name.jl"),
+            "module $name\nconst FIXTURE_VERSION = v\"$version\"\nend\n",
+        )
+        hash = Base.SHA1(VibePkg.TreeHash.tree_hash(source))
+        hashes[(name, version)] = hash
+        installed = joinpath(depot, "packages", name, Base.version_slug(uuid, hash))
+        mkpath(dirname(installed))
+        cp(source, installed)
+    end
+
+    reg = mkpath(joinpath(depot, "registries", "ResolveTierRegistry"))
+    open(joinpath(reg, "Registry.toml"), "w") do io
+        TOML.print(
+            io,
+            Dict(
+                "name" => "ResolveTierRegistry",
+                "uuid" => "37373737-3737-4737-8737-373737373737",
+                "packages" => Dict(
+                    string(uuid) => Dict("name" => name, "path" => "T/$name")
+                        for (name, uuid, _) in packages
+                ),
+            ),
+        )
+    end
+    for (name, uuid, versions) in packages
+        pkg = mkpath(joinpath(reg, "T", name))
+        open(joinpath(pkg, "Package.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    "name" => name,
+                    "uuid" => string(uuid),
+                    "repo" => "https://network.invalid/$name.jl.git",
+                ),
+            )
+        end
+        open(joinpath(pkg, "Versions.toml"), "w") do io
+            TOML.print(
+                io,
+                Dict(
+                    string(version) => Dict(
+                            "git-tree-sha1" => string(hashes[(name, version)]),
+                        ) for version in versions
+                ),
+            )
+        end
+    end
+
+    function write_dependency(package, dependency, uuid, compat)
+        pkg = joinpath(reg, "T", package)
+        open(joinpath(pkg, "Deps.toml"), "w") do io
+            TOML.print(io, Dict("1-2" => Dict(dependency => string(uuid))))
+        end
+        return open(joinpath(pkg, "Compat.toml"), "w") do io
+            TOML.print(io, compat)
+        end
+    end
+    write_dependency(
+        "TierRoot", "TierLeaf", TIER_LEAF_UUID,
+        Dict("1" => Dict("TierLeaf" => "1"), "2" => Dict("TierLeaf" => "2")),
+    )
+    write_dependency(
+        "TierTargetDirect", "TierLeaf", TIER_LEAF_UUID,
+        Dict("1" => Dict("TierLeaf" => "1.1.0")),
+    )
+    write_dependency(
+        "TierTargetSemver", "TierRoot", TIER_ROOT_UUID,
+        Dict("1" => Dict("TierRoot" => "1.1.0")),
+    )
+    write_dependency(
+        "TierTargetNone", "TierRoot", TIER_ROOT_UUID,
+        Dict("1" => Dict("TierRoot" => "2.0.0")),
+    )
+    return hashes
+end
+
+function write_resolve_tier_environment(envdir, hashes)
+    mkpath(envdir)
+    write(
+        joinpath(envdir, "Project.toml"),
+        "[deps]\nTierRoot = \"$TIER_ROOT_UUID\"\n",
+    )
+    write(
+        joinpath(envdir, "Manifest.toml"),
+        """
+        manifest_format = "2.1"
+
+        [[deps.TierLeaf]]
+        git-tree-sha1 = "$(hashes[("TierLeaf", v"1.0.0")])"
+        uuid = "$TIER_LEAF_UUID"
+        version = "1.0.0"
+
+        [[deps.TierRoot]]
+        deps = ["TierLeaf"]
+        git-tree-sha1 = "$(hashes[("TierRoot", v"1.0.0")])"
+        uuid = "$TIER_ROOT_UUID"
+        version = "1.0.0"
+        """,
+    )
     return
 end
 
@@ -516,7 +647,134 @@ end
             @test haskey(added2.manifest, OLD_UUID)
             @test entry_version(added2.manifest[TOP_UUID]) == v"1.0.0"
             @test entry_version(added2.manifest[DEP_UUID]) == v"1.0.0"
+
+            # Full preserve-level matrix. Top is direct and Dep is indirect;
+            # both have a newer patch in the registry when Oldie is added.
+            # This distinguishes holding the whole graph, direct packages,
+            # semver-compatible packages, and no existing state.
+            for preserve in (PRESERVE_TIERED, PRESERVE_TIERED_INSTALLED, PRESERVE_ALL)
+                result = plan_add(
+                    env, regs, Config(depots), [PackageRequest("Oldie")]; preserve,
+                )
+                @test entry_version(result.manifest[TOP_UUID]) == v"1.0.0"
+                @test entry_version(result.manifest[DEP_UUID]) == v"1.0.0"
+            end
+            @test_throws VibePkg.Resolve.ResolverError plan_add(
+                env, regs, Config(depots), [PackageRequest("Oldie")];
+                preserve = PRESERVE_ALL_INSTALLED,
+            )
+            direct = plan_add(
+                env, regs, Config(depots), [PackageRequest("Oldie")];
+                preserve = PRESERVE_DIRECT,
+            )
+            @test entry_version(direct.manifest[TOP_UUID]) == v"1.0.0"
+            @test entry_version(direct.manifest[DEP_UUID]) == v"1.0.1"
+            for preserve in (PRESERVE_SEMVER, PRESERVE_NONE)
+                result = plan_add(
+                    env, regs, Config(depots), [PackageRequest("Oldie")]; preserve,
+                )
+                @test entry_version(result.manifest[TOP_UUID]) == v"1.0.1"
+                @test entry_version(result.manifest[DEP_UUID]) == v"1.0.1"
+            end
         end
+    end
+end
+
+@testset "public add: forced tiered preserve fallback" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depot_path = copy(Base.DEPOT_PATH)
+    old_auto_precompile = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+    old_auto_gc = VibePkg.API.AUTO_GC_ENABLED[]
+    old_registry_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        VibePkg.API.AUTO_GC_ENABLED[] = false
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        mktempdir() do dir
+            dir = realpath(dir)
+            depot = mkpath(joinpath(dir, "depot"))
+            hashes = make_resolve_tier_fixture(dir, depot)
+            copy!(Base.DEPOT_PATH, [depot])
+            semver_1 = VibePkg.Versions.semver_spec("1.0.0")
+
+            function activate_scenario(name)
+                envdir = joinpath(dir, name)
+                write_resolve_tier_environment(envdir, hashes)
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                return
+            end
+            function resolved_versions()
+                deps = VibePkg.dependencies()
+                return Dict(uuid => info.version for (uuid, info) in deps)
+            end
+
+            withenv(
+                "JULIA_PKG_SERVER" => "",
+                "JULIA_PKG_OFFLINE" => nothing,
+                "JULIA_PKG_PRESERVE_TIERED_INSTALLED" => nothing,
+            ) do
+                # PRESERVE_ALL succeeds: both existing manifest entries stay
+                # exact while the unrelated package is added.
+                activate_scenario("all")
+                VibePkg.add(PackageSpec(name = "TierTargetAll", version = v"1.0.0"); io = devnull)
+                versions = resolved_versions()
+                @test versions[TIER_ROOT_UUID] == v"1.0.0"
+                @test versions[TIER_LEAF_UUID] == v"1.0.0"
+                @test versions[TIER_ALL_UUID] == v"1.0.0"
+
+                # ALL cannot satisfy the new leaf constraint; the default
+                # falls through to DIRECT, holding TierRoot and moving only
+                # its indirect dependency.
+                activate_scenario("direct")
+                direct = PackageSpec(name = "TierTargetDirect", version = v"1.0.0")
+                @test_throws VibePkg.Resolve.ResolverError VibePkg.add(
+                    direct; preserve = PRESERVE_ALL, io = devnull,
+                )
+                VibePkg.add(direct; io = devnull)
+                versions = resolved_versions()
+                @test versions[TIER_ROOT_UUID] == v"1.0.0"
+                @test versions[TIER_LEAF_UUID] == v"1.1.0"
+                @test versions[TIER_DIRECT_UUID] == v"1.0.0"
+
+                # ALL and DIRECT both pin the direct root at 1.0.0. SEMVER
+                # can move it to the target's forced, compatible 1.1.0.
+                activate_scenario("semver")
+                semver = PackageSpec(name = "TierTargetSemver", version = v"1.0.0")
+                for preserve in (PRESERVE_ALL, PRESERVE_DIRECT)
+                    @test_throws VibePkg.Resolve.ResolverError VibePkg.add(
+                        semver; preserve, io = devnull,
+                    )
+                end
+                VibePkg.add(semver; io = devnull)
+                versions = resolved_versions()
+                @test versions[TIER_ROOT_UUID] == v"1.1.0"
+                @test versions[TIER_ROOT_UUID] in semver_1
+                @test versions[TIER_LEAF_UUID] == v"1.1.0"
+                @test versions[TIER_SEMVER_UUID] == v"1.0.0"
+
+                # The final target forces the root across its major boundary:
+                # only NONE can satisfy it after ALL, DIRECT, and SEMVER fail.
+                activate_scenario("none")
+                none = PackageSpec(name = "TierTargetNone", version = v"1.0.0")
+                for preserve in (PRESERVE_ALL, PRESERVE_DIRECT, PRESERVE_SEMVER)
+                    @test_throws VibePkg.Resolve.ResolverError VibePkg.add(
+                        none; preserve, io = devnull,
+                    )
+                end
+                VibePkg.add(none; io = devnull)
+                versions = resolved_versions()
+                @test versions[TIER_ROOT_UUID] == v"2.0.0"
+                @test !(versions[TIER_ROOT_UUID] in semver_1)
+                @test versions[TIER_LEAF_UUID] == v"2.0.0"
+                @test versions[TIER_NONE_UUID] == v"1.0.0"
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        copy!(Base.DEPOT_PATH, old_depot_path)
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto_precompile
+        VibePkg.API.AUTO_GC_ENABLED[] = old_auto_gc
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_registry_gate
     end
 end
 

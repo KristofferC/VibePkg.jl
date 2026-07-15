@@ -1796,7 +1796,7 @@ end
         @test !manifest_matches_project(reloadenv(envdir))
 
         # default: warns, stays stale
-        @test_logs (:warn, r"does not match") match_mode = :any VibePkg.instantiate(; io = devnull)
+        @test_logs (:warn, r"project dependencies or compat requirements have changed") match_mode = :any VibePkg.instantiate(; io = devnull)
         env = reloadenv(envdir)
         @test entry_version(env.manifest[EX]) == v"0.5.5"
         @test !manifest_matches_project(env)

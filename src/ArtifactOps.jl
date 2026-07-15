@@ -229,8 +229,9 @@ function ensure_artifact_installed!(
         adir = mkpath(artifacts_dir(depots1(d)))
         create_cachedir_tag(adir)
         failures = String[]
+        already = Ref(false)
         success = mkpidlock(path * ".pid", stale_age = 20) do
-            isdir(path) && return true
+            isdir(path) && (already[] = true; return true)
             for (url, sha) in sources
                 try_install_from(
                     url, sha, hash, path;
@@ -243,8 +244,11 @@ function ensure_artifact_installed!(
             "Failed to install artifact $name [$hash]. Attempted sources:\n" *
                 join(("  - " * failure for failure in failures), "\n")
         )
+        installed = already[]
     end
-    return path, !installed
+    new = !installed
+    new && @debug "Installed artifact $name $hash"
+    return path, new
 end
 
 # Artifact selection: a `.pkg/select_artifacts.jl` hook (run in a minimal
@@ -254,8 +258,10 @@ function selected_artifacts(pkg_root::String, artifacts_toml::String, platform::
     if isfile(selector)
         triplet = Base.BinaryPlatforms.triplet(platform)
         sep = Sys.iswindows() ? ';' : ':'
+        active_project = Base.active_project()
+        project_arg = active_project === nothing ? `` : `--project=$active_project`
         cmd = addenv(
-            `$(joinpath(Sys.BINDIR, "julia")) -O0 --compile=min -t1 --startup-file=no $selector $triplet`,
+            `$(joinpath(Sys.BINDIR, "julia")) -O0 --compile=min -t1 --startup-file=no $project_arg $selector $triplet`,
             "JULIA_LOAD_PATH" => "@$(sep)@stdlib",
         )
         out = try

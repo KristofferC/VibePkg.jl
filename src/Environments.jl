@@ -172,7 +172,18 @@ end
     workspace = Pair{String, Project}[]
     manifest_file = if project.manifest_path !== nothing
         path = project.manifest_path
-        abspath(isabspath(path) ? path : joinpath(dir, path))
+        shared_manifest = abspath(isabspath(path) ? path : joinpath(dir, path))
+        # A subpackage may explicitly share the manifest beside a parent/root
+        # project without declaring a `[workspace]` (Pkg's project-as-manifest
+        # monorepo). Include that owning project in the resolve view so an op
+        # from the subpackage preserves the root's direct dependencies instead
+        # of pruning them from the shared manifest.
+        owner_file = projectfile_path(dirname(shared_manifest); strict = true)
+        if owner_file !== nothing && !samefile_or_equal(owner_file, project_file)
+            owner_file = safe_realpath(owner_file)
+            push!(workspace, owner_file => read_project(owner_file))
+        end
+        shared_manifest
     else
         root_file = find_workspace_root(project_file)
         if root_file != project_file || !isempty(project.workspace)

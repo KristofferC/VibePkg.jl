@@ -79,7 +79,10 @@ function concurrent_downloads_env()
 end
 
 """
-    Config(depots = depot_stack(); io, offline, respect_sysimage_versions)
+    Config(
+        depots = depot_stack(); io, offline, respect_sysimage_versions,
+        use_git_for_all_downloads, use_only_tarballs_for_downloads
+    )
 
 One immutable view of the ambient operation settings. Session flags
 (offline mode, sysimage-version respect) are folded in by the caller; the
@@ -93,6 +96,8 @@ struct Config
     devdir::String
     concurrency::Int
     respect_sysimage_versions::Bool
+    use_git_for_all_downloads::Bool
+    use_only_tarballs_for_downloads::Bool
 end
 
 function Config(
@@ -100,6 +105,8 @@ function Config(
         io::IO = stderr_f(),
         offline::Bool = false,
         respect_sysimage_versions::Bool = true,
+        use_git_for_all_downloads::Bool = false,
+        use_only_tarballs_for_downloads::Bool = false,
     )
     return Config(
         depots, io, pkg_server(),
@@ -107,6 +114,8 @@ function Config(
         devdir_env(depots),
         concurrent_downloads_env(),
         respect_sysimage_versions,
+        use_git_for_all_downloads,
+        use_only_tarballs_for_downloads,
     )
 end
 

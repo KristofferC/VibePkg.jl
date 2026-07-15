@@ -23,14 +23,23 @@ using VibePkg.Versions: semver_spec
     )
     @test valid["hello-world"].submodule == "CLI"
 
+    nested = VibePkg.EnvFiles.read_project_apps(
+        Dict{String, Any}(
+            "hello" => Dict{String, Any}("submodule" => "CLI.Nested"),
+        )
+    )
+    @test nested["hello"].submodule == "CLI.Nested"
+
     for name in ("", "../outside", "dir/app", raw"dir\app", "-leading")
         @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
             Dict{String, Any}(name => Dict{String, Any}())
         )
     end
-    @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
-        Dict{String, Any}("hello" => Dict{String, Any}("submodule" => "CLI.Sub"))
-    )
+    for submodule in (".CLI", "CLI.", "CLI..Nested", "CLI-not-an-identifier")
+        @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
+            Dict{String, Any}("hello" => Dict{String, Any}("submodule" => submodule))
+        )
+    end
     @test_throws PkgError VibePkg.EnvFiles.read_project_apps(
         Dict{String, Any}("hello" => Dict{String, Any}("submodule" => 1))
     )
@@ -576,7 +585,7 @@ end
     uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
 
     [apps.main]
-    submodule = "CLI"
+    submodule = "CLI.Nested"
     julia_flags = ["--threads=2"]
     custom_key = "kept"
 
@@ -584,11 +593,13 @@ end
     """
     p = parse_project(TOML.parse(raw))
     out = TOML.parse(render_project(p))
-    @test out["apps"]["main"]["submodule"] == "CLI"
+    @test out["apps"]["main"]["submodule"] == "CLI.Nested"
     @test out["apps"]["main"]["julia_flags"] == ["--threads=2"]
     @test out["apps"]["main"]["custom_key"] == "kept"   # unknown keys survive
     @test haskey(out["apps"], "plain")
     @test parse_project(TOML.parse(render_project(p))) == p
+    @test parse_project(TOML.parse(render_project(p))).apps["main"].submodule ==
+        "CLI.Nested"
 
     # removing an app through a functional update removes it on write
     p2 = with_project(p; apps = Dict("main" => p.apps["main"]))

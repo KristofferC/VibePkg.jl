@@ -10,6 +10,8 @@ using REPL
 LocalPkgServer.isolate!()
 
 using Test
+import LibGit2
+import TOML
 using Base: UUID
 using VibePkg
 using VibePkg.REPLMode
@@ -18,6 +20,50 @@ using VibePkg: PackageSpec
 using VibePkg.Planning: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR
 using VibePkg.Errors: PkgError
 using VibePkg.Utils: expanduser_path
+
+function write_repl_fixture_package(
+        path::String, name::String, uuid::UUID;
+        version::VersionNumber = v"0.1.0", with_tests::Bool = false,
+    )
+    mkpath(joinpath(path, "src"))
+    write(
+        joinpath(path, "Project.toml"),
+        "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"$version\"\n",
+    )
+    write(
+        joinpath(path, "src", "$name.jl"),
+        "module $name\nvalue() = 1\nend\n",
+    )
+    if with_tests
+        mkpath(joinpath(path, "test"))
+        write(
+            joinpath(path, "test", "runtests.jl"),
+            "using $name\n@assert $name.value() == 1\n",
+        )
+    end
+    return path
+end
+
+function init_repl_fixture_repo(path::String)
+    repo = LibGit2.init(path)
+    signature = LibGit2.Signature("fixture", "fixture@localhost")
+    commit = try
+        LibGit2.add!(repo, "*")
+        LibGit2.commit(repo, "initial"; author = signature, committer = signature)
+    finally
+        close(repo)
+    end
+    return commit
+end
+
+function write_empty_repl_registry(depot::String, uuid::UUID)
+    registry = mkpath(joinpath(depot, "registries", "REPLFixtures"))
+    write(
+        joinpath(registry, "Registry.toml"),
+        "name = \"REPLFixtures\"\nuuid = \"$uuid\"\n\n[packages]\n",
+    )
+    return registry
+end
 
 @testset "REPLMode" begin
     REPLMode.TEST_MODE[] = true
@@ -28,6 +74,27 @@ using VibePkg.Utils: expanduser_path
         api, args, opts = capture("add Example")
         @test api === VibePkg.API.add
         @test args[1] == [PackageSpec("Example")]
+
+        # Bare identifiers stay package names even beside a same-named local
+        # directory; an explicit ./ prefix selects the path and the former
+        # spelling emits Pkg's helpful local-directory nudge.
+        mktempdir() do dir
+            cd(dir) do
+                mkdir("example")
+                api, args, opts = capture("add Example")
+                @test args[1] == [PackageSpec("Example")]
+                @test_logs (:info, Regex("Use `\\./example` to add or develop the local directory at `$(abspath("example"))`\\.")) begin
+                    api, args, opts = capture("add example")
+                    @test args[1] == [PackageSpec("example")]
+                end
+                api, args, opts = capture("add ./example")
+                @test args[1] == [PackageSpec(; path = "./example")]
+                cd("example") do
+                    api, args, opts = capture("add .")
+                    @test args[1] == [PackageSpec(; path = ".")]
+                end
+            end
+        end
 
         api, args, opts = capture("add Example@0.5.1 Other=22222222-2222-2222-2222-222222222222")
         @test args[1][1] == PackageSpec("Example", "0.5.1")
@@ -478,6 +545,7 @@ using VibePkg.Utils: expanduser_path
         @test_throws PkgError do_cmd("add @0.5")            # modifier without a package
         @test_throws PkgError do_cmd("add Example #a #b")   # duplicate revision specifier
         @test_throws PkgError do_cmd("pin https://github.com/JuliaLang/Example.jl") # urls only for add/dev
+        @test_throws PkgError do_cmd("test --project Example") # invalid option surface
     finally
         REPLMode.TEST_MODE[] = false
     end
@@ -495,6 +563,32 @@ end
 
     @test mode isa REPL.LineEdit.Prompt
     @test mode.hist === repl.interface.modes[1].hist
+
+    # JuliaLang/julia#58690: the LineEdit-facing method must use the current
+    # NamedCompletion/zero-based-region interface, including at an empty
+    # insertion range. Exercise the provider directly, not just the core
+    # string completion helper.
+    @eval REPL.beforecursor(state::NamedTuple) =
+        String(state.input_buffer.data[1:(state.input_buffer.ptr - 1)])
+    mock_state = (
+        input_buffer = let buffer = IOBuffer()
+            write(buffer, "add Example")
+            seek(buffer, sizeof("add Example"))
+            buffer
+        end,
+    )
+    completions, region, should_complete =
+        @invokelatest REPL.LineEdit.complete_line(ext.VibeCompletionProvider(), mock_state)
+    @test completions isa Vector{REPL.LineEdit.NamedCompletion}
+    @test region isa Pair{Int, Int}
+    @test should_complete isa Bool
+
+    empty_state = (input_buffer = IOBuffer(),)
+    empty_completions, empty_region, empty_should_complete =
+        @invokelatest REPL.LineEdit.complete_line(ext.VibeCompletionProvider(), empty_state)
+    @test empty_completions isa Vector{REPL.LineEdit.NamedCompletion}
+    @test empty_region isa Pair{Int, Int}
+    @test empty_should_complete isa Bool
 end
 
 # Pkg.jl repl.jl "unit test for REPLMode.promptf" + JuliaLang/julia #55850 —
@@ -790,21 +884,470 @@ end
     end
 end
 
-# ---------------------------------------------------------------------------
-# Pkg.jl repl.jl "accidental" (line 28) — leading `]` tolerance.
-# ⚪ DIVERGENCE: Pkg's `do_cmd` strips a leading `]` so `]st`, `] st -m`, bare
-#   `]` etc. are tolerated. VibePkg's `do_cmd` does NOT strip `]`; the bracket
-#   becomes part of the command word, so every one of these is an unrecognized
-#   command and throws PkgError. Pinning the real behavior.
-# ---------------------------------------------------------------------------
-@testset "accidental bracket input (repl.jl:28)" begin
-    REPLMode.TEST_MODE[] = true
+@testset "nested relative develop survives project copy (repl.jl:213)" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_offline = VibePkg.API.OFFLINE_MODE[]
     try
-        for input in ("]?", "] ?", "]st", "] st", "]st -m", "] st -m", "]")
-            @test_throws PkgError do_cmd(input)
+        VibePkg.API.OFFLINE_MODE[] = true
+        mktempdir() do root
+            root = realpath(root)
+            original = mkpath(joinpath(root, "original", "HelloWorld"))
+            copied_parent = mkpath(joinpath(root, "copied"))
+            uuids = (
+                UUID("51b10001-51b1-4000-8000-51b100000001"),
+                UUID("51b20002-51b2-4000-8000-51b200000002"),
+            )
+            for (name, uuid) in zip(("SubModule1", "SubModule2"), uuids)
+                package = mkpath(joinpath(original, name))
+                mkpath(joinpath(package, "src"))
+                write(
+                    joinpath(package, "Project.toml"),
+                    "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n",
+                )
+                write(joinpath(package, "src", "$name.jl"), "module $name end\n")
+            end
+
+            Base.ACTIVE_PROJECT[] = joinpath(original, "Project.toml")
+            cd(original) do
+                do_cmd("develop ./SubModule1"; io = devnull)
+                tests = mkdir("tests")
+                cd(tests) do
+                    do_cmd("develop ../SubModule2"; io = devnull)
+                end
+            end
+
+            env = VibePkg.Environments.load_environment(
+                ; depots = VibePkg.Depots.depot_stack(),
+            )
+            @test VibePkg.EnvFiles.entry_path(env.manifest[uuids[1]]) == "SubModule1"
+            @test VibePkg.EnvFiles.entry_path(env.manifest[uuids[2]]) == "SubModule2"
+            @test all(uuid -> VibePkg.dependencies()[uuid].version == v"0.1.0", uuids)
+
+            copied = joinpath(copied_parent, "HelloWorld")
+            cp(original, copied)
+            Base.ACTIVE_PROJECT[] = joinpath(copied, "Project.toml")
+            copied_deps = VibePkg.dependencies()
+            @test Base.samefile(copied_deps[uuids[1]].source, joinpath(copied, "SubModule1"))
+            @test Base.samefile(copied_deps[uuids[2]].source, joinpath(copied, "SubModule2"))
         end
     finally
+        Base.ACTIVE_PROJECT[] = old_active
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+    end
+end
+
+@testset "BigProject multiline REPL input (repl.jl:562)" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        mktempdir() do root
+            root = realpath(root)
+            depot = mkpath(joinpath(root, "depot"))
+            write_empty_repl_registry(
+                depot, UUID("b1900000-b190-4000-8000-b19000000000"),
+            )
+            big = write_repl_fixture_package(
+                mkpath(joinpath(root, "BigProject")), "BigProject",
+                UUID("b1900001-b190-4000-8000-b19000000001"); with_tests = true,
+            )
+            dependencies = (
+                (
+                    "RecursiveDep", UUID("b1900002-b190-4000-8000-b19000000002"),
+                ),
+                (
+                    "SubModule", UUID("b1900003-b190-4000-8000-b19000000003"),
+                ),
+            )
+            for (name, uuid) in dependencies
+                write_repl_fixture_package(
+                    mkpath(joinpath(big, name)), name, uuid; with_tests = true,
+                )
+            end
+
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(big, "Project.toml")
+            cd(big) do
+                do_cmd(
+                    """
+                    dev ./RecursiveDep
+                    dev ./SubModule
+                    add Random
+                    build
+                    """; io = devnull,
+                )
+                deps = VibePkg.dependencies()
+                @test all((haskey(deps, uuid) for (_, uuid) in dependencies))
+                @test all((deps[uuid].is_tracking_path for (_, uuid) in dependencies))
+                @test haskey(deps, UUID("9a3f8284-a2c9-5f02-9a11-845980a1fd5c"))
+
+                # Each newline is a command boundary here too; both real test
+                # subprocesses must run rather than becoming arguments to the
+                # first `test` command.
+                do_cmd(
+                    """
+                    test RecursiveDep
+                    test SubModule
+                    """; io = devnull,
+                )
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+    end
+end
+
+@testset "quoted local-path add/remove (repl.jl:607)" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        mktempdir() do root
+            root = realpath(root)
+            depot = mkpath(joinpath(root, "depot"))
+            envdir = mkpath(joinpath(root, "environment"))
+            write_empty_repl_registry(
+                depot, UUID("aadd0000-aadd-4000-8000-aadd00000000"),
+            )
+            fixtures = (
+                (
+                    joinpath("space dir", "WeirdName77"), "WeirdName77",
+                    UUID("aadd0001-aadd-4000-8000-aadd00000001"),
+                ),
+                (
+                    joinpath("some@d;ir#", "WeirdName78"), "WeirdName78",
+                    UUID("aadd0002-aadd-4000-8000-aadd00000002"),
+                ),
+                (
+                    joinpath("two space dir", "QuotedName1"), "QuotedName1",
+                    UUID("aadd0003-aadd-4000-8000-aadd00000003"),
+                ),
+                (
+                    joinpath("two'quote'dir", "QuotedName2"), "QuotedName2",
+                    UUID("aadd0004-aadd-4000-8000-aadd00000004"),
+                ),
+            )
+            for (relative, name, uuid) in fixtures
+                package = write_repl_fixture_package(
+                    mkpath(joinpath(root, relative)), name, uuid,
+                )
+                init_repl_fixture_repo(package)
+            end
+
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            cd(root) do
+                first_path, first_name, first_uuid = fixtures[1]
+                do_cmd("add \"$first_path\""; io = devnull)
+                @test haskey(VibePkg.dependencies(), first_uuid)
+                do_cmd("remove \"$first_name\""; io = devnull)
+                @test !haskey(VibePkg.dependencies(), first_uuid)
+
+                second_path, second_name, second_uuid = fixtures[2]
+                do_cmd("add \"$second_path\""; io = devnull)
+                @test haskey(VibePkg.dependencies(), second_uuid)
+                do_cmd("remove '$second_name'"; io = devnull)
+                @test !haskey(VibePkg.dependencies(), second_uuid)
+
+                third_path, third_name, third_uuid = fixtures[3]
+                fourth_path, fourth_name, fourth_uuid = fixtures[4]
+                do_cmd("add '$third_path' \"$fourth_path\""; io = devnull)
+                @test all(
+                    uuid -> haskey(VibePkg.dependencies(), uuid),
+                    (third_uuid, fourth_uuid),
+                )
+                do_cmd("remove '$third_name' \"$fourth_name\""; io = devnull)
+                @test all(
+                    uuid -> !haskey(VibePkg.dependencies(), uuid),
+                    (third_uuid, fourth_uuid),
+                )
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+    end
+end
+
+@testset "REPL add/develop :subdir end-to-end" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        mktempdir() do root
+            root = realpath(root)
+            depot = mkpath(joinpath(root, "depot"))
+            envdir = mkpath(joinpath(root, "environment"))
+            write_empty_repl_registry(
+                depot, UUID("5abd0000-5abd-4000-8000-5abd00000000"),
+            )
+            repo = mkpath(joinpath(root, "MainRepo"))
+            subdir_uuid = UUID("5abd0001-5abd-4000-8000-5abd00000001")
+            subdir = write_repl_fixture_package(
+                mkpath(joinpath(repo, "SubDir")), "SubDir", subdir_uuid,
+            )
+            init_repl_fixture_repo(repo)
+
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            do_cmd("add $repo:SubDir"; io = devnull)
+            added = VibePkg.dependencies()[subdir_uuid]
+            @test added.is_tracking_repo
+            @test isfile(joinpath(added.source, "Project.toml"))
+
+            do_cmd("rm SubDir"; io = devnull)
+            @test !haskey(VibePkg.dependencies(), subdir_uuid)
+            do_cmd("develop $repo:SubDir"; io = devnull)
+            developed = VibePkg.dependencies()[subdir_uuid]
+            @test developed.is_tracking_path
+            @test Base.samefile(developed.source, subdir)
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+    end
+end
+
+@testset "REPL add/rm/pin/free/update/develop/instantiate workflow" begin
+    LocalPkgServer.ensure!()
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        mktempdir() do root
+            root = realpath(root)
+            depot = mkpath(joinpath(root, "depot"))
+            envdir = mkpath(joinpath(root, "environment"))
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            VibePkg.API.OFFLINE_MODE[] = false
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+
+            example_uuid = UUID(LocalPkgServer.EXAMPLE_UUID)
+            do_cmd("add Example@0.5.3"; io = devnull)
+            @test VibePkg.dependencies()[example_uuid].version == v"0.5.3"
+            do_cmd("rm Example"; io = devnull)
+
+            # Space-, comma-, compact-comma-, and leading-whitespace forms all
+            # run through the string REPL driver rather than direct API calls.
+            for (add_command, rm_command) in (
+                    ("add Example, Random", "rm Example Random"),
+                    ("add Example,Random", "rm Example,Random"),
+                    ("    add Example, Random", "rm Example Random"),
+                )
+                do_cmd(add_command; io = devnull)
+                @test haskey(VibePkg.dependencies(), example_uuid)
+                do_cmd(rm_command; io = devnull)
+                @test !haskey(VibePkg.dependencies(), example_uuid)
+            end
+
+            do_cmd("add Example#master"; io = devnull)
+            before_fixed = VibePkg.dependencies()[example_uuid]
+            @test before_fixed.is_tracking_repo
+            @test before_fixed.git_revision == "master"
+            do_cmd("up --fixed"; io = devnull)
+            after_fixed = VibePkg.dependencies()[example_uuid]
+            @test after_fixed.is_tracking_repo
+            @test after_fixed.git_revision == "master"
+
+            do_cmd("pin Example"; io = devnull)
+            @test VibePkg.dependencies()[example_uuid].is_pinned
+            do_cmd("free Example"; io = devnull)
+            @test !VibePkg.dependencies()[example_uuid].is_pinned
+            @test_throws PkgError do_cmd("free Example"; io = devnull)
+
+            flow_uuid = UUID("f10a0001-f10a-4000-8000-f10a00000001")
+            flow_repo = write_repl_fixture_package(
+                mkpath(joinpath(root, "FlowPkg")), "FlowPkg", flow_uuid;
+                with_tests = true,
+            )
+            init_repl_fixture_repo(flow_repo)
+            do_cmd("add $flow_repo#master"; io = devnull)
+            flow_before = VibePkg.dependencies()[flow_uuid]
+            @test flow_before.version == v"0.1.0"
+            @test flow_before.is_tracking_repo
+
+            write_repl_fixture_package(
+                flow_repo, "FlowPkg", flow_uuid; version = v"0.2.0", with_tests = true,
+            )
+            repo_handle = LibGit2.GitRepo(flow_repo)
+            signature = LibGit2.Signature("fixture", "fixture@localhost")
+            try
+                LibGit2.add!(repo_handle, "*")
+                LibGit2.commit(
+                    repo_handle, "version 0.2"; author = signature, committer = signature,
+                )
+            finally
+                close(repo_handle)
+            end
+            do_cmd("update"; io = devnull)
+            @test VibePkg.dependencies()[flow_uuid].version == v"0.2.0"
+
+            do_cmd("pin FlowPkg"; io = devnull)
+            @test VibePkg.dependencies()[flow_uuid].is_pinned
+            do_cmd("free FlowPkg"; io = devnull)
+            @test !VibePkg.dependencies()[flow_uuid].is_pinned
+            @test_throws PkgError do_cmd("free FlowPkg"; io = devnull)
+            do_cmd("test FlowPkg"; io = devnull)
+
+            do_cmd("develop $flow_repo"; io = devnull)
+            developed = VibePkg.dependencies()[flow_uuid]
+            @test developed.version == v"0.2.0"
+            @test developed.is_tracking_path
+            @test Base.samefile(developed.source, flow_repo)
+
+            # Reproduce the REPL-created environment in a fresh depot via the
+            # public `instantiate` string command. The developed source remains
+            # available at its recorded absolute path; registry materialization
+            # for Example must be rebuilt in the new depot.
+            project_text = read(joinpath(envdir, "Project.toml"), String)
+            manifest_text = read(joinpath(envdir, "Manifest.toml"), String)
+            fresh_depot = mkpath(joinpath(root, "fresh-depot"))
+            fresh_env = mkpath(joinpath(root, "fresh-environment"))
+            write(joinpath(fresh_env, "Project.toml"), project_text)
+            write(joinpath(fresh_env, "Manifest.toml"), manifest_text)
+            Base.ACTIVE_PROJECT[] = joinpath(fresh_env, "Project.toml")
+            append!(empty!(Base.DEPOT_PATH), [fresh_depot; old_depots[2:end]])
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = false
+            do_cmd("instantiate"; io = devnull)
+            fresh_deps = VibePkg.dependencies()
+            @test fresh_deps[flow_uuid].version == v"0.2.0"
+            @test Base.samefile(fresh_deps[flow_uuid].source, flow_repo)
+            @test haskey(fresh_deps, example_uuid)
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+    end
+end
+
+# Pkg.jl repl.jl "accidental" (line 28) — a pasted Julia-mode transition
+# bracket is stripped inside package mode, and a bare bracket is a no-op.
+@testset "accidental bracket input (repl.jl:28)" begin
+    REPLMode.TEST_MODE[] = true
+    warning = r"^Removing leading `]`, which should only be used once to switch to pkg> mode$"
+    try
+        @test_logs (:warn, warning) @test only(do_cmd("]?"))[1] === REPLMode.help_command
+        @test_logs (:warn, warning) @test only(do_cmd("] ?"))[1] === REPLMode.help_command
+        @test_logs (:warn, warning) @test only(do_cmd("]st"))[1] === VibePkg.API.status
+        @test_logs (:warn, warning) @test only(do_cmd("] st"))[1] === VibePkg.API.status
+        @test_logs (:warn, warning) @test only(do_cmd("]st -m"))[3][:mode] === :manifest
+        @test_logs (:warn, warning) @test only(do_cmd("] st -m"))[3][:mode] === :manifest
+        @test_logs (:warn, warning) @test isempty(do_cmd("]"))
+    finally
         REPLMode.TEST_MODE[] = false
+    end
+end
+
+@testset "comma-separated develop (Pkg.jl#3997)" begin
+    # Pin the public parser contract independently of the effectful test: an
+    # unquoted comma is a separator for `dev`, exactly as it is for `add`.
+    REPLMode.TEST_MODE[] = true
+    try
+        api, args, opts = only(do_cmd("dev CommaA,CommaB"))
+        @test api === VibePkg.API.develop
+        @test args == [[PackageSpec("CommaA"), PackageSpec("CommaB")]]
+        @test isempty(opts)
+    finally
+        REPLMode.TEST_MODE[] = false
+    end
+
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+        mktempdir() do root
+            root = realpath(root)
+            depot = mkpath(joinpath(root, "depot"))
+            envdir = mkpath(joinpath(root, "environment"))
+            devdir = joinpath(root, "dev")
+            comma_a = UUID("c0aa0001-c0aa-4000-8000-c0aa00000001")
+            comma_b = UUID("c0bb0002-c0bb-4000-8000-c0bb00000002")
+
+            function make_repo(name, uuid)
+                path = mkpath(joinpath(root, "repos", name))
+                mkpath(joinpath(path, "src"))
+                write(
+                    joinpath(path, "Project.toml"),
+                    "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n",
+                )
+                write(joinpath(path, "src", "$name.jl"), "module $name end\n")
+                repo = LibGit2.init(path)
+                sig = LibGit2.Signature("fixture", "fixture@localhost")
+                try
+                    LibGit2.add!(repo, "*")
+                    LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+                finally
+                    close(repo)
+                end
+                return path
+            end
+
+            repositories = Dict(
+                "CommaA" => (comma_a, make_repo("CommaA", comma_a)),
+                "CommaB" => (comma_b, make_repo("CommaB", comma_b)),
+            )
+            registry = mkpath(joinpath(depot, "registries", "CommaRegistry"))
+            write(
+                joinpath(registry, "Registry.toml"),
+                """
+                name = "CommaRegistry"
+                uuid = "c0cc0003-c0cc-4000-8000-c0cc00000003"
+
+                [packages]
+                $comma_a = { name = "CommaA", path = "C/CommaA" }
+                $comma_b = { name = "CommaB", path = "C/CommaB" }
+                """,
+            )
+            for (name, (uuid, repo)) in repositories
+                package = mkpath(joinpath(registry, "C", name))
+                open(joinpath(package, "Package.toml"), "w") do io
+                    TOML.print(
+                        io,
+                        Dict("name" => name, "uuid" => string(uuid), "repo" => repo),
+                    )
+                end
+            end
+
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            withenv("JULIA_PKG_SERVER" => "", "JULIA_PKG_DEVDIR" => devdir) do
+                do_cmd("dev CommaA,CommaB"; io = devnull)
+            end
+
+            deps = VibePkg.dependencies()
+            @test all(uuid -> haskey(deps, uuid), (comma_a, comma_b))
+            @test all(uuid -> deps[uuid].is_tracking_path, (comma_a, comma_b))
+            @test Base.samefile(deps[comma_a].source, joinpath(devdir, "CommaA"))
+            @test Base.samefile(deps[comma_b].source, joinpath(devdir, "CommaB"))
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+        VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
     end
 end
 
@@ -852,14 +1395,9 @@ end
 end
 
 # ---------------------------------------------------------------------------
-# Pkg.jl repl.jl "tab completion" (line 350) — the missing completion pieces.
-# COVERED: installed-dependency filtering for rm / free / why (only names of
-#   packages in the active project's [deps] are offered).
-# ⚪ DIVERGENCE (#4098): Pkg deduplicates already-specified packages; VibePkg
-#   does NOT — a name already typed earlier on the line is still offered again.
-# ⚪ DIVERGENCE: Pkg completes help-mode input (`?ad` → `?add`); VibePkg's
-#   `completions_for` returns nothing for a `?`-prefixed word.
-# ---------------------------------------------------------------------------
+# Pkg.jl repl.jl "tab completion" (line 350): installed-dependency
+# filtering, #4098 deduplication, help mode, directory-only local-path
+# traversal, Julia-compat upper bounds, and the core return types.
 @testset "tab completion gaps (repl.jl:350)" begin
     mktempdir() do dir
         proj = joinpath(dir, "Project.toml")
@@ -887,21 +1425,95 @@ end
             # trailing space offers every dependency
             @test REPLMode.completions_for("rm ")[1] == ["Example", "PackageWithDependency"]
 
-            # ⚪ #4098: no dedup — an already-specified package is still offered
-            @test "Example" in REPLMode.completions_for("rm Example E")[1]
-            @test "Example" in REPLMode.completions_for("rm Example@0.5 Exam")[1]
-            @test "Example" in REPLMode.completions_for("rm Example PackageWithDependency E")[1]
+            # Pkg.jl#4098: already-specified names are not suggested again,
+            # including package micro-syntax and multi-package input.
+            @test !("Example" in REPLMode.completions_for("rm Example E")[1])
+            @test !("Example" in REPLMode.completions_for("rm Example@0.5 Exam")[1])
+            cands, _ = REPLMode.completions_for(
+                "rm Example PackageWithDependency E",
+            )
+            @test !("Example" in cands)
+            @test !("PackageWithDependency" in cands)
+            @test !("Example" in REPLMode.completions_for("add Example E")[1])
         finally
             Base.ACTIVE_PROJECT[] = old
         end
     end
 
-    # ⚪ help-mode completion is not implemented: a `?`-prefixed word completes
-    # to nothing (Pkg would turn `?ad` into `?add`).
-    @test isempty(REPLMode.completions_for("?ad")[1])
-    @test isempty(REPLMode.completions_for("?act")[1])
-    # never throws on `?`-prefixed input
-    @test REPLMode.completions_for("? ad")[1] isa Vector
+    apply_completion(input) = begin
+        candidates, word = REPLMode.completions_for(input)
+        input[1:(end - length(word))] * only(candidates)
+    end
+    @test apply_completion("?ad") == "?add"
+    @test apply_completion("?act") == "?activate"
+    @test apply_completion("? ad") == "? add"
+    @test apply_completion("? act") == "? activate"
+
+    # Local add/develop candidates recurse through directories and never
+    # offer ordinary files.
+    mktempdir() do dir
+        cd(dir) do
+            mkpath(joinpath("testdir", "foo", "bar"))
+            touch("README.md")
+            separator = Sys.iswindows() ? '\\' : '/'
+            @test "testdir$separator" in REPLMode.completions_for("add tes")[1]
+            @test "testdir$(separator)foo$(separator)" in
+                REPLMode.completions_for("add testdir$(separator)f")[1]
+            @test "testdir$(separator)foo$(separator)" in
+                REPLMode.completions_for("dev testdir$(separator)f")[1]
+            @test !("README.md" in REPLMode.completions_for("add RE")[1])
+        end
+    end
+
+    # Registry names whose every version excludes this Julia must not be
+    # suggested, while a sibling with compatible Julia bounds remains.
+    old_depots = copy(Base.DEPOT_PATH)
+    try
+        mktempdir() do dir
+            depot = mkpath(joinpath(dir, "depot"))
+            registry = mkpath(joinpath(depot, "registries", "CompatCompletion"))
+            entries = (
+                (
+                    "Chunks", "ccaa0001-ccaa-4000-8000-ccaa00000001",
+                    "0.6",
+                ),
+                (
+                    "CurrentChunk", "ccbb0002-ccbb-4000-8000-ccbb00000002",
+                    "1",
+                ),
+            )
+            package_lines = String[]
+            for (name, uuid, julia_compat) in entries
+                path = "C/$name"
+                package = mkpath(joinpath(registry, path))
+                push!(package_lines, "$uuid = { name = \"$name\", path = \"$path\" }")
+                write(
+                    joinpath(package, "Package.toml"),
+                    "name = \"$name\"\nuuid = \"$uuid\"\nrepo = \"https://example.invalid/$name.jl\"\n",
+                )
+                write(
+                    joinpath(package, "Versions.toml"),
+                    "[\"0.1.0\"]\ngit-tree-sha1 = \"1111111111111111111111111111111111111111\"\n",
+                )
+                write(
+                    joinpath(package, "Compat.toml"),
+                    "[\"0\"]\njulia = \"$julia_compat\"\n",
+                )
+            end
+            write(
+                joinpath(registry, "Registry.toml"),
+                "name = \"CompatCompletion\"\nuuid = \"cccc0003-cccc-4000-8000-cccc00000003\"\n\n[packages]\n" *
+                    join(package_lines, '\n') * "\n",
+            )
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            REPLMode.reset_completion_cache!()
+            @test !("Chunks" in REPLMode.completions_for("add Chu")[1])
+            @test "CurrentChunk" in REPLMode.completions_for("add Cur")[1]
+        end
+    finally
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        REPLMode.reset_completion_cache!()
+    end
 end
 
 @testset "tab completion while offline (repl.jl:331)" begin

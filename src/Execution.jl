@@ -8,6 +8,7 @@
 module Execution
 
 using Base: UUID, SHA1
+using Base.BinaryPlatforms: AbstractPlatform, HostPlatform
 
 using ..Errors: pkgerror
 using ..Utils: can_fancyprint, printpkgstyle
@@ -24,6 +25,7 @@ using ..Fetch
 using ..ArtifactOps: collect_artifact_installs, ensure_artifact_installed!, artifact_tree_path
 using ..Environments
 using ..Environments: Environment, projectfile_path
+using ..Planning: get_project_syntax_version
 using TOML: TOML
 
 export apply!, instantiate!, ensure_sources_installed!, sandbox_manifest,
@@ -221,7 +223,12 @@ fetched; path/repo-tracked entries are always materialized.
         work, [w.name for w in work];
         io, header = "Downloading packages", concurrency = config.concurrency,
     ) do item, inner_io
-        path, new = Fetch.ensure_package_installed!(depots, item.name, item.uuid, item.hash, item.git_urls; archive_urls = item.archive_urls, io = inner_io, server = config.server)
+        path, new = Fetch.ensure_package_installed!(
+            depots, item.name, item.uuid, item.hash, item.git_urls;
+            archive_urls = item.archive_urls, io = inner_io, server = config.server,
+            use_git_for_all_downloads = config.use_git_for_all_downloads,
+            use_only_tarballs_for_downloads = config.use_only_tarballs_for_downloads,
+        )
         new && push!(new_installs, (; item.uuid, item.name, path))
     end
     return new_installs
@@ -295,15 +302,16 @@ function write_sandbox_preferences(sandbox_dir::String, prefs::Dict{String, Any}
 end
 
 """
-    ensure_artifacts!(env, config; only, io) -> Vector{String}
+    ensure_artifacts!(env, config; only, platform, io) -> Vector{String}
 
 Install the artifacts selected by every package in the environment
-(including the project itself) for the host platform. With an `only` set,
+(including the project itself) for `platform` (the host by default). With an `only` set,
 manifest packages outside it are skipped.
 """
 @timeit TIMER "install artifacts" function ensure_artifacts!(
         env::Environment, config::Config;
-        only::Union{Nothing, Set{UUID}} = nothing, io::IO = config.io,
+        only::Union{Nothing, Set{UUID}} = nothing,
+        platform::AbstractPlatform = HostPlatform(), io::IO = config.io,
     )
     depots = config.depots
     # gather selections serially (cheap TOML reads), install concurrently,
@@ -312,7 +320,9 @@ manifest packages outside it are skipped.
     seen = Set{String}()
     usage = String[]
     function gather(pkg_root, pkg_uuid)
-        for (name, meta) in collect_artifact_installs(depots, pkg_root; pkg_uuid, usage_out = usage)
+        for (name, meta) in collect_artifact_installs(
+                depots, pkg_root; pkg_uuid, platform, usage_out = usage,
+            )
             meta["git-tree-sha1"] in seen && continue
             push!(seen, meta["git-tree-sha1"])
             push!(jobs, (name, meta))
@@ -383,7 +393,7 @@ function fixups_from_projectfile(env::Environment, depots::DepotStack)
                         weakdeps = merge(project.weakdeps, project.deps_weak),
                         exts = project.exts,
                         entryfile = project.entryfile,
-                        julia_syntax_version = project.julia_syntax_version,
+                        julia_syntax_version = get_project_syntax_version(project),
                     )
                 end
             end
@@ -395,7 +405,7 @@ end
 
 """
     apply!(old_env, planned_env, registries, config;
-           skip_writing_project, download_loadable_only, io)
+           skip_writing_project, download_loadable_only, platform, io)
         -> (env, installed, wrote)
 
 Execute a planned environment: install missing sources, apply project-file
@@ -411,12 +421,13 @@ function apply!(
         io::IO = config.io,
         skip_writing_project::Bool = false,
         download_loadable_only::Bool = false,
+        platform::AbstractPlatform = HostPlatform(),
     )
     # selective instantiate (Pkg.jl#4699): the whole workspace resolves, but
     # only the active project's loadable closure is fetched
     loadable = download_loadable_only ? loadable_uuids(planned_env) : nothing
     installed = ensure_sources_installed!(planned_env, registries, config; io, loadable)
-    ensure_artifacts!(planned_env, config; io, only = loadable)
+    ensure_artifacts!(planned_env, config; io, only = loadable, platform)
     manifest = fixups_from_projectfile(planned_env, config.depots)
     env = Environment(planned_env.project_file, planned_env.manifest_file, planned_env.project, manifest, planned_env.workspace)
     wrote = write_environment(old_env, env; skip_writing_project)
@@ -438,7 +449,10 @@ function manifest_matches_project(env::Environment)
 end
 
 """
-    instantiate!(env, registries, config; julia_version_strict, workspace, io) -> installed
+    instantiate!(
+            env, registries, config; julia_version_strict, workspace,
+            platform, io
+        ) -> installed
 
 Make the active project's loadable dependency closure present on disk:
 never rewrites the manifest. Errors when a direct dependency is missing
@@ -448,7 +462,8 @@ direct dependencies to have entries.
 """
 function instantiate!(
         env::Environment, registries::Vector{RegistryInstance}, config::Config;
-        julia_version_strict::Bool = false, workspace::Bool = false, io::IO = config.io,
+        julia_version_strict::Bool = false, workspace::Bool = false,
+        platform::AbstractPlatform = HostPlatform(), io::IO = config.io,
     )
     # all direct deps must have manifest entries
     direct = Dict{String, UUID}(env.project.deps)
@@ -465,13 +480,13 @@ function instantiate!(
     end
     current = is_manifest_current(env)
     if current === false
-        @warn """Manifest $(repr(env.manifest_file)) does not match project $(repr(env.project_file)).
-        Run VibePkg.resolve() or VibePkg.up() to synchronize them.""" maxlog = 1
+        @warn """The project dependencies or compat requirements have changed since the manifest was last resolved.
+        It is recommended to `VibePkg.resolve()` or consider `VibePkg.update()` if necessary."""
     end
     check_manifest_julia_version_compat(env.manifest, env.manifest_file; julia_version_strict)
     loadable = workspace ? nothing : loadable_uuids(env)
     installed = ensure_sources_installed!(env, registries, config; io, loadable)
-    ensure_artifacts!(env, config; io, only = loadable)
+    ensure_artifacts!(env, config; io, only = loadable, platform)
     return installed
 end
 

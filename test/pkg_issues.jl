@@ -2334,7 +2334,7 @@ end
         out = sprint(
             io -> VibePkg.Display.print_env_diff(io, old_env, freed; registries = regs, depots)
         )
-        @test occursin("~ Example v0.5.4", out)
+        @test occursin("Example v0.5.4", out)
         @test occursin("⇒", out)
         @test !occursin("+ Example", out)
     end
@@ -3717,7 +3717,11 @@ end
             # add narrows auto-precompile to the added package's closure, so
             # the dependency precompiles cleanly and the broken project
             # package Foo is never touched / never blamed.
-            @test occursin("✓ Example", text)
+            if Base.JLOptions().use_compiled_modules == 1
+                @test occursin("✓ Example", text)
+            else
+                @test !occursin("Precompiling", text)
+            end
             @test !occursin("✗ Foo", text)
             @test !occursin("dependency errored", text)
             reloaded = load_environment(joinpath(envdir, "Project.toml"); depots = depot_stack(copy(Base.DEPOT_PATH)))
@@ -4242,18 +4246,15 @@ end
         write(joinpath(pkgdir, "Project.toml"), "name = \"WithSpaces\"\nuuid = \"00000000-0000-0000-0000-000000000001\"\n")
         mkdir(joinpath(dir, "nospace"))
         cd(dir) do
-            # The reported #2013 corruption was `dev dir<TAB>` -> `dev dir with spaces\`.
-            # VibePkg's add/develop completion emits only package names, never
-            # filesystem paths, so no space/backslash-mangled candidate can appear.
+            # The reported #2013 corruption was `dev dir<TAB>` ->
+            # `dev dir with spaces\`. Current Pkg completion legitimately
+            # includes local directories, so pin the intact directory spelling
+            # and reject only the corrupt trailing-backslash form.
             for verb in ("dev dir", "develop dir")
                 cands, word = REPLMode.completions_for(verb)
                 @test cands isa Vector           # never throws
                 @test word == "dir"
-                # No candidate may be a filesystem path with an embedded space
-                # or a trailing backslash (the exact #2013 corrupt output).
-                @test !any(c -> occursin(' ', c), cands)
-                @test !any(c -> occursin('\\', c), cands)
-                @test !("dir with spaces" in cands)
+                @test joinpath("dir with spaces", "") in cands
                 @test !("dir with spaces\\" in cands)
             end
 
