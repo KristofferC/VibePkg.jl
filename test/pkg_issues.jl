@@ -4229,9 +4229,12 @@ end
             @test !isdir(artifacts_dir)
         finally
             # restore the real extractor so concatenated testsets are unaffected
-            @eval VibePkg.Fetch function unpack(tarball::String, dest::String)
+            @eval VibePkg.Fetch function unpack(
+                    tarball::String, dest::String;
+                    copy_symlinks::Union{Nothing, Bool} = copy_symlinks_mode(),
+                )
                 return open(get_extract_cmd(tarball)) do io
-                    Tar.extract(io, dest)
+                    Tar.extract(io, dest; copy_symlinks)
                 end
             end
         end
@@ -4255,7 +4258,9 @@ end
                 @test cands isa Vector           # never throws
                 @test word == "dir"
                 @test joinpath("dir with spaces", "") in cands
-                @test !("dir with spaces\\" in cands)
+                if !Sys.iswindows()
+                    @test !("dir with spaces\\" in cands)
+                end
             end
 
             # `dev "dir<TAB>` (inside a double quote) must also not crash and

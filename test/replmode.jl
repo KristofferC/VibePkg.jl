@@ -83,7 +83,8 @@ end
                 mkdir("example")
                 api, args, opts = capture("add Example")
                 @test args[1] == [PackageSpec("Example")]
-                @test_logs (:info, Regex("Use `\\./example` to add or develop the local directory at `$(abspath("example"))`\\.")) begin
+                message = "Use `./example` to add or develop the local directory at `$(abspath("example"))`."
+                @test_logs (:info, message) begin
                     api, args, opts = capture("add example")
                     @test args[1] == [PackageSpec("example")]
                 end

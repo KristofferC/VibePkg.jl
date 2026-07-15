@@ -388,14 +388,18 @@ function partial_concurrent_fixture(root::String, artifact_url::String)
         """,
     )
     repo = LibGit2.init(package)
-    try
+    package_hash = try
         LibGit2.add!(repo, ".")
         signature = LibGit2.Signature("fixture", "fixture@localhost")
-        LibGit2.commit(repo, "initial"; author = signature, committer = signature)
+        commit = LibGit2.commit(repo, "initial"; author = signature, committer = signature)
+        LibGit2.with(LibGit2.GitCommit(repo, commit)) do commit_obj
+            LibGit2.with(LibGit2.peel(LibGit2.GitTree, commit_obj)) do tree
+                SHA1(string(LibGit2.GitHash(tree)))
+            end
+        end
     finally
         close(repo)
     end
-    package_hash = SHA1(VibePkg.TreeHash.tree_hash(package))
 
     registry = mkpath(joinpath(root, "shared", "registries", "ConcurrentRegistry"))
     write(

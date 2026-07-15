@@ -124,34 +124,45 @@ end
 
 # one commit + tag per version; only ever modifies the same two files, so
 # the worktree at each tag is exactly the generated package tree
-function make_git_repo!(repo_dir::String, version_hashes::Dict{String, String})
+function commit_tree_hash(repo::LibGit2.GitRepo, commit::LibGit2.GitHash)
+    return LibGit2.with(LibGit2.GitCommit(repo, commit)) do commit_obj
+        LibGit2.with(LibGit2.peel(LibGit2.GitTree, commit_obj)) do tree
+            string(LibGit2.GitHash(tree))
+        end
+    end
+end
+
+function make_git_repo!(repo_dir::String)
     repo = LibGit2.init(repo_dir)
     sig = LibGit2.Signature("fixture", "fixture@localhost")
+    version_hashes = Dict{String, String}()
     for v in VERSIONS
         write_example!(repo_dir, v)
         LibGit2.add!(repo, "Project.toml", "src/Example.jl")
         commit = LibGit2.commit(repo, "Example v$v"; author = sig, committer = sig)
         LibGit2.tag_create(repo, "v$v", string(commit); msg = "v$v", sig)
-        h = bytes2hex(tree_hash(repo_dir))
-        @assert h == version_hashes[v] "git worktree hash disagrees with generated tree for $v"
+        version_hashes[v] = commit_tree_hash(repo, commit)
     end
     close(repo)
-    return repo_dir
+    return repo_dir, version_hashes
 end
 
 function generate_fixtures(dir::String)
     files = mkpath(joinpath(dir, "files"))
 
     # package trees + tarballs, hashed from what we generate
-    version_hashes = Dict{String, String}()
+    packages = Dict{String, String}()
     for v in VERSIONS
         pkg = write_example!(mkpath(joinpath(dir, "pkgs", v)), v)
-        h = bytes2hex(tree_hash(pkg))
-        version_hashes[v] = h
-        gzip_tarball(pkg, joinpath(files, "package", EXAMPLE_UUID, h))
+        packages[v] = pkg
     end
 
-    git_repo = make_git_repo!(mkpath(joinpath(dir, "Example.jl")), version_hashes)
+    git_repo, version_hashes = make_git_repo!(mkpath(joinpath(dir, "Example.jl")))
+    for v in VERSIONS
+        gzip_tarball(
+            packages[v], joinpath(files, "package", EXAMPLE_UUID, version_hashes[v]),
+        )
+    end
 
     # the registry: a synthetic "General" so default-registry bootstrap in
     # both clients finds it without special-casing

@@ -761,7 +761,8 @@ end
                 @test VibePkg.instantiate(; verbose = true, io = devnull) === nothing
                 old_loaded = load_environment(oldenv; depots)
                 @test haskey(old_loaded.manifest, lonely_uuid)
-                @test VibePkg.EnvFiles.entry_path(old_loaded.manifest[lonely_uuid]) == "../LonelyPkg"
+                @test VibePkg.EnvFiles.entry_path(old_loaded.manifest[lonely_uuid]) ==
+                    joinpath("..", "LonelyPkg")
             end
         end
     finally

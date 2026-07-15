@@ -329,7 +329,11 @@ function _mini_make_package_repo(root, name, uuid, versions)
             commit = LibGit2.commit(
                 repo, "$name $version"; author = signature, committer = signature,
             )
-            hashes[version] = bytes2hex(tree_hash(dir))
+            hashes[version] = LibGit2.with(LibGit2.GitCommit(repo, commit)) do commit_obj
+                LibGit2.with(LibGit2.peel(LibGit2.GitTree, commit_obj)) do tree
+                    string(LibGit2.GitHash(tree))
+                end
+            end
             commits[version] = string(commit)
         end
     finally
