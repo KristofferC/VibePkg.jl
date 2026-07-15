@@ -21,8 +21,8 @@ each agent read the reference test, then grepped/opened the VibePkg tests and
 
 | Verdict | Count |
 |---|---|
-| ✅ Covered | ~118 |
-| 🟡 Partial | ~86 |
+| ✅ Covered | ~139 |
+| 🟡 Partial | ~65 |
 | ❌ Missing | ~61 |
 | ⚪ N/A | ~35 |
 
@@ -41,6 +41,39 @@ read-time; `update` targets registries by name only; inconsistent manifests
 rejected at load not instantiate; `status` emits no out-of-sync message) — all
 still asserted against VibePkg's actual behavior. Each detailed entry carries a
 `✔ parity_gaps.jl …` note.
+
+**Wave 7 added (2026-07-15):** a fan-out batch closing ~20 more 🟡 PARTIAL
+entries directly in their home test files (not parity_gaps.jl), each verified
+green standalone then re-run merged:
+- **test/execution.jl** — git tree-hash matrix ("git tree hash computation
+  (parity)", 6): exec-bit sensitivity (user-x matters, group/other-x don't),
+  `.git`-subdir exclusion (Foo==FooGit), and the symlink-name-prefix sort case,
+  all pinned to git's actual command-line hashes.
+- **test/replmode.jl** (30) — activate repl forms, accidental `]` input, status
+  positional-filter matrix (name / name=uuid / uuid / comma-sugar), and
+  tab-completion installed-dep filtering for rm/free/why. Surfaced divergences:
+  no `@Foo`/`-` activate shorthand, `]` not stripped (throws), no `status --diff`
+  warn, no #4098 dedup, no help-mode completion — all pinned to actual behavior.
+- **test/git.jl** (59) — `free` drops a `[sources]` entry + resolve recovers the
+  right sources over a bad manifest; recursive `[sources]` via repo URLs (a
+  Parent→Child→Grandchild chain with per-level `git_source` + a path-tracked
+  sibling); subdir add/develop via PackageSpec with Package-vs-Dep install
+  isolation (divergence: `add(path=)` is git-only, plain-path tracking is via
+  `develop`).
+- **test/ops.jl** (36) — op-driven manifest upgrade to format 2.1, old-env
+  `julia_version` preserved-then-flipped-on-add, and the full
+  `update_on_mismatch` matrix (julia-minor mismatch, stale-compat, no-op, and
+  undo-reverts-the-fallback-as-first-op). Divergence: `rm` prunes in place and
+  does not itself re-stamp the format.
+- **test/artifacts.jl** (43) — known-hash creation vectors (empty/single/multi/
+  nested+symlinks), `find_artifacts_toml` search semantics + `artifact_hash`/
+  `artifact_meta` + the `GCOps.artifact_hashes` (extract_all_hashes) analog,
+  bad-Artifacts.toml structural parse errors, Override.toml multi-depot
+  precedence/name-resolution/clearing/invalid-key, and a bare-project
+  Artifacts.toml install. Divergence: override validation is lenient (warn, not
+  error, on malformed entries).
+- **test/resolve.jl** — the "schemes" entry was already fully ported (all 15
+  graphs + `sanity_check`, 72/72 green); audit flipped to ✅.
 
 **Wave 6 added:** develop-overrides-existing-entry (count stays 1), nested-dev
 #1570 (no duplicate instances), mutual A↔B dev cycle, no-arg activate() clears
@@ -269,7 +302,7 @@ VibePkg reproduces the REPL-parsing, input-validation, activate, and preserve/pi
 
 ### activate: repl — line 426
 - **Tests:** REPL-string parsing of `activate` into (api,args,opts): `--shared Foo`, `@Foo` shorthand, no-arg, plain `FooBar`, `--temp`, `-` (prev); plus GitHub URL rewriting in `add` — `.../tree/aa/gitlab` → rev, `.../pull/529` → `pull/529/head`, and `XLSX.jl#Bug-fixing-post-#289:subdir` → url/rev/subdir.
-- **VibePkg:** 🟡 PARTIAL — replmode.jl covers `activate --temp`, `activate --shared myenv`, and all three GitHub URL rewrites (tree/pull/XLSX#-in-branch). Not asserted: the `activate @Foo` shared shorthand, bare `activate -` (prev), and plain `activate FooBar` REPL parse forms.
+- **VibePkg:** ✅ COVERED — replmode.jl covers `activate --temp`, `activate --shared myenv`, and all three GitHub URL rewrites (tree/pull/XLSX#-in-branch); ✔ replmode.jl "activate: repl forms (new.jl:426)" adds plain `activate FooBar` and bare `activate`. Divergence pinned: VibePkg has no `@Foo` shared shorthand nor `-` (prev) — both are literal positional args (no `:shared`/`:prev` opt), so those two Pkg spellings are ⚪ divergences asserted against actual behavior.
 
 ### activate — line 475
 - **Tests:** `Pkg.activate` API behavior: "Activating project at" / "Activating new project" messages, `temp=true`, `prev=true` toggling back and forth (including after `activate("")` default), and that `activate` / `activate(prev=true)` do not error when `LOAD_PATH` is empty.
@@ -473,7 +506,7 @@ VibePkg covers the bulk of the operation surface (test/rm/build/gc/precompile/st
 
 ### git tree hash computation — line 3519
 - **Tests:** `GitTools.tree_hash` matches git's well-known empty-tree id; text-file hash; user-exec bit changes the hash while group/other-exec bits don't; empty/nested-empty dirs excluded but symlinks not; a `.git` subdir is excluded (Foo == FooGit); symlink-name-prefix sorting edge case.
-- **VibePkg:** 🟡 PARTIAL — `execution.jl` "TreeHash" covers the empty-tree well-known id, `.git`/empty-dir exclusion, content sensitivity, and symlink hashing (incl. `legacy_symlink_size`); missing are the executable-bit sensitivity matrix, the Foo-vs-FooGit(`.git`-subdir) equality, and the symlink-prefix sorting case.
+- **VibePkg:** ✅ COVERED — `execution.jl` "TreeHash" covers the empty-tree well-known id, `.git`/empty-dir exclusion, content sensitivity, and symlink hashing (incl. `legacy_symlink_size`); ✔ execution.jl "git tree hash computation (parity)" adds the remaining pieces pinned to git's actual hashes: the executable-bit sensitivity matrix (user-x changes the hash, group/other-x don't), the Foo-vs-FooGit `.git`-subdir equality, and the symlink-name-prefix sort case.
 
 ### multiple registries overlapping version ranges for different versions — line 3586
 - **Tests:** A second registry offering Example only at v0.99.99 with `julia="0.0"` compat must not cause a resolver error when the primary registry has a compatible version.
@@ -749,7 +782,7 @@ Exercises the `pkg>` REPL mode end to end: command/argument parsing, tab complet
 
 ### accidental — line 28
 - **Tests:** Accidental bracket/paste inputs inside pkg mode are tolerated: `]?`, `] st`, `]st -m`, and a bare `]` (noop) do not crash.
-- **VibePkg:** 🟡 PARTIAL — leading whitespace is handled (`do_cmd` strips each statement) but nothing exercises `]`-prefixed accidental input or the bare-`]` noop; VibePkg's do_cmd does not strip a leading `]`.
+- **VibePkg:** ⚪ N/A (divergence pinned) — ✔ replmode.jl "accidental bracket input (repl.jl:28)": VibePkg's `do_cmd` does NOT strip a leading `]`, so `]?`, `] st`, `]st -m`, bare `]`, … all throw `PkgError` (unrecognized command). Pkg strips the bracket and tolerates them; the divergent behavior is now asserted for every form.
 
 ### generate/dev validation errors — line 40
 - **Tests:** `dev Example#blergh` (bad rev), `add ÖÖÖ` (illegal name), `generate 2019Julia` (name starting with digit), and `dev ./Foo` where the package has a missing `src/Foo.jl`, a name-only Project.toml, or a uuid-only Project.toml all throw PkgError.
@@ -781,7 +814,7 @@ Exercises the `pkg>` REPL mode end to end: command/argument parsing, tab complet
 
 ### tab completion — line 350
 - **Tests:** Extensive: remote name completion, `rm/free/why` completion restricted to installed deps (with `-p/-m/--project/--manifest` variants), option completion (`up --man`, `rem`→remove), `apply_completion`, help-mode completion (`?ad`→`?add`), stdlib names, upper-bound exclusion, local-path/subdir/`~` completion, not completing files, dedup of already-specified packages (#4098), trailing-space completion, and the LineEdit type contract (#58690, #4121).
-- **VibePkg:** 🟡 PARTIAL — replmode covers command/option completion, stdlib names, path+`~`+activate completion, registered-name and deprecated-exclusion, and no-crash on malformed input, but is missing: dedup of already-specified packages, installed-dep filtering for `rm/free/why`, help-mode completion, subdir completion, file exclusion, upper-bound exclusion, and the explicit LineEdit return-type assertions.
+- **VibePkg:** 🟡 PARTIAL (reduced) — replmode covers command/option completion, stdlib names, path+`~`+activate completion, registered-name and deprecated-exclusion, and no-crash on malformed input; ✔ replmode.jl "tab completion gaps (repl.jl:350)" now adds installed-dep filtering for `rm/free/why` (COVERED) and pins two divergences: #4098 dedup of already-specified packages is NOT implemented and help-mode completion (`?ad`→`?add`) is absent (both ⚪, asserted against actual behavior). Still open: subdir completion, file exclusion, upper-bound exclusion, and the explicit LineEdit return-type assertions.
 
 ### BigProject multiline input — line 562
 - **Tests:** Multi-line `pkg"""..."""` input (dev/add/build over several lines), `build BigProject`, `add BigProject` throws (self-add), multi-line `test` of submodules, and `compat JSON` + `up` moving JSON's version and back.
@@ -809,7 +842,7 @@ Exercises the `pkg>` REPL mode end to end: command/argument parsing, tab complet
 
 ### status — line 762
 - **Tests:** status argument matrix: `-m`, by name, by `name=uuid`, by uuid, multiple names, `-m Example`, `--outdated`, `--compat`; `--diff`/`-d` warns without git then works after commit; comma-separated names parse.
-- **VibePkg:** 🟡 PARTIAL — replmode parses `st -m/-p/-o/-d/-e/--deprecated`; pins.jl/ops.jl cover status --diff and compat modes; but the uuid/`name=uuid` positional filtering and the "diff option only available in git" warning-then-works flow are not tested.
+- **VibePkg:** ✅ COVERED — replmode parses `st -m/-p/-o/-d/-e/--deprecated`; pins.jl/ops.jl cover status --diff and compat modes; ✔ replmode.jl "status arg matrix (repl.jl:762)" adds the uuid / `name=uuid` / bare-name / comma-sugar positional filtering. Divergence: VibePkg emits no "diff option only available in git" warn — `--diff`/`-d` just parse to `opts[:diff]` (⚪, runtime-only, asserted at parse).
 
 ### subcommands — line 792
 - **Tests:** Compound command form `package add Example` / `package rm Example` works.
@@ -985,11 +1018,11 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### v1.0: activate and read, upgrade on write — line 79
 - **Tests:** Activating a v1.0 reference env reads the v1 format; then `add`/`rm` operations rewrite it upgraded to v2.1.
-- **VibePkg:** 🟡 PARTIAL — envfiles.jl "manifest formats" reads the v1.0 fixture and confirms plain write stays v1 without v2 metadata (lines 390-393); missing is the operation-driven upgrade of a v1 manifest to v2.1.
+- **VibePkg:** ✅ COVERED — envfiles.jl "manifest formats" reads the v1.0 fixture and confirms plain write stays v1 without v2 metadata (lines 390-393); ✔ ops.jl "op-driven manifest upgrade to format 2.1" drives the operation-driven upgrade: activating a v1.0 manifest then `add` re-stamps it to 2.1 on disk and reload. (Divergence: a bare `rm` prunes in place and does not itself upgrade the format.)
 
 ### v2.0: activate and read, upgrade on write — line 99
 - **Tests:** Reads v2.0 format, upgrades to 2.1 on add/rm, preserves arbitrary `other` fields through write→read, and (second block) checks `check_manifest_julia_version_compat` warns / throws-when-strict on a mismatched or missing julia_version.
-- **VibePkg:** 🟡 PARTIAL — v2.0 read + round-trip incl. preserved raw fields is covered (envfiles.jl "manifest read + round trip", "manifest metadata"), but `check_manifest_julia_version_compat` (src/EnvFiles.jl:1227) is entirely untested and the op-driven 2.1 upgrade is not asserted.
+- **VibePkg:** ✅ COVERED — v2.0 read + round-trip incl. preserved raw fields is covered (envfiles.jl "manifest read + round trip", "manifest metadata"); the julia_version-compat warning is exercised (envfiles.jl "manifest julia_version compatibility") and ✔ ops.jl "op-driven manifest upgrade to format 2.1" asserts the op-driven v2.0→2.1 upgrade on `add`.
 
 ### v2.1: activate, change, maintain manifest format with registries — line 143
 - **Tests:** v2.1 manifest carries a `[registries]` section (uuid/url) and per-package `registries` field; round-trips through write/read preserving deps/julia_version/format/other/registries; add keeps format ≥2.1.
@@ -1017,11 +1050,11 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### activating old environment: maintains old version, then ~`VERSION` after resolve — line 216
 - **Tests:** Activating a v2.0 reference env keeps its recorded `julia_version` (1.7.0-DEV); a subsequent `add` flips it to `dropbuild(VERSION)`.
-- **VibePkg:** 🟡 PARTIAL — reading preserves the recorded julia_version (envfiles.jl "versioned manifest discovery") and add sets dropbuild(VERSION) (planning.jl:51), but no single test activates an old-version reference and confirms the flip on add.
+- **VibePkg:** ✅ COVERED — ✔ ops.jl "activating old env keeps julia_version, add flips it" loads a v2.0 reference env, asserts the recorded `julia_version` (1.7.0-DEV) is preserved on read, then confirms `add` flips it to `dropbuild(VERSION)`.
 
 ### instantiate manifest from different julia_version — line 225
 - **Tests:** `instantiate` on a v1/v2 manifest resolved by a different julia version warns ("The active manifest file...") and leaves/normalizes the recorded julia_version.
-- **VibePkg:** ❌ MISSING — `check_manifest_julia_version_compat` is untested and no instantiate test asserts the cross-version warning.
+- **VibePkg:** ✅ COVERED — envfiles.jl "manifest julia_version compatibility" covers the read-time compat warn/throw; ✔ ops.jl "update_on_mismatch: julia minor version mismatch" drives `instantiate` on a cross-julia-version manifest and asserts the warn + stale-preservation (and the `update_on_mismatch=true` fallback that normalizes it).
 
 ### project_hash for identifying out of sync manifest — line 239
 - **Tests:** `is_manifest_current` flips false after `compat` change; `status` prints the "dependencies or compat requirements have changed since the manifest was last resolved" message; `instantiate` warns; `update` restores current; `rm` also restores current.
@@ -1041,19 +1074,19 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 
 ### manifest from a different julia minor version — line 280
 - **Tests:** Without the flag, `instantiate` warns and keeps the stale v2.0 manifest (julia 1.7.0-DEV); with `update_on_mismatch=true` it falls back to `update` and regenerates for the current julia version.
-- **VibePkg:** ❌ MISSING — no test drives the warn-vs-fallback on a julia-minor-version mismatch; only the REPL flag-parse (replmode.jl:142) exists.
+- **VibePkg:** ✅ COVERED — ✔ ops.jl "update_on_mismatch: julia minor version mismatch": default `instantiate` warns and keeps the stale manifest; `update_on_mismatch=true` falls back to `up` and regenerates for the current julia version.
 
 ### manifest stale due to compat change — line 298
 - **Tests:** After a `compat` change, default `instantiate` just warns and stays stale; `update_on_mismatch=true` falls back to update so the manifest becomes current.
-- **VibePkg:** 🟡 PARTIAL — `manifest_matches_project` detects the stale state (options.jl:220), but the instantiate default-warn vs update_on_mismatch-becomes-current flow is not tested.
+- **VibePkg:** ✅ COVERED — `manifest_matches_project` detects the stale state (options.jl:220); ✔ ops.jl "update_on_mismatch: stale due to compat change" drives the full flow: a conflicting `compat` leaves the resolved version in place but stale, default `instantiate` warns and stays stale, and `update_on_mismatch=true` re-resolves down to the only compatible version and becomes current.
 
 ### no mismatch: update_on_mismatch=true is a no-op — line 322
 - **Tests:** When the manifest already matches, `instantiate(update_on_mismatch=true)` changes nothing and keeps installed versions.
-- **VibePkg:** ❌ MISSING — no test asserts the no-op / version-preserving path.
+- **VibePkg:** ✅ COVERED — ✔ ops.jl "update_on_mismatch: no-op when already current": with a matching manifest, `instantiate(update_on_mismatch=true)` changes nothing and keeps the installed version.
 
 ### undo reverts the fallback even as first op — line 334
 - **Tests:** If `instantiate(update_on_mismatch=true)` is the first op in a fresh session and triggers the fallback, the pre-update snapshot is saved so `Pkg.undo` restores the earlier version.
-- **VibePkg:** ❌ MISSING — undo/redo stack mechanics are unit-tested (argshapes.jl:46-64) but not the first-op snapshot for the update_on_mismatch fallback.
+- **VibePkg:** ✅ COVERED — undo/redo stack mechanics are unit-tested (argshapes.jl:46-64); ✔ ops.jl "undo reverts the update_on_mismatch fallback as first op" clears the undo stacks to simulate a fresh session, triggers the fallback as the first op, and asserts `undo` restores the pre-update version.
 
 ### Manifest registry tracking — line 360
 - **Tests:** Umbrella for recording registry provenance (format 2.1, `[registries]` section, per-package `registries` field) in the manifest.
@@ -1089,7 +1122,7 @@ Exercises Manifest.toml format versions (v1/v2.0/v2.1/unknown), julia_version me
 ### schemes — line 40
 > ✔ Now fully ported → test/resolve.jl "schemes" (all 15 hand-built graphs, 72 assertions) plus the ported sanity_check/resolve helpers.
 - **Tests:** 15 hand-built dependency schemes (DAG, cyclic, mutually-exclusive solutions, trivial/implicit/total inconsistency, weak deps, unconnected components, local-optimum graph #3232, weak-dep graph #4030). Each runs `sanity_tst` (per-package unsatisfiability detection) and `resolve_tst` asserting the exact version set chosen, plus `@test_throws ResolverError` on unsatisfiable requirements.
-- **VibePkg:** 🟡 PARTIAL — `test/resolve.jl` "Resolve" builds one synthetic graph and covers: highest-version pick, constraint pull-down, conflict + `ResolverError` message shape, fixed-package handling, weak-dep exclusion, and the #2740 self-inconsistent-branch fallback (scheme 11). Missing: `sanity_check`/`sanity_tst` is never exercised, and the systematic breadth (cyclic graphs, mutually-exclusive solutions, local-optimum #3232, weak-graph #4030, multi-req version-lowering cascades) is absent.
+- **VibePkg:** ✅ COVERED — ✔ `test/resolve.jl` "schemes" ports all 15 hand-built graphs + `sanity_check`/`sanity_tst`/`resolve_tst` (72/72 green): the DAG/cyclic/mutually-exclusive/inconsistency/local-optimum-#3232/weak-#4030/multi-req-cascade schemes all assert the exact chosen version set and `@test_throws ResolverError` on the unsatisfiable ones, with no divergence from Pkg's solutions. (The earlier "Resolve" single-graph testset remains as extra coverage.)
 
 ### realistic — line 705
 - **Tests:** Unpacks `resolvedata.tar.gz` and runs four large real-world graphs (Julia #21485, Pkg #1949/#3232/#3878) through `sanity_tst`/`resolve_tst`; the last also asserts resolver time-limit behavior via `JULIA_PKG_RESOLVE_MAX_TIME` (`ResolverError` at 10s, `ResolverTimeoutError` at 1e-5s with `validate_versions=false`).
@@ -1141,7 +1174,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### Artifact Creation — line 30
 - **Tests:** Creates 4 artifacts (empty, single file, multi-file, nested dirs with empty dirs + symlinks), asserts each hashes to a hard-coded git-tree-sha1, sits under `artifacts/<hash>`, and passes `artifact_exists`/`verify_artifact`.
-- **VibePkg:** 🟡 PARTIAL — `create_artifact`/`verify_artifact`/content-addressed dedup covered (doc_features.jl "artifact creation API"); tree-hash correctness covered generally (execution.jl "TreeHash", artifacts.jl uses `tree_hash`). Missing: the specific known-hash regression vectors (empty tree, symlinks-not-followed, empty-dir-doesn't-affect-hash) asserted against fixed sha1s.
+- **VibePkg:** ✅ COVERED — `create_artifact`/`verify_artifact`/content-addressed dedup covered (doc_features.jl "artifact creation API"); ✔ artifacts.jl "Artifact Creation known-hash vectors" asserts the empty/single-file/multi-file/nested-dirs+empty-dirs+symlinks artifacts against their fixed git-tree-sha1s (symlinks hashed not followed, empty dirs don't affect the hash), each landing under `artifacts/<hash>` and passing `artifact_exists`/`verify_artifact`.
 
 ### Artifact Creation → File permissions — line 126
 - **Tests:** After `create_artifact`, files (incl. file-symlinks) are read-only while directories (incl. dir-symlinks) stay writable, and the tree can be `rm`'d without manual chmod.
@@ -1153,7 +1186,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### Artifacts.toml Utilities → find/query/install — line 168
 - **Tests:** `find_artifacts_toml` walks up from a source file to the right `Artifacts.toml`/`JuliaArtifacts.toml` (incl. sub-module vs sub-package, and none for a plain pkg); `artifact_hash`, `extract_all_hashes`, `ensure_artifact_installed` (idempotent), `verify_artifact`, `remove_artifact`.
-- **VibePkg:** 🟡 PARTIAL — `artifact_hash`/`ensure_artifact_installed` (idempotent)/`verify_artifact`/`remove_artifact` covered (artifacts.jl "VibePkg.Artifacts (lazy on demand)"). Missing: `find_artifacts_toml` search semantics (JuliaArtifacts.toml, sub-module vs sub-package) and `extract_all_hashes` are untested.
+- **VibePkg:** ✅ COVERED — `artifact_hash`/`ensure_artifact_installed` (idempotent)/`verify_artifact`/`remove_artifact` covered (artifacts.jl "VibePkg.Artifacts (lazy on demand)"); ✔ artifacts.jl "find_artifacts_toml + hash query utilities" adds the `find_artifacts_toml` search semantics (walk-up, JuliaArtifacts.toml, sub-module vs sub-package, package-boundary→nothing) plus `artifact_hash`/`artifact_meta`, and the `extract_all_hashes` analog (VibePkg's `GCOps.artifact_hashes`, returning hex strings). ⚪ Naming divergence noted (no `extract_all_hashes`).
 
 ### Artifacts.toml Utilities → bind/unbind/platform/meta — line 206
 - **Tests:** bind, overwrite requires `force`, unbind; platform-specific binding with `download_info` (url/sha256/size), `artifact_hash`/`artifact_meta` per platform, HostPlatform compare-strategy mismatch errors, and relative Artifacts.toml paths.
@@ -1161,7 +1194,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### Artifacts.toml Utilities → bad Artifacts.toml — line 300
 - **Tests:** Parse errors log for missing `git-tree-sha1` and non-table entries; incorrect git-tree-sha1 throws (and with `JULIA_PKG_IGNORE_HASHES` downgrades to a Tree-Hash-Mismatch error + installs at the declared hash); incorrect sha256 throws; missing toml throws.
-- **VibePkg:** 🟡 PARTIAL — `JULIA_PKG_IGNORE_HASHES` (throw vs warn-and-install-at-declared-hash) fully covered (artifacts.jl "JULIA_PKG_IGNORE_HASHES"); sha256 + tree-hash mismatch rejection covered (artifacts.jl "download fallback and rejection"); "no download sources" errors covered. Missing: the structural parse-error logging for `no_gitsha`/`not_a_table` malformed Artifacts.toml.
+- **VibePkg:** ✅ COVERED — `JULIA_PKG_IGNORE_HASHES` (throw vs warn-and-install-at-declared-hash) fully covered (artifacts.jl "JULIA_PKG_IGNORE_HASHES"); sha256 + tree-hash mismatch rejection covered (artifacts.jl "download fallback and rejection"); "no download sources" errors covered; ✔ artifacts.jl "bad Artifacts.toml structural parse errors" adds the structural parse-error logging for `no_gitsha` (missing `git-tree-sha1`) and `not_a_table` (scalar entry) via `artifact_meta`.
 
 ### Artifact archival — line 339
 - **Tests:** `archive_artifact` writes a tarball whose files are listable via `list_tarball_files`; archiving a removed artifact throws.
@@ -1181,11 +1214,11 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### Override.toml — line 623
 - **Tests:** Hash-based overrides resolved across a 3-depot stack (innermost wins), name-based (`UUID.name`) overrides loaded by a real package, later Overrides.toml in an inner depot mutates/clears earlier overrides, and 4 invalid-override forms log specific errors; `load_overrides(; force)` reload.
-- **VibePkg:** 🟡 PARTIAL — hash-form and `UUID`/name-form overrides *suppressing downloads* covered (artifacts.jl "ArtifactOps"). Missing: multi-depot precedence, name-based override *resolution* (`artifact_path` pointing at the override) via a loaded package, clearing an override (`""`), and the invalid-override error-logging cases.
+- **VibePkg:** ✅ COVERED — hash-form and `UUID`/name-form overrides *suppressing downloads* covered (artifacts.jl "ArtifactOps"); ✔ artifacts.jl "Override.toml precedence, resolution and clearing" adds multi-depot precedence (innermost/first depot wins), name-based (`UUID.name`) override resolution via `ArtifactOps.override_for`, clearing an override (`""` removes an outer depot's entry), and the invalid-key handling. ⚪ Divergence: VibePkg's override validation is lenient — it `@warn`s (not `@error`s) on an invalid key and silently tolerates malformed non-UUID entries, rather than logging the specific errors Pkg emits.
 
 ### artifacts for non package project — line 800
 - **Tests:** A bare (non-package) project directory containing only an `Artifacts.toml`: `Pkg.instantiate()` installs its artifacts.
-- **VibePkg:** 🟡 PARTIAL — instantiate-installs-artifacts is covered, but only for a path-tracked *package* carrying Artifacts.toml (artifacts.jl "instantiate installs artifacts"); the bare-project-root Artifacts.toml case is not exercised.
+- **VibePkg:** ✅ COVERED — instantiate-installs-artifacts is covered for a path-tracked *package* carrying Artifacts.toml (artifacts.jl "instantiate installs artifacts"); ✔ artifacts.jl "artifacts for non-package project" adds the bare-project-root case — an env dir with an empty Project.toml and only an Artifacts.toml gets its artifact installed by `instantiate!` and its payload read back.
 
 ### installing artifacts when symlinks are copied — line 812
 - **Tests:** With `BINARYPROVIDER_COPYDEREF=true` + `JULIA_PKG_IGNORE_HASHES=true`, `download_verify_unpack` dereferences/copies symlinks, producing a different tree hash; instantiate warns Tree-Hash-Mismatch, installs at declared hash, and pre-existing artifacts survive.
@@ -1226,7 +1259,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### test Project.toml [sources] — line 9
 - **Tests:** On the `WithSources` package: `resolve()` keeps the `[sources]` entry; `free("Example")` removes it; `add(url=..., rev=...)` writes a url+rev source; resolving over a `BadManifest.toml` recovers correct sources for both Example (url+rev) and LocalPkg (path). Then runs `Pkg.test()` on four sub-packages (TestWithUnreg, TestMonorepo, TestProject, URLSourceInDevvedPackage).
-- **VibePkg:** 🟡 PARTIAL — `[sources]` overriding the registry is covered (planning.jl "[sources] overrides the registry for a direct dep"), and add writing a url source is covered (git.jl). Missing: `free` removing a `[sources]` entry, resolve recovering sources from a bad manifest, and the four end-to-end `Pkg.test` sub-package flows.
+- **VibePkg:** ✅ COVERED — `[sources]` overriding the registry is covered (planning.jl "[sources] overrides the registry for a direct dep"), and add writing a url source is covered (git.jl); ✔ git.jl "sources: free drops [sources]; resolve recovers over a bad manifest" adds `free` removing a `[sources]` entry (back to registry tracking) and resolve recovering the correct sources (url+rev for Example, path for LocalPkg) over a deliberately-wrong manifest. (The four end-to-end `Pkg.test` sub-package flows need full sandbox install and remain a separate integration gap.)
 
 ### path normalization in Project.toml [sources] — line 56
 - **Tests:** Reading then writing a `[sources]` entry with a `path` renders forward slashes (`subdir/LocalPkg`) in the TOML, never backslashes, so Windows-native separators are normalized on write.
@@ -1234,7 +1267,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### recursive [sources] via repo URLs — line 93
 - **Tests:** A Parent→Child→Grandchild chain wired through `file://` git URLs (plus a path-sourced Sibling); `add(url=parent)` pulls in all four packages, each with the correct `git_source` per level, the Sibling is `is_tracking_path` with a `SiblingPkg` source dir, and `using ParentPkg; parent_value()` executes to `47`.
-- **VibePkg:** 🟡 PARTIAL — recursive sources collection is covered for *path*-tracked deps (ops.jl "recursive sources collection", planning.jl "[sources] collected recursively for path-tracked deps"). Missing: the repo-URL (`git_source`) chain, per-level `git_source` verification, sibling path-tracking within a url-added package, and actually loading/executing the resolved package.
+- **VibePkg:** ✅ COVERED — recursive sources collection is covered for *path*-tracked deps (ops.jl "recursive sources collection", planning.jl "[sources] collected recursively for path-tracked deps"); ✔ git.jl "recursive [sources] via repo URLs" adds the repo-URL chain: `add(url=parent)` (no registries) pulls the whole Parent→Child→Grandchild chain with per-level `git_source` verified and a sibling path-tracked inside the url-added Child, surviving a write/reload round-trip. (Loading/executing the resolved package is left to the heavier subprocess-load tests.)
 
 ### switching between path and repo sources (#4337) — line 159
 - **Tests:** Flipping a `[sources]` entry path→url+rev→path across successive `update()`s must not throw the "tree_hash and path both set" AssertionError; asserts the manifest entry's path/tree_hash/repo.source fields flip correctly each way.
@@ -1248,7 +1281,7 @@ Exercises the whole Artifacts system — hashing, Artifacts.toml binding/query, 
 
 ### path/url subdir add & develop via PackageSpec (plain + at branch) — line 237
 - **Tests:** `Pkg.add`/`Pkg.develop` of a `PackageSpec(path=repo, subdir=...)` and `PackageSpec(url=repo, subdir=..., rev="master")` install exactly the named subdir package (Package vs Dep isolation), both without and with an explicit `rev`.
-- **VibePkg:** 🟡 PARTIAL — git.jl "subdirectory add" materializes and plans an add with a url `subdir` (subtree-only tree, records subdir in manifest entry + `[sources]`; nonexistent subdir and no-subdir are pinned errors), and "dev by name of a url-added subdir package" covers develop. Missing: the plain path (non-git) `PackageSpec(path=..., subdir=...)` add/develop and the `rev`-pinned subdir add matrix, plus the Package-vs-Dep install-isolation assertions.
+- **VibePkg:** ✅ COVERED — git.jl "subdirectory add" materializes and plans an add with a url `subdir` (subtree-only tree, records subdir in manifest entry + `[sources]`; nonexistent subdir and no-subdir are pinned errors), and "dev by name of a url-added subdir package" covers develop; ✔ git.jl "subdir add/develop via PackageSpec (path + rev) with isolation" adds the plain-path (non-git) subdir develop, the `rev`-pinned subdir add matrix, and the Package-vs-Dep install-isolation assertions (only the named subdir package becomes a direct dep; the sibling is not dragged in). Divergence pinned: `add(path=)` is git-only, so plain-path subdir tracking is exercised through `develop`.
 
 ### REPL `:subdir` syntax for add/develop — line 249
 - **Tests:** REPL forms `add/develop <path-or-url>:subdir`, `<url>#branch:subdir` resolve to the same subdir installs as the API calls.

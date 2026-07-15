@@ -493,3 +493,151 @@ end
         ext.invalidate_prompt!()
     end
 end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl new.jl "activate: repl" (line 426) — the currently-unasserted forms.
+# COVERED: plain `activate FooBar` and bare `activate`.
+# ⚪ DIVERGENCE: VibePkg does not special-case `@Foo` (shared shorthand) or
+#   `-` (previous project); `activate` is a plain :splat command, so those
+#   words are passed through literally with no `:shared`/`:prev` option.
+# ---------------------------------------------------------------------------
+@testset "activate: repl forms (new.jl:426)" begin
+    REPLMode.TEST_MODE[] = true
+    try
+        capture(s) = only(do_cmd(s))
+
+        # regular activate (COVERED — matches Pkg)
+        api, args, opts = capture("activate FooBar")
+        @test api === VibePkg.API.activate && args == Any["FooBar"] && isempty(opts)
+
+        # no-arg activate (COVERED — matches Pkg)
+        api, args, opts = capture("activate")
+        @test api === VibePkg.API.activate && isempty(args) && isempty(opts)
+
+        # ⚪ `activate @Foo`: Pkg maps `@Foo` → shared=true, arg "Foo".
+        # VibePkg has no `@`-shorthand: the word is a literal positional.
+        api, args, opts = capture("activate @Foo")
+        @test api === VibePkg.API.activate && args == Any["@Foo"] && isempty(opts)
+
+        # ⚪ `activate -`: Pkg maps `-` → prev=true. VibePkg has no `prev`
+        # option; `-` is a literal positional argument.
+        api, args, opts = capture("activate -")
+        @test api === VibePkg.API.activate && args == Any["-"] && isempty(opts)
+    finally
+        REPLMode.TEST_MODE[] = false
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl repl.jl "accidental" (line 28) — leading `]` tolerance.
+# ⚪ DIVERGENCE: Pkg's `do_cmd` strips a leading `]` so `]st`, `] st -m`, bare
+#   `]` etc. are tolerated. VibePkg's `do_cmd` does NOT strip `]`; the bracket
+#   becomes part of the command word, so every one of these is an unrecognized
+#   command and throws PkgError. Pinning the real behavior.
+# ---------------------------------------------------------------------------
+@testset "accidental bracket input (repl.jl:28)" begin
+    REPLMode.TEST_MODE[] = true
+    try
+        for input in ("]?", "] ?", "]st", "] st", "]st -m", "] st -m", "]")
+            @test_throws PkgError do_cmd(input)
+        end
+    finally
+        REPLMode.TEST_MODE[] = false
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl repl.jl "status" (line 762) — the positional-filter argument matrix.
+# COVERED: name, `name=uuid`, bare uuid, multiple names, and comma-separated
+#   names all parse into the right PackageSpec filter list (status uses the
+#   :requests package micro-syntax + comma-sugar).
+# ⚪ DIVERGENCE (runtime, not parse): Pkg's `status --diff` warns "diff option
+#   only available…" without a git repo then works once committed. VibePkg has
+#   no such warn — `--diff` simply parses to `opts[:diff] => true` and the API
+#   handles it. Asserting the parse result.
+# ---------------------------------------------------------------------------
+@testset "status arg matrix (repl.jl:762)" begin
+    REPLMode.TEST_MODE[] = true
+    try
+        capture(s) = only(do_cmd(s))
+        exuuid = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
+
+        api, args, _ = capture("status Example")
+        @test api === VibePkg.API.status && args[1] == [PackageSpec("Example")]
+
+        # name=uuid positional filter
+        api, args, _ = capture("status Example=7876af07-990d-54b4-ab0e-23690620f79a")
+        @test args[1] == [PackageSpec(; name = "Example", uuid = exuuid)]
+
+        # bare uuid positional filter
+        api, args, _ = capture("status 7876af07-990d-54b4-ab0e-23690620f79a")
+        @test args[1] == [PackageSpec(; uuid = exuuid)]
+
+        # multiple names
+        api, args, _ = capture("status Example Random")
+        @test args[1] == [PackageSpec("Example"), PackageSpec("Random")]
+
+        # comma-separated names parse (status is in the comma-sugar set)
+        api, args, _ = capture("status Example, Random")
+        @test args[1] == [PackageSpec("Example"), PackageSpec("Random")]
+
+        # ⚪ --diff / -d parse to opts[:diff] with no warn (divergence is runtime)
+        @test only(do_cmd("status --diff"))[3][:diff] === true
+        @test only(do_cmd("status -d"))[3][:diff] === true
+    finally
+        REPLMode.TEST_MODE[] = false
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl repl.jl "tab completion" (line 350) — the missing completion pieces.
+# COVERED: installed-dependency filtering for rm / free / why (only names of
+#   packages in the active project's [deps] are offered).
+# ⚪ DIVERGENCE (#4098): Pkg deduplicates already-specified packages; VibePkg
+#   does NOT — a name already typed earlier on the line is still offered again.
+# ⚪ DIVERGENCE: Pkg completes help-mode input (`?ad` → `?add`); VibePkg's
+#   `completions_for` returns nothing for a `?`-prefixed word.
+# ---------------------------------------------------------------------------
+@testset "tab completion gaps (repl.jl:350)" begin
+    mktempdir() do dir
+        proj = joinpath(dir, "Project.toml")
+        write(
+            proj, """
+            name = "Sandbox"
+            uuid = "12345678-1234-1234-1234-123456789abc"
+
+            [deps]
+            Example = "7876af07-990d-54b4-ab0e-23690620f79a"
+            PackageWithDependency = "88888888-8888-8888-8888-888888888888"
+            """
+        )
+        old = Base.ACTIVE_PROJECT[]
+        try
+            Base.ACTIVE_PROJECT[] = proj
+
+            # installed-dependency filtering: rm/free/why offer only project deps
+            @test REPLMode.completions_for("rm Exam")[1] == ["Example"]
+            @test REPLMode.completions_for("rm Pack")[1] == ["PackageWithDependency"]
+            @test REPLMode.completions_for("free Exam")[1] == ["Example"]
+            @test REPLMode.completions_for("why Exam")[1] == ["Example"]
+            # a non-dependency name yields nothing
+            @test isempty(REPLMode.completions_for("rm Bogus")[1])
+            # trailing space offers every dependency
+            @test REPLMode.completions_for("rm ")[1] == ["Example", "PackageWithDependency"]
+
+            # ⚪ #4098: no dedup — an already-specified package is still offered
+            @test "Example" in REPLMode.completions_for("rm Example E")[1]
+            @test "Example" in REPLMode.completions_for("rm Example@0.5 Exam")[1]
+            @test "Example" in REPLMode.completions_for("rm Example PackageWithDependency E")[1]
+        finally
+            Base.ACTIVE_PROJECT[] = old
+        end
+    end
+
+    # ⚪ help-mode completion is not implemented: a `?`-prefixed word completes
+    # to nothing (Pkg would turn `?ad` into `?add`).
+    @test isempty(REPLMode.completions_for("?ad")[1])
+    @test isempty(REPLMode.completions_for("?act")[1])
+    # never throws on `?`-prefixed input
+    @test REPLMode.completions_for("? ad")[1] isa Vector
+end

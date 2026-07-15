@@ -572,16 +572,18 @@ store, and read the package's Project.toml for its identity.
         # store.  Use the Git object's canonical id: re-hashing a Windows
         # checkout can lose Unix mode information and produce an id that does
         # not exist in the repository (and therefore cannot be re-fetched).
-        # snapshot the resolved object/rev into single-assignment locals so the
+        # snapshot the resolved handles into single-assignment locals so the
         # closure below captures them without boxing (`obj`/`actual_rev` are
-        # reassigned across the resolution branches above)
+        # reassigned across the resolution branches above; `repo` is assigned
+        # inside the enclosing `try`, which likewise defeats the analysis)
         checkout_obj = obj
         checkout_rev = actual_rev
+        checkout_repo = repo
         mktempdir() do temp
             tree = LibGit2.peel(LibGit2.GitTree, checkout_obj)
             package_tree = nothing
             try
-                checkout_tree_to_path(repo, tree, temp)
+                checkout_tree_to_path(checkout_repo, tree, temp)
                 pkg_root = subdir === nothing ? temp : joinpath(temp, subdir)
                 isdir(pkg_root) || pkgerror("path `$subdir` does not exist in the repository at `$url`")
                 git_subdir = subdir === nothing ? "." : replace(normpath(subdir), '\\' => '/')

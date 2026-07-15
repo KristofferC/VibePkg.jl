@@ -6,6 +6,7 @@ end
 LocalPkgServer.isolate!()
 
 using Test
+using Random
 using Base: SHA1
 using Base.BinaryPlatforms: HostPlatform, Platform, os, arch, triplet
 using VibePkg
@@ -788,5 +789,258 @@ if !Sys.iswindows()
             @test SHA1(tree_hash(dest; legacy_symlink_size = true)) == legacy
             @test SHA1(tree_hash(dest)) != legacy
         end
+    end
+end
+
+# create_artifact + chmod files to 0o644 so hashes are stable across umasks
+# (mirrors Pkg.jl test/artifacts.jl create_artifact_chmod)
+function create_artifact_chmod(f::Function)
+    return VibePkg.Artifacts.create_artifact() do path
+        f(path)
+        for (root, dirs, files) in walkdir(path)
+            for name in files
+                fp = joinpath(root, name)
+                islink(fp) || chmod(fp, 0o644)
+            end
+        end
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl test/artifacts.jl "Artifact Creation" (line 30): known-hash vectors.
+@testset "Artifact Creation known-hash vectors" begin
+    A = VibePkg.Artifacts
+    make_empty(path) = nothing
+    make_single(path) = write(joinpath(path, "foo"), "Hello, world!")
+    function make_multi(path)
+        write(joinpath(path, "foo1"), "Hello")
+        write(joinpath(path, "foo2"), "world!")
+        return
+    end
+    function make_nested(path)
+        mkpath(joinpath(path, "bar", "bar"))
+        write(joinpath(path, "bar", "bar", "foo1"), "Hello")
+        write(joinpath(path, "bar", "foo2"), "world!")
+        write(joinpath(path, "foo3"), "baz!")
+        # empty (even nested-empty) dirs must not affect the hash
+        mkpath(joinpath(path, Random.randstring(8), "inner"))
+        # symlinks are hashed as links, never followed
+        symlink("foo3", joinpath(path, "foo3_link"))
+        symlink("../bar", joinpath(path, "bar", "infinite_link"))
+        return
+    end
+
+    creators = Any[
+        (make_empty, "4b825dc642cb6eb9a060e54bf8d69288fbee4904"),
+        (make_single, "339aad93c0f854604248ea3b7c5b7edea20625a9"),
+        (make_multi, "98cda294312216b19e2a973e9c291c0f5181c98c"),
+    ]
+    # the nested-dirs + empty-dirs + symlinks vector needs symlink support
+    if !Sys.iswindows()
+        push!(creators, (make_nested, "86a1ce580587d5851fdfa841aeb3c8d55663f6f9"))
+    end
+
+    for (creator, known_hash) in creators
+        hash = create_artifact_chmod(creator)
+        @test all(hash.bytes .== hex2bytes(known_hash))
+        # it lands under `artifacts/<hash>` and is discoverable
+        @test basename(dirname(A.artifact_path(hash))) == "artifacts"
+        @test basename(A.artifact_path(hash)) == known_hash
+        @test A.artifact_exists(hash)
+        @test A.verify_artifact(hash)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl test/artifacts.jl "Artifacts.toml Utilities" (line 168):
+# find_artifacts_toml search semantics + artifact_hash/artifact_meta +
+# the extract_all_hashes equivalent (VibePkg: GCOps.artifact_hashes).
+@testset "find_artifacts_toml + hash query utilities" begin
+    A = VibePkg.Artifacts
+    mktempdir() do root
+        ATS = mkpath(joinpath(root, "ArtifactTOMLSearch"))
+        arty_hex = "43563e7631a7eafae1f9f8d9d332e3de44ad7239"
+        atoml_body = """
+        [arty]
+        git-tree-sha1 = "$arty_hex"
+        """
+        # top-level Artifacts.toml
+        write(joinpath(ATS, "Artifacts.toml"), atoml_body)
+        write(joinpath(ATS, "pkg.jl"), "module pkg end\n")
+        # a plain sub-directory (not a package): search walks up past it
+        submod = mkpath(joinpath(ATS, "sub_module"))
+        write(joinpath(submod, "pkg.jl"), "module pkg end\n")
+        # a sub-directory carrying its OWN Artifacts.toml wins there
+        subpkg = mkpath(joinpath(ATS, "sub_package"))
+        write(joinpath(subpkg, "Artifacts.toml"), atoml_body)
+        write(joinpath(subpkg, "pkg.jl"), "module pkg end\n")
+        # JuliaArtifacts.toml is also recognised
+        jat = mkpath(joinpath(ATS, "julia_artifacts_test"))
+        write(joinpath(jat, "JuliaArtifacts.toml"), atoml_body)
+        write(joinpath(jat, "pkg.jl"), "module pkg end\n")
+        # a package (has a Project.toml) with no Artifacts.toml: search stops
+        # at the package boundary and finds nothing
+        sandbox = mkpath(joinpath(root, "BasicSandbox", "src"))
+        write(joinpath(root, "BasicSandbox", "Project.toml"), "name = \"BasicSandbox\"\n")
+        write(joinpath(sandbox, "Foo.jl"), "module Foo end\n")
+
+        cases = [
+            joinpath(ATS, "pkg.jl") => joinpath(ATS, "Artifacts.toml"),
+            joinpath(submod, "pkg.jl") => joinpath(ATS, "Artifacts.toml"),
+            joinpath(subpkg, "pkg.jl") => joinpath(subpkg, "Artifacts.toml"),
+            joinpath(jat, "pkg.jl") => joinpath(jat, "JuliaArtifacts.toml"),
+            joinpath(sandbox, "Foo.jl") => nothing,
+        ]
+        for (src, expected) in cases
+            @test A.find_artifacts_toml(src) == expected
+        end
+
+        # artifact_hash / artifact_meta read the located file
+        toml = joinpath(ATS, "Artifacts.toml")
+        @test A.artifact_hash("arty", toml) == SHA1(arty_hex)
+        @test A.artifact_hash("nope", toml) === nothing
+        meta = A.artifact_meta("arty", toml)
+        @test meta["git-tree-sha1"] == arty_hex
+
+        # extract_all_hashes equivalent: VibePkg's GCOps.artifact_hashes returns
+        # every git-tree-sha1 as a hex string (Pkg returns SHA1 objects)
+        @test arty_hex in VibePkg.GCOps.artifact_hashes(toml)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl test/artifacts.jl "Artifacts.toml Utilities" bad-file block (line 300):
+# structural parse errors are logged by artifact_meta.
+@testset "bad Artifacts.toml structural parse errors" begin
+    A = VibePkg.Artifacts
+    mktempdir() do dir
+        no_gitsha = joinpath(dir, "no_gitsha.toml")
+        write(
+            no_gitsha, """
+            [broken_artifact]
+            not_a_hash = "whoops"
+            """
+        )
+        @test_logs (:error, r"contains no `git-tree-sha1`") A.artifact_meta("broken_artifact", no_gitsha)
+
+        not_a_table = joinpath(dir, "not_a_table.toml")
+        write(not_a_table, "broken_artifact = \"i am a scalar\"\n")
+        @test_logs (:error, r"malformed, must be array or dict!") A.artifact_meta("broken_artifact", not_a_table)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl test/artifacts.jl "Override.toml" (line 623): multi-depot precedence,
+# name-based (UUID.name) resolution, clearing (""), and invalid-entry logging.
+# VibePkg's override engine is ArtifactOps.load_overrides / override_for; the
+# actual artifact_path redirect at load time is delegated to the Artifacts
+# stdlib, which shares the same Overrides.toml file format.
+@testset "Override.toml precedence, resolution and clearing" begin
+    mktempdir() do container
+        depot1 = mkpath(joinpath(container, "depot1", "artifacts"))
+        depot2 = mkpath(joinpath(container, "depot2", "artifacts"))
+        depot3 = mkpath(joinpath(container, "depot3", "artifacts"))
+
+        foo = SHA1("1"^40)
+        bar = SHA1("2"^40)
+        baz = SHA1("3"^40)
+        aol_uuid = Base.UUID("7b879065-7f74-5fa4-bdd5-9b7a15df8941")
+
+        path_a = mkpath(joinpath(container, "override_a"))
+        path_b = mkpath(joinpath(container, "override_b"))
+
+        # depot2 (outer): baz->bar (hash form), arty->bar and barty->path_a (uuid form)
+        write(
+            joinpath(depot2, "Overrides.toml"), """
+            $(string(baz)) = "$(string(bar))"
+
+            [$aol_uuid]
+            arty = "$(string(bar))"
+            barty = "$(toml_path(path_a))"
+            """
+        )
+        # depot1 (innermost, wins): foo->path_b, clear baz, arty->path_b
+        write(
+            joinpath(depot1, "Overrides.toml"), """
+            $(string(foo)) = "$(toml_path(path_b))"
+            $(string(baz)) = ""
+
+            [$aol_uuid]
+            arty = "$(toml_path(path_b))"
+            """
+        )
+
+        d = depot_stack([dirname(depot1), dirname(depot2), dirname(depot3)])
+        ov = ArtifactOps.load_overrides(d)
+
+        # hash-form: innermost depot's path override wins
+        @test ArtifactOps.override_for(ov, nothing, "x", foo) == path_b
+        # clearing ("") in the innermost depot removes the outer depot's override
+        @test ArtifactOps.override_for(ov, nothing, "x", baz) === nothing
+        # a hash used only as an override *target* is not itself overridden
+        @test ArtifactOps.override_for(ov, nothing, "x", bar) === nothing
+        # name-based (uuid.name): innermost depot wins for `arty`
+        @test ArtifactOps.override_for(ov, aol_uuid, "arty", SHA1("0"^40)) == path_b
+        # `barty` exists only in the outer depot
+        @test ArtifactOps.override_for(ov, aol_uuid, "barty", SHA1("0"^40)) == path_a
+        # a uuid override does not apply to a different uuid
+        @test ArtifactOps.override_for(ov, Base.UUID("0"^8 * "-0000-0000-0000-" * "0"^12), "arty", foo) == path_b
+
+        # invalid Overrides.toml entry: a non-UUID key with a table value is
+        # skipped with a warning (VibePkg divergence: it does NOT @error on the
+        # non-absolute-path / invalid-SHA1 / non-string cases Pkg rejects — it
+        # tolerates them silently).
+        write(
+            joinpath(depot3, "Overrides.toml"), """
+            ["invalid UUID key"]
+            "$(string(foo))" = "$(string(bar))"
+            """
+        )
+        d3 = depot_stack([dirname(depot3)])
+        @test_logs (:warn, r"ignoring invalid key") match_mode = :any ArtifactOps.load_overrides(d3)
+
+        # tolerated-silently cases (no error, entry simply ignored)
+        write(
+            joinpath(depot3, "Overrides.toml"), """
+            "not-a-40-char-hex" = "$(string(bar))"
+            """
+        )
+        ov3 = @test_logs min_level = Logging.Error ArtifactOps.load_overrides(d3)
+        @test isempty(ov3.hash_overrides) && isempty(ov3.uuid_overrides)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Pkg.jl test/artifacts.jl "artifacts for non package project" (line 800):
+# a bare project dir carrying only an Artifacts.toml gets its artifacts
+# installed by instantiate().
+@testset "artifacts for non-package project" begin
+    mktempdir() do dir
+        art = make_gz_artifact(dir, "bareart")
+        envdir = mkpath(joinpath(dir, "env"))
+        # a bare (non-package) project: no name/uuid, just an Artifacts.toml
+        write(joinpath(envdir, "Project.toml"), "")
+        write(
+            joinpath(envdir, "Artifacts.toml"), """
+            [bareart]
+            git-tree-sha1 = "$(art.hash)"
+
+                [[bareart.download]]
+                url = "$(file_url(art.gz))"
+                sha256 = "$(art.sha)"
+            """
+        )
+        depot = mkpath(joinpath(dir, "depot"))
+        d = depot_stack([depot])
+        env = load_environment(envdir; depots = d)
+
+        # not present before instantiate
+        @test !last(artifact_tree_path(d, art.hash))
+        withenv("JULIA_PKG_SERVER" => "") do
+            instantiate!(env, RegistryInstance[], Config(d); io = devnull)
+        end
+        path, installed = artifact_tree_path(d, art.hash)
+        @test installed
+        @test read(joinpath(path, "bareart.txt"), String) == "bareart payload\n"
     end
 end

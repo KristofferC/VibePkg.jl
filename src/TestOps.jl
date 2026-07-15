@@ -300,8 +300,8 @@ function test!(
     depots = config.depots
     entry = get(env.manifest, pkg_uuid, nothing)
     name, source = if entry !== nothing
-        source = entry_source_path(env.manifest_file, entry, depots)
-        entry.name, source
+        src = entry_source_path(env.manifest_file, entry, depots)
+        entry.name, src
     elseif env.project.uuid == pkg_uuid
         something(env.project.name, "unnamed project"), dirname(env.project_file)
     else
