@@ -248,7 +248,7 @@ function edit_compat_buffer(
     return try
         while true
             print(io, move_start, clear_to_end, buffer, "\e[$(start_pos + cursor)G")
-            key = TerminalMenus._readkey(input_io)
+            key = TerminalMenus._readkey(input_io)::Union{Char, TerminalMenus.Key}
             if key == '\r'
                 println(io)
                 return buffer

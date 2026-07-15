@@ -908,7 +908,7 @@ a command. Never throws.
 function completions_for(partial::AbstractString)
     word = String(match(r"[^\s]*$", partial).match)
     before = strip(partial[1:(end - length(word))])
-    words = isempty(before) ? String[] : String.(split(before))
+    words = isempty(before) ? String[] : collect(String, split(before))
     specs = command_specs()
     cands = try
         if isempty(words) && startswith(word, "?")

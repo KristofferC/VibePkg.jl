@@ -93,11 +93,13 @@ module BinaryPlatformsCompat
     end
 
     for f in (
-            :libgfortran_version, :libstdcxx_version, :platform_name, :wordsize,
+            :libgfortran_version, :libstdcxx_version, :wordsize,
             :platform_dlext, :tags, :triplet,
         )
         @eval $(f)(platform::PlatformUnion) = $(f)(platform.p)
     end
+
+    platform_name(platform::PlatformUnion) = platform_name(platform.p)
 
     Base.:(==)(a::PlatformUnion, b::AbstractPlatform) = b == a.p
 
