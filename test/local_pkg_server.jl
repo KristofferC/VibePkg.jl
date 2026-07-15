@@ -89,15 +89,17 @@ end
 
 function write_example!(dir::String, v::String)
     mkpath(joinpath(dir, "src"))
+    project_file = joinpath(dir, "Project.toml")
+    source_file = joinpath(dir, "src", "Example.jl")
     write(
-        joinpath(dir, "Project.toml"), """
+        project_file, """
         name = "Example"
         uuid = "$EXAMPLE_UUID"
         version = "$v"
         """
     )
     write(
-        joinpath(dir, "src", "Example.jl"), """
+        source_file, """
         module Example
         # synthetic test fixture, version $v
 
@@ -107,6 +109,10 @@ function write_example!(dir::String, v::String)
         end
         """
     )
+    # Fresh Windows files are executable according to `Sys.isexecutable`,
+    # which would make host-generated tarballs differ from Git's 100644 tree.
+    chmod(project_file, 0o644)
+    chmod(source_file, 0o644)
     return dir
 end
 
