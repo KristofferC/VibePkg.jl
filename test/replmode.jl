@@ -162,7 +162,7 @@ using VibePkg.Errors: PkgError
                     end
                     @test err isa PkgError
                     if err isa PkgError
-                        @test occursin("conflicting options", err.msg)
+                        @test occursin("conflicting options", lowercase(err.msg))
                         @test occursin("--$first_flag", err.msg)
                         @test occursin("--$second_flag", err.msg)
                     end

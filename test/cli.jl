@@ -86,5 +86,5 @@ using VibePkg.Utils: DEFAULT_IO
         VibePkg.main(["not-a-command"])
     end
     @test code == 1
-    @test occursin("ERROR: `not-a-command` is not a recognized command", String(take!(output)))
+    @test occursin("ERROR: Unknown command \"not-a-command\". Type ? to list available commands", String(take!(output)))
 end

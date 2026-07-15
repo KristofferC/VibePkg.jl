@@ -178,7 +178,7 @@ function project_source(project::Project, project_file::String, manifest_file::S
     source = get(project.sources, name, nothing)
     source === nothing && return nothing
     if source.path !== nothing && (source.url !== nothing || source.rev !== nothing)
-        pkgerror("`path` and `url` are conflicting specifications")
+        pkgerror("Cannot specify both path and URL")
     end
     path = source.path === nothing ? nothing : rebase_path(project_file, manifest_file, source.path)
     return SourceSpec(path, source.url, source.rev, source.subdir)
@@ -337,7 +337,7 @@ function collect_project(node::Union{Node, Nothing}, path::String, manifest_file
     project = project_file === nothing ? Project() : read_project(project_file)
     julia_compat = get_compat_spec(project, "julia")
     if !isnothing(julia_compat) && !isnothing(julia_version) && !(julia_version in julia_compat)
-        pkgerror("julia version requirement for package at `$path` not satisfied: compat entry \"julia = $(get_compat_str(project, "julia"))\" does not include Julia version $julia_version")
+        pkgerror("Package at $(repr(path)) requires Julia $(repr(get_compat_str(project, "julia"))), but the selected Julia version is $julia_version")
     end
     for (name, uuid) in project.deps
         dep_source = project_file === nothing ? nothing :
@@ -416,13 +416,16 @@ end
 # entry whose url comes from the registry — is fetched and installed through
 # the injected `fetcher` capability. Returns the installed source path.
 function materialize_node!(n::Node, registries::Vector{RegistryInstance}, config::Config, fetcher)
-    (config.offline || fetcher === nothing) && pkgerror(
-        "package $(err_rep(n)) tracks a repository but its source tree is not materialized; " *
-            "planning requires repository packages to be installed first"
+    config.offline && pkgerror(
+        "Cannot materialize repository source for package $(err_rep(n)) in offline mode; " *
+            "unset JULIA_PKG_OFFLINE or call VibePkg.offline(false)"
+    )
+    fetcher === nothing && pkgerror(
+        "Cannot materialize repository source for package $(err_rep(n)): no repository fetch capability is available"
     )
     if n.repo_url === nothing
         url = registered_repo_url(registries, n.uuid::UUID)
-        url === nothing && pkgerror("package $(err_rep(n)) has a `rev` but no url or path")
+        url === nothing && pkgerror("Package $(err_rep(n)) specifies revision $(repr(n.repo_rev)) but has no URL or path")
         n.repo_url = url
     end
     rp = fetcher(n.repo_url; rev = n.repo_rev, subdir = n.repo_subdir)::RepoPackage
@@ -488,8 +491,13 @@ end
                     push!(dependents, dep_entry.name)
                 end
             end
-            error_msg = "expected package $(err_rep(n)) to exist at path `$path`"
-            error_msg *= "\n\nThis package is referenced in the manifest file: $(env.manifest_file)"
+            error_msg = if path === nothing
+                "Manifest entry for package $(err_rep(n)) has no usable source location"
+            else
+                "Package $(err_rep(n)) is expected at path $(repr(path)), but that path does not exist"
+            end
+            error_msg *= "\n\nThe package is referenced by manifest $(repr(env.manifest_file)). " *
+                "Correct the path or run VibePkg.resolve() and VibePkg.instantiate()."
             if !isempty(dependents)
                 if length(dependents) == 1
                     error_msg *= "\nIt is required by: $(dependents[1])"
@@ -576,17 +584,19 @@ end
 ##############
 
 function registered_name(registries::Vector{RegistryInstance}, uuid::UUID)
-    name = nothing
+    values = Pair{String, String}[]
     for reg in registries
         regpkg = get(reg, uuid, nothing)
         regpkg === nothing && continue
-        name′ = regpkg.name
-        if name !== nothing
-            name′ == name || pkgerror("package `$uuid` has multiple registered name values: $name, $name′")
-        end
-        name = name′
+        push!(values, registry_name(reg) => regpkg.name)
     end
-    return name
+    isempty(values) && return nothing
+    names = unique(last.(values))
+    length(names) == 1 || pkgerror(
+        "Configured registries disagree on the name of package $uuid: " *
+            join(("$(repr(name)) from $(repr(reg))" for (reg, name) in values), ", ")
+    )
+    return only(names)
 end
 
 const PKGORIGIN_HAVE_VERSION = :version in fieldnames(Base.PkgOrigin)
@@ -751,7 +761,7 @@ const PKGORIGIN_HAVE_VERSION = :version in fieldnames(Base.PkgOrigin)
                     push!(unavailable_weak_uuids, uuid)
                     continue
                 end
-                pkgerror("cannot find name corresponding to UUID $(uuid) in a registry")
+                pkgerror("No package named by UUID $uuid was found in the project, manifest, configured registries, or standard libraries")
             end
             uuid_to_name[uuid] = name
             entry = get(env.manifest, uuid, nothing)
@@ -791,6 +801,7 @@ function load_tree_hash!(registries::Vector{RegistryInstance}, n::Node, julia_ve
     end
     tracking_registered_version(n, julia_version) || return n
     hash = nothing
+    hash_registry = nothing
     for reg in registries
         reg_pkg = get(reg, n.uuid::UUID, nothing)
         reg_pkg === nothing && continue
@@ -799,9 +810,13 @@ function load_tree_hash!(registries::Vector{RegistryInstance}, n::Node, julia_ve
         version_info === nothing && continue
         hash′ = version_info.git_tree_sha1
         if hash !== nothing
-            hash == hash′ || pkgerror("hash mismatch in registries for $(n.name) at version $(n.version)")
+            hash == hash′ || pkgerror(
+                "Registries $(hash_registry) and $(registry_name(reg)) disagree on git-tree-sha1 for " *
+                    "$(n.name) v$(n.version): $hash versus $hash′"
+            )
         end
         hash = hash′
+        hash_registry = registry_name(reg)
     end
     n.tree_hash = hash
     return n
@@ -821,9 +836,10 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
     depots = config.depots
     # julia compat check for the project itself
     if julia_version !== nothing
-        v = intersect(julia_version, get_compat_env(env, "julia"))
+        project_julia_compat = get_compat_env(env, "julia")
+        v = intersect(julia_version, project_julia_compat)
         if isempty(v)
-            @warn "julia version requirement for project not satisfied" _module = nothing _file = nothing
+            @warn "Project Julia compatibility constraint $(repr(string(project_julia_compat))) does not include selected Julia version $julia_version" project = env.project_file _module = nothing _file = nothing
         end
     end
 
@@ -865,7 +881,7 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
         if isempty(v)
             throw(
                 Resolve.ResolverError(
-                    "empty intersection between $(n.name)@$(n.version) and project compatibility $(compat)"
+                    "Requested versions $(n.version) for package $(n.name) do not satisfy the project's [compat] constraint $compat"
                 )
             )
         end
@@ -954,7 +970,13 @@ dropbuild(v::VersionNumber) = VersionNumber(v.major, v.minor, v.patch, isempty(v
                 d = Dict{String, UUID}()
                 available_versions = get(Vector{VersionNumber}, pkg_versions_map, n.uuid)
                 if !(n.version in available_versions)
-                    pkgerror("version $(n.version) of package $(n.name) is not available. Available versions: $(join(available_versions, ", "))")
+                    shown = last(available_versions, min(length(available_versions), 10))
+                    omitted = length(available_versions) - length(shown)
+                    suffix = omitted == 0 ? "" : " ($omitted earlier versions omitted)"
+                    pkgerror(
+                        "Version $(n.version) of package $(n.name) [$(n.uuid)] is not available. " *
+                            "Latest available versions: $(join(shown, ", "))$suffix"
+                    )
                 end
                 deps_for_version = Registries.query_deps_for_version(
                     deps_map_compressed, weak_deps_map_compressed, n.uuid::UUID, n.version::VersionNumber
@@ -1216,7 +1238,7 @@ function request_version_spec(r::PackageRequest, name = r.name)
         return VersionSpec(v)
     catch e
         (e isa ArgumentError || e isa BoundsError) || rethrow()
-        pkgerror("invalid version specifier \"$v\"$pkg")
+        pkgerror("Invalid version specifier $(repr(v))$pkg")
     end
 end
 
@@ -1254,7 +1276,7 @@ end
 function resolve_request(env::Environment, registries::Vector{RegistryInstance}, r::PackageRequest)
     name, uuid = r.name, r.uuid
     if uuid === nothing
-        name === nothing && pkgerror("package request must have a name or uuid")
+        name === nothing && pkgerror("Package request must include a name or UUID")
         for source in (env.project.deps, env.project.extras, env.project.weakdeps)
             if haskey(source, name)
                 uuid = source[name]
@@ -1269,7 +1291,7 @@ function resolve_request(env::Environment, registries::Vector{RegistryInstance},
             if length(manifest_matches) == 1
                 uuid = manifest_matches[1]
             elseif length(manifest_matches) > 1
-                pkgerror("there are multiple packages named `$name` in the manifest, explicitly set the uuid")
+                pkgerror("Multiple manifest entries are named $(repr(name)): $(join(manifest_matches, ", ")); specify a UUID explicitly")
             end
         end
         if uuid === nothing
@@ -1281,7 +1303,11 @@ function resolve_request(env::Environment, registries::Vector{RegistryInstance},
             if length(uuids) == 1
                 uuid = uuids[1]
             elseif length(uuids) > 1
-                pkgerror("there are multiple registered `$name` packages, explicitly set the uuid")
+                origins = String[]
+                for reg in registries, candidate in uuids_from_name(reg, name)
+                    push!(origins, "$candidate from $(registry_name(reg))")
+                end
+                pkgerror("Multiple registered packages are named $(repr(name)): $(join(origins, ", ")); specify a UUID explicitly")
             end
         end
         if uuid === nothing
@@ -1300,7 +1326,7 @@ function resolve_request(env::Environment, registries::Vector{RegistryInstance},
             info = get(stdlib_infos(), uuid, nothing)
             name = info === nothing ? nothing : info.name
         end
-        name === nothing && pkgerror("cannot find name corresponding to UUID $(uuid) in a registry")
+        name === nothing && pkgerror("No package named by UUID $uuid was found in the project, manifest, configured registries, or standard libraries")
     end
     return name, uuid
 end
@@ -1312,7 +1338,7 @@ function check_registered(env::Environment, registries::Vector{RegistryInstance}
     entry = get(env.manifest, uuid, nothing)
     entry !== nothing && !EnvFiles.is_registry_tracked(entry) && return
     any(reg -> haskey(reg, uuid), registries) && return
-    msg = "expected package $(err_rep(name, uuid)) to be registered"
+    msg = "Expected package $(err_rep(name, uuid)) to be registered in the configured registries"
     if name !== nothing
         reg_uuid = Pair{String, Vector{UUID}}[]
         for reg in registries
@@ -1320,9 +1346,9 @@ function check_registered(env::Environment, registries::Vector{RegistryInstance}
             isempty(uuids) || push!(reg_uuid, registry_name(reg) => uuids)
         end
         if !isempty(reg_uuid)
-            msg *= "\n You may have provided the wrong UUID for package $name.\n Found the following UUIDs for that name:"
+            msg *= "\nThe supplied UUID may be wrong for package $name. Registered candidates:"
             for (reg, uuids) in reg_uuid
-                msg *= "\n  - $(join(uuids, ", ")) from registry: $reg"
+                msg *= "\n  - $(join(uuids, ", ")) from registry $reg"
             end
         end
     end
@@ -1415,7 +1441,7 @@ function add_target_node!(
     )
     name, uuid = resolve_request(env, registries, r)
     if uuid == env.project.uuid
-        pkgerror("cannot add package $(err_rep(name, uuid)) to itself")
+        pkgerror("Project $(repr(env.project_file)) cannot add itself as package $(err_rep(name, uuid))")
     end
     check_registered(env, registries, name, uuid)
     version = request_version_spec(r, name)
@@ -1438,7 +1464,7 @@ function add_target_node!(
         r::RepoPackage, ::PreserveLevel,
     )
     if r.uuid == env.project.uuid
-        pkgerror("cannot add package $(err_rep(r.name, r.uuid)) to itself")
+        pkgerror("Project $(repr(env.project_file)) cannot add itself as package $(err_rep(r.name, r.uuid))")
     end
     push!(
         nodes, Node(;
@@ -1466,7 +1492,7 @@ function plan_add(
         preferred_versions::Dict{UUID, VersionNumber} = Dict{UUID, VersionNumber}(),
         fetcher = nothing,
     )
-    isempty(targets) && pkgerror("no packages specified")
+    isempty(targets) && pkgerror("add requires at least one package")
     nodes = Node[]
     new_deps = Dict{String, UUID}(env.project.deps)
     for t in targets
@@ -1495,7 +1521,7 @@ and every package that (transitively) depends on them.
 # manifest-mode rm: drop the requested packages plus their reverse-dependency
 # closure from `new_deps` and the manifest. A standalone function so `targets`
 # is an unconditional local (a conditionally-assigned capture would box).
-function rm_manifest!(manifest, new_deps, requests)
+function rm_manifest!(manifest, new_deps, requests, manifest_path::String)
     targets = Set{UUID}()
     for r in requests
         found = false
@@ -1505,7 +1531,7 @@ function rm_manifest!(manifest, new_deps, requests)
                 found = true
             end
         end
-        found || @warn("`$(something(r.name, r.uuid))` not in manifest, ignoring")
+        found || @warn("Package $(repr(something(r.name, r.uuid))) is not in manifest $(repr(manifest_path)); ignoring")
     end
     # reverse-dependency closure as a worklist BFS over a dependents map
     # built once — a manifest-rescanning fixpoint is quadratic (Pkg.jl#4720)
@@ -1525,6 +1551,7 @@ function rm_manifest!(manifest, new_deps, requests)
         deps = Dict(uuid => e for (uuid, e) in manifest.deps if !(uuid in targets)),
     )
 end
+rm_manifest!(manifest, new_deps, requests) = rm_manifest!(manifest, new_deps, requests, "manifest")
 
 function plan_rm(env::Environment, requests::Vector{PackageRequest}; mode::Symbol = :project)
     isempty(requests) && pkgerror("rm requires at least one package")
@@ -1539,16 +1566,16 @@ function plan_rm(env::Environment, requests::Vector{PackageRequest}; mode::Symbo
             end
             if name === nothing || !haskey(new_deps, name)
                 # Pkg parity: unknown packages are skipped with a warning
-                @warn("`$(something(r.name, r.uuid))` not in project, ignoring")
+                @warn("Package $(repr(something(r.name, r.uuid))) is not in project $(repr(env.project_file)); ignoring")
                 continue
             end
             delete!(new_deps, name)
         end
         manifest = prune_manifest(manifest, Set{UUID}(values(new_deps)))
     elseif mode === :manifest
-        manifest = rm_manifest!(manifest, new_deps, requests)
+        manifest = rm_manifest!(manifest, new_deps, requests, env.manifest_file)
     else
-        pkgerror("unknown rm mode `$mode`")
+        pkgerror("Invalid remove mode $(repr(mode)); expected :project or :manifest")
     end
     # Pkg parity: compat/sources/targets entries only survive for remaining
     # direct deps (or extras/weakdeps); `julia` is an implicit direct dep
@@ -1606,7 +1633,7 @@ function plan_develop(
         paths::Vector{String}; preserve::PreserveLevel = default_preserve(), julia_version = VERSION,
         fetcher = nothing,
     )
-    isempty(paths) && pkgerror("no packages specified")
+    isempty(paths) && pkgerror("develop requires at least one package")
     nodes = Node[]
     new_deps = Dict{String, UUID}(env.project.deps)
     # the develop request must win over a stale [sources] url/rev entry
@@ -1621,22 +1648,22 @@ function plan_develop(
         dev_dir = isabspath(path) ? path : normpath(joinpath(dirname(env.project_file), path))
         if !isdir(dev_dir)
             if isfile(dev_dir)
-                pkgerror("Dev path `$(dev_dir)` is a file, but a directory is required.")
+                pkgerror("Development path $(repr(dev_dir)) is a file; expected a directory")
             else
-                pkgerror("Dev path `$(dev_dir)` does not exist.")
+                pkgerror("Development path $(repr(dev_dir)) does not exist")
             end
         end
         project_file = projectfile_path(dev_dir; strict = true)
         project_file === nothing && pkgerror(
-            "could not find project file (Project.toml or JuliaProject.toml) in package at `$path` maybe `subdir` needs to be specified"
+            "Development path $(repr(dev_dir)) contains neither Project.toml nor JuliaProject.toml"
         )
         dev_project = read_project(project_file)
         (dev_project.name === nothing || dev_project.uuid === nothing) && pkgerror(
-            "expected a `name` and `uuid` entry in project file at `$project_file`"
+            "Development project $(repr(project_file)) must define both name and uuid"
         )
         name, uuid = dev_project.name, dev_project.uuid
         if uuid == env.project.uuid
-            pkgerror("cannot develop package $(err_rep(name, uuid)) into itself")
+            pkgerror("Project $(repr(env.project_file)) cannot develop itself as package $(err_rep(name, uuid))")
         end
         error_if_in_sysimage(name, uuid, config)
 
@@ -1693,7 +1720,7 @@ function plan_up(
         repos::Vector{RepoPackage} = RepoPackage[],
         julia_version = VERSION, fetcher = nothing,
     )
-    mode in (:project, :manifest) || pkgerror("unknown up mode `$mode`")
+    mode in (:project, :manifest) || pkgerror("Invalid update mode $(repr(mode)); expected :project or :manifest")
     nodes = Node[]
     if isempty(requests)
         # whole-environment update: direct deps (project mode) or every
@@ -1722,7 +1749,9 @@ function plan_up(
         for r in requests
             name, uuid = resolve_request(env, registries, r)
             entry = get(env.manifest, uuid, nothing)
-            entry === nothing && pkgerror("package $(err_rep(name, uuid)) not in the manifest, run `Pkg.add` first")
+            entry === nothing && pkgerror(
+                "Package $(err_rep(name, uuid)) is not in manifest $(repr(env.manifest_file)); add it with VibePkg.add($(repr(name))) first"
+            )
             entry_isfixed(entry) && continue    # pinned/dev'd never move
             push!(nodes, Node(; name, uuid, version = level_spec(entry_version(entry), level)))
         end
@@ -1764,7 +1793,11 @@ function plan_pin(
     for r in requests
         name, uuid = resolve_request(env, registries, r)
         entry = get(env.manifest, uuid, nothing)
-        entry === nothing && pkgerror("package $(err_rep(name, uuid)) not found in the manifest, run `Pkg.resolve()` and retry")
+        if entry === nothing
+            recovery = get(env.project.deps, name, nothing) == uuid ?
+                "run VibePkg.resolve() and retry" : "add it with VibePkg.add($(repr(name))) first"
+            pkgerror("Package $(err_rep(name, uuid)) was not found in manifest $(repr(env.manifest_file)); $recovery")
+        end
         if r.version === nothing
             n = entry_to_node(uuid, entry, entry_version(entry))
             n.pinned = true
@@ -1772,7 +1805,7 @@ function plan_pin(
             # pin@version implies returning to registry tracking, so the
             # package must be registered somewhere
             if !EnvFiles.is_registry_tracked(entry) && !any(reg -> haskey(reg, uuid), registries)
-                pkgerror("unable to pin unregistered package $(err_rep(name, uuid)) to an arbitrary version")
+                pkgerror("Cannot pin unregistered package $(err_rep(name, uuid)) to an arbitrary version; arbitrary-version pinning requires a registered package")
             end
             EnvFiles.is_registry_tracked(entry) || push!(retracked_names, name)
             n = Node(; name, uuid, version = request_version_spec(r, name), pinned = true)
@@ -1818,11 +1851,11 @@ function plan_free(
     for r in requests
         name, uuid = resolve_request(env, registries, r)
         entry = get(env.manifest, uuid, nothing)
-        entry === nothing && pkgerror("package $(err_rep(name, uuid)) not found in the manifest")
+        entry === nothing && pkgerror("Package $(err_rep(name, uuid)) was not found in manifest $(repr(env.manifest_file))")
         if entry.tracking isa RegistryTracked
             if !entry.pinned
                 err_if_free && pkgerror(
-                    "expected package $(err_rep(name, uuid)) to be pinned, tracking a path, or tracking a repository"
+                    "Package $(err_rep(name, uuid)) is already free: it is unpinned and registry-tracked"
                 )
                 continue
             end
@@ -1830,7 +1863,7 @@ function plan_free(
         else
             registered = any(reg -> haskey(reg, uuid), registries)
             registered || pkgerror(
-                "unable to free unregistered package $(err_rep(name, uuid))"
+                "Cannot return package $(err_rep(name, uuid)) to registry tracking because no configured registry contains its UUID"
             )
             push!(to_resolve, Node(; name, uuid, version = VersionSpec()))
             push!(freed_names, name)
@@ -1862,14 +1895,14 @@ end
 function plan_compat_entry(env::Environment, name::String, compat_str::Union{Nothing, String})
     if name != "julia" && !haskey(env.project.deps, name) && !haskey(env.project.weakdeps, name) &&
             !haskey(env.project.extras, name) && !haskey(env.project.deps_weak, name)
-        pkgerror("package `$name` is not a dependency of the project and cannot have a compat entry")
+        pkgerror("Package $(repr(name)) is not listed in [deps], [weakdeps], or [extras] of project $(repr(env.project_file)) and cannot have a [compat] entry")
     end
     compat = Dict{String, EnvFiles.Compat}(env.project.compat)
     if compat_str === nothing || isempty(strip(compat_str))
         delete!(compat, name)
     else
         spec = semver_spec(compat_str, throw = false)
-        spec === nothing && pkgerror("invalid version specifier \"$compat_str\" for package `$name`")
+        spec === nothing && pkgerror("Invalid version specifier $(repr(compat_str)) for package $(repr(name))")
         compat[name] = EnvFiles.Compat(spec, compat_str)
     end
     project = with_project(env.project; compat)
@@ -1896,9 +1929,9 @@ function plan_compat(
     catch err
         err isa Resolve.ResolverError || rethrow()
         pkgerror(
-            "Could not resolve the environment with the new compat entry `$name = $(repr(compat_str))`:\n" *
+            "The new [compat] entry $name = $(repr(compat_str)) conflicts with the current resolution:\n" *
                 sprint(showerror, err) *
-                "\nSuggestion: Call `update` to resolve to the latest compatible versions, or relax the compat entry."
+                "\nRun VibePkg.up($(repr(name))) or relax the constraint"
         )
     end
 end

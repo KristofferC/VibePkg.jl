@@ -34,7 +34,7 @@ function parse_registry_spec(spec::String)
     i === nothing && return spec, nothing
     name = String(strip(spec[1:prevind(spec, i)]))
     uuid_str = String(strip(spec[nextind(spec, i):end]))
-    occursin(uuid_re, uuid_str) || pkgerror("`$spec` is not a valid registry specification")
+    occursin(uuid_re, uuid_str) || pkgerror("Invalid registry specification $(repr(spec)); expected NAME, UUID, or NAME=UUID")
     return name, UUID(uuid_str)
 end
 
@@ -46,7 +46,7 @@ Remove registries from the depot. `spec` is a name, `name=uuid`, or a
 bare uuid; a name shared by several registries requires the uuid form.
 """
 function rm(specs::AbstractString...; io::IO = stderr_f())
-    isempty(specs) && pkgerror("`registry rm` requires at least one registry")
+    isempty(specs) && pkgerror("registry rm requires at least one registry name or UUID")
     for spec in specs
         name, uuid = parse_registry_spec(String(spec))
         Registries.remove_registry!(depot_stack(), name, uuid; io)

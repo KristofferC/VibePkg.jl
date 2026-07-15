@@ -319,7 +319,7 @@ mutable struct Graph
 
                 for (uuid1, vs) in vnmap
                     p1 = pdict[uuid1]
-                    p1 == p0 && error("Package $(pkgID(pkgs[p0], uuid_to_name)) version $vn has a dependency with itself")
+                    p1 == p0 && error("Invalid registry metadata: package $(pkgID(pkgs[p0], uuid_to_name)) version $vn lists itself as a dependency; correct its Deps.toml entry")
                     # check conflicts instead of intersecting?
                     # (intersecting is used by fixed packages though...)
                     req_p1 = get(req, p1, nothing)
@@ -466,7 +466,7 @@ function _add_reqs!(graph::Graph, reqs::Requires, reason; weak_reqs::Set{UUID} =
     pvers = graph.data.pvers
 
     for (rp, rvs) in reqs
-        haskey(pdict, rp) || error("unknown required package $(pkgID(rp, graph))")
+        haskey(pdict, rp) || error("Internal resolver error: required package $(pkgID(rp, graph)) with UUID $rp is unknown")
         rp0 = pdict[rp]
         new_constr = trues(spp[rp0])
         for rv0 in 1:(spp[rp0] - 1)
@@ -499,7 +499,7 @@ function _add_fixed!(graph::Graph, fixed::Dict{UUID, Fixed})
     vdict = graph.data.vdict
 
     for (fp, fx) in fixed
-        haskey(pdict, fp) || error("unknown fixed package $(pkgID(fp, graph))")
+        haskey(pdict, fp) || error("Internal resolver error: fixed package $(pkgID(fp, graph)) with UUID $fp is unknown")
         fp0 = pdict[fp]
         fv0 = vdict[fp0][fx.version]
         new_constr = falses(spp[fp0])
@@ -1045,7 +1045,7 @@ Show the full resolution log. The `view` keyword controls how the events are dis
  * `:chronological` for a flat view of all events in chronological order
 """
 function showlog(io::IO, rlog::ResolveLog; view::Symbol = :plain)
-    view ∈ [:plain, :tree, :chronological] || throw(ArgumentError("the view argument should be `:plain`, `:tree` or `:chronological`"))
+    view ∈ [:plain, :tree, :chronological] || throw(ArgumentError("Invalid view $(repr(view)); expected :plain, :tree, or :chronological"))
     println(io, "Resolve log:")
     view === :chronological && return showlogjournal(io, rlog)
     seen = IdDict()
@@ -1080,7 +1080,7 @@ it during resolution. The `view` option can be either `:plain` or `:tree` (works
 the same as for `showlog(io, rlog)`); the default is `:tree`.
 """
 function showlog(io::IO, rlog::ResolveLog, p::UUID; view::Symbol = :tree)
-    view ∈ [:plain, :tree] || throw(ArgumentError("the view argument should be `:plain` or `:tree`"))
+    view ∈ [:plain, :tree] || throw(ArgumentError("Invalid view $(repr(view)); expected :plain or :tree"))
     entry = rlog.pool[p]
     return if view === :tree
         _show(io, rlog, entry, _logindent, IdDict{Any, Any}(entry => true), true)

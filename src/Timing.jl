@@ -67,13 +67,13 @@ should_print_timings() =
             sig = sig.args[1]
         end
         Meta.isexpr(sig, :call) && sig.args[1] isa Symbol ||
-            error("@operation could not infer a label; pass one explicitly")
+            error("@operation could not infer a label from $(repr(fdef)); use `@operation \"label\" function ... end`")
         return String(sig.args[1])
     end
 
     function operation_expr(label::String, fdef::Expr)
         Meta.isexpr(fdef, :function) && length(fdef.args) == 2 ||
-            error("@operation expects a `function ... end` definition")
+            error("@operation expects a `function ... end` definition, for example `@operation function add(args); nothing; end`")
         body = quote
             local depth = op_depth()
             local outermost = depth == 0

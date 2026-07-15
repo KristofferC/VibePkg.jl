@@ -237,7 +237,7 @@ using PrecompileTools: @setup_workload, @compile_workload
                         # REPL-printed error would silently shrink coverage
                         depots = Depots.depot_stack()
                         env = Environments.load_environment(envdir; depots)
-                        isempty(env.project.deps) || error("precompile workload session did not complete")
+                        isempty(env.project.deps) || error("Internal precompile workload error: session did not complete")
 
                         # acquisition-adjacent bits not reached without a server
                         Fetch.pkg_server_headers("https://pkg.julialang.org"; depots)

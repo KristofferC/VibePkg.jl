@@ -716,7 +716,7 @@ end
                 plan_add(env, regs, Config(depots), [PackageRequest("Example", nothing, "0.5.1+1")])
                 false
             catch e
-                e isa PkgError && occursin("invalid version specifier", sprint(showerror, e))
+                e isa PkgError && occursin("invalid version specifier", lowercase(sprint(showerror, e)))
             end
             @test_broken !rejected_as_invalid
         end

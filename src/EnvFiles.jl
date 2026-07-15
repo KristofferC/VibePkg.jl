@@ -71,7 +71,7 @@ end
 "Validate an app name before it can become a filesystem path component."
 function validate_app_name(name::String)
     occursin(r"^[A-Za-z][A-Za-z0-9_-]*$", name) || pkgerror(
-        "invalid app name `$name`: app names must start with a letter and " *
+        "Invalid app name $(repr(name)): app names must start with a letter and " *
             "contain only letters, numbers, underscores, and hyphens"
     )
     return name
@@ -79,11 +79,11 @@ end
 
 function validate_app_submodule(submodule, app_name::String; qualified::Bool = false)
     submodule === nothing && return nothing
-    submodule isa String || pkgerror("Expected `submodule` for app `$app_name` to be a string")
+    submodule isa String || pkgerror("App $(repr(app_name)) field submodule must be a string; got $(repr(submodule))")
     valid = qualified ?
         all(Base.isidentifier, split(submodule, '.'; keepempty = true)) :
         Base.isidentifier(submodule)
-    valid || pkgerror("invalid submodule `$submodule` for app `$app_name`")
+    valid || pkgerror("Invalid submodule $(repr(submodule)) for app $(repr(app_name))")
     return submodule
 end
 
@@ -379,152 +379,163 @@ listed_deps(project::Project; include_weak::Bool) = vcat(
     include_weak ? vcat(collect(keys(project.weakdeps)), collect(keys(project.deps_weak))) : String[],
 )
 
-read_project_uuid(::Nothing) = nothing
-function read_project_uuid(uuid::String)
+project_location(file) = file === nothing ? "streamed project" : repr(file)
+
+read_project_uuid(::Nothing; file = nothing) = nothing
+function read_project_uuid(uuid::String; file = nothing)
     return try
         UUID(uuid)
     catch err
         err isa ArgumentError || rethrow()
-        pkgerror("Could not parse project UUID as a UUID")
+        pkgerror("Invalid project UUID $(repr(uuid)) in $(project_location(file)); expected a UUID string")
     end
 end
-read_project_uuid(uuid) = pkgerror("Expected project UUID to be a string")
+read_project_uuid(uuid; file = nothing) =
+    pkgerror("Invalid project UUID $(repr(uuid)) in $(project_location(file)); expected a UUID string")
 
-read_project_version(::Nothing) = nothing
-function read_project_version(version::String)
+read_project_version(::Nothing; file = nothing) = nothing
+function read_project_version(version::String; file = nothing)
     return try
         VersionNumber(version)
     catch err
         err isa ArgumentError || rethrow()
-        pkgerror("Could not parse project version as a version")
+        pkgerror("Invalid project version $(repr(version)) in $(project_location(file))")
     end
 end
-read_project_version(version) = pkgerror("Expected project version to be a string")
+read_project_version(version; file = nothing) =
+    pkgerror("Invalid project version $(repr(version)) in $(project_location(file)); expected a version string")
 
-read_project_deps(::Nothing, section::String) = Dict{String, UUID}()
-function read_project_deps(raw::Dict{String, Any}, section_name::String)
+read_project_deps(::Nothing, section::String; file = nothing) = Dict{String, UUID}()
+function read_project_deps(raw::Dict{String, Any}, section_name::String; file = nothing)
     deps = Dict{String, UUID}()
     for (name, uuid) in raw
         # guard: UUID(x) accepts any Integer, silently making a bogus UUID
-        uuid isa String || pkgerror("Malformed value for `$name` in `$(section_name)` section.")
+        uuid isa String || pkgerror(
+            "Dependency $(repr(name)) in [$section_name] of $(project_location(file)) must be a UUID string; got $(repr(uuid))"
+        )
         deps[name] = try
             UUID(uuid)
         catch err
             err isa ArgumentError || rethrow()
-            pkgerror("Malformed value for `$name` in `$(section_name)` section.")
+            pkgerror("Invalid UUID $(repr(uuid)) for dependency $(repr(name)) in [$section_name] of $(project_location(file))")
         end
     end
     return deps
 end
-function read_project_deps(raw, section_name::String)
-    pkgerror("Expected `$(section_name)` section to be a key-value list")
+function read_project_deps(raw, section_name::String; file = nothing)
+    pkgerror("Expected [$section_name] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 end
 
-read_project_targets(::Nothing) = Dict{String, Vector{String}}()
-function read_project_targets(raw::Dict{String, Any})
+read_project_targets(::Nothing; file = nothing) = Dict{String, Vector{String}}()
+function read_project_targets(raw::Dict{String, Any}; file = nothing)
     targets = Dict{String, Vector{String}}()
     for (target, deps) in raw
         # an empty or heterogeneous TOML array parses as Vector{Any}
         deps isa Vector && all(x -> x isa String, deps) || pkgerror(
-            """
-                Expected value for target `$target` to be a list of dependency names.
-            """
+            "Target $(repr(target)) must be an array of dependency-name strings in $(project_location(file)); got $(repr(deps))"
         )
         targets[target] = String[x for x in deps]
     end
     return targets
 end
-read_project_targets(raw) = pkgerror("Expected `targets` section to be a key-value list")
+read_project_targets(raw; file = nothing) =
+    pkgerror("Expected [targets] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 
-read_project_apps(::Nothing) = Dict{String, AppInfo}()
-function read_project_apps(raw::Dict{String, Any})
+read_project_apps(::Nothing; file = nothing) = Dict{String, AppInfo}()
+function read_project_apps(raw::Dict{String, Any}; file = nothing)
     appinfos = Dict{String, AppInfo}()
     for (name, info) in raw
         validate_app_name(name)
-        info isa Dict{String, Any} || pkgerror(
-            """
-                Expected value for app `$name` to be a dictionary.
-            """
-        )
+        info isa Dict{String, Any} || pkgerror("App $(repr(name)) in [apps] of $(project_location(file)) must be a TOML table; got $(repr(info))")
         submodule = validate_app_submodule(get(info, "submodule", nothing), name)
         julia_flags_raw = get(info, "julia_flags", nothing)
         julia_flags = if julia_flags_raw === nothing
             String[]
         elseif julia_flags_raw isa Vector
             all(flag -> flag isa String, julia_flags_raw) ||
-                pkgerror("Expected `julia_flags` for app `$name` to be an array of strings")
+                pkgerror("App $(repr(name)) field julia_flags must be an array of strings; got $(repr(julia_flags_raw))")
             String[String(flag) for flag in julia_flags_raw]
         else
-            pkgerror("Expected `julia_flags` for app `$name` to be an array of strings")
+            pkgerror("App $(repr(name)) field julia_flags must be an array of strings; got $(repr(julia_flags_raw))")
         end
         appinfos[name] = AppInfo(name, nothing, submodule, julia_flags, info)
     end
     return appinfos
 end
-read_project_apps(raw) = pkgerror("Expected `apps` section to be a key-value list")
+read_project_apps(raw; file = nothing) =
+    pkgerror("Expected [apps] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 
 read_project_compat(::Nothing; file = nothing) = Dict{String, Compat}()
 function read_project_compat(raw::Dict{String, Any}; file = nothing)
     compat = Dict{String, Compat}()
     location_string = file === nothing ? "" : " in $(repr(file))"
     for (name, version) in raw
-        version = version::String
+        version isa String || pkgerror(
+            "Invalid [compat] entry $name = $(repr(version)) in $(project_location(file)); expected a string"
+        )
         compat[name] = try
             Compat(semver_spec(version), version)
         catch err
-            pkgerror("Could not parse compatibility version spec $(repr(version)) for dependency `$name`$location_string")
+            err isa InterruptException && rethrow()
+            pkgerror("Invalid [compat] entry $name = $(repr(version)) in $(project_location(file)): $(sprint(showerror, err))")
         end
     end
     return compat
 end
 read_project_compat(raw; file = nothing) =
-    pkgerror("Expected `compat` section to be a key-value list" * (file === nothing ? "" : " in $(repr(file))"))
+    pkgerror("Expected [compat] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 
-read_project_sources(::Nothing) = Dict{String, SourceSpec}()
-function read_project_sources(raw::Dict{String, Any})
+read_project_sources(::Nothing; file = nothing) = Dict{String, SourceSpec}()
+function read_project_sources(raw::Dict{String, Any}; file = nothing)
     valid_keys = ("path", "url", "rev", "subdir")
     sources = Dict{String, SourceSpec}()
     for (name, source) in raw
         if !(source isa AbstractDict)
-            pkgerror("Expected `source` section to be a table")
+            pkgerror("Expected [sources].$name to be a TOML table in $(project_location(file)); got $(repr(source))")
         end
         for key in keys(source)
             key isa String && key in valid_keys ||
-                pkgerror("Invalid key `$key` in `source` section")
+                pkgerror("Unknown key $(repr(key)) in [sources].$name; expected path, url, rev, or subdir")
         end
         if haskey(source, "path") && (haskey(source, "url") || haskey(source, "rev"))
-            pkgerror("Both `path` and `url` or `rev` are specified in `source` section")
+            pkgerror("[sources].$name cannot specify path together with url or rev")
+        end
+        for key in valid_keys
+            value = get(source, key, nothing)
+            value === nothing || value isa String || pkgerror(
+                "[sources].$name.$key must be a string in $(project_location(file)); got $(repr(value))"
+            )
         end
         sources[name] = SourceSpec(
-            get(source, "path", nothing)::Union{Nothing, String},
-            get(source, "url", nothing)::Union{Nothing, String},
-            get(source, "rev", nothing)::Union{Nothing, String},
-            get(source, "subdir", nothing)::Union{Nothing, String},
+            get(source, "path", nothing), get(source, "url", nothing),
+            get(source, "rev", nothing), get(source, "subdir", nothing),
         )
     end
     return sources
 end
-read_project_sources(raw) = pkgerror("Expected `sources` section to be a table")
+read_project_sources(raw; file = nothing) =
+    pkgerror("Expected [sources] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 
-read_project_workspace(::Nothing) = Dict{String, Any}()
-function read_project_workspace(raw::Dict)
+read_project_workspace(::Nothing; file = nothing) = Dict{String, Any}()
+function read_project_workspace(raw::Dict; file = nothing)
     workspace_table = Dict{String, Any}()
     for (key, val) in raw
         if key == "projects"
             # an empty or heterogeneous TOML array parses as Vector{Any}
             val isa Vector && all(x -> x isa String, val) ||
-                pkgerror("Expected `projects` in the `workspace` section to be a list of strings")
+                pkgerror("[workspace].projects must be an array of strings in $(project_location(file)); got $(repr(val))")
         else
-            pkgerror("Invalid key `$key` in `workspace`")
+            pkgerror("Unknown key $(repr(key)) in [workspace]; expected only projects")
         end
         workspace_table[key] = val
     end
     return workspace_table
 end
-read_project_workspace(raw) = pkgerror("Expected `workspace` section to be a key-value list")
+read_project_workspace(raw; file = nothing) =
+    pkgerror("Expected [workspace] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 
-read_project_exts(::Nothing) = Dict{String, Union{String, Vector{String}}}()
-function read_project_exts(raw::Dict{String, Any})
+read_project_exts(::Nothing; file = nothing) = Dict{String, Union{String, Vector{String}}}()
+function read_project_exts(raw::Dict{String, Any}; file = nothing)
     exts = Dict{String, Union{String, Vector{String}}}()
     for (key, val) in raw
         if val isa String
@@ -532,75 +543,82 @@ function read_project_exts(raw::Dict{String, Any})
         elseif val isa Vector && all(x -> x isa String, val)
             exts[key] = String[x for x in val]
         else
-            pkgerror("Expected value for extension `$key` to be a string or list of strings")
+            pkgerror("Extension $(repr(key)) must name one dependency or an array of dependencies in $(project_location(file)); got $(repr(val))")
         end
     end
     return exts
 end
-read_project_exts(raw) = pkgerror("Expected `extensions` section to be a key-value list")
+read_project_exts(raw; file = nothing) =
+    pkgerror("Expected [extensions] to be a TOML table in $(project_location(file)); got $(repr(raw))")
 
 function validate_project(project::Project; file = nothing)
-    location_string = file === nothing ? "" : " at $(repr(file))."
-    dep_uuids = collect(values(project.deps))
-    if length(dep_uuids) != length(unique(dep_uuids))
-        pkgerror("Two different dependencies can not have the same uuid" * location_string)
-    end
-    weak_dep_uuids = collect(values(project.weakdeps))
-    if length(weak_dep_uuids) != length(unique(weak_dep_uuids))
-        pkgerror("Two different weak dependencies can not have the same uuid" * location_string)
-    end
-    extra_uuids = collect(values(project.extras))
-    if length(extra_uuids) != length(unique(extra_uuids))
-        pkgerror("Two different `extra` dependencies can not have the same uuid" * location_string)
+    location_string = " in $(project_location(file))"
+    for (section, entries) in (("deps", project.deps), ("weakdeps", project.weakdeps), ("extras", project.extras))
+        by_uuid = Dict{UUID, Vector{String}}()
+        for (name, uuid) in entries
+            push!(get!(Vector{String}, by_uuid, uuid), name)
+        end
+        for (uuid, names) in by_uuid
+            length(names) > 1 || continue
+            pkgerror("Dependencies $(repr(names[1])) and $(repr(names[2])) in [$section] use the same UUID $uuid$location_string")
+        end
     end
     listed = listed_deps(project; include_weak = true)
     for (target, deps) in project.targets, dep in deps
         if length(deps) != length(unique(deps))
-            pkgerror("A dependency was named twice in target `$target`")
+            duplicate = first(dep for dep in deps if count(==(dep), deps) > 1)
+            pkgerror("Target $(repr(target)) contains duplicate dependency $(repr(duplicate))$location_string")
         end
         dep in listed || pkgerror(
-            """
-            Dependency `$dep` in target `$target` not listed in `deps`, `weakdeps` or `extras` section
-            """ * location_string
+            "Dependency $(repr(dep)) in target $(repr(target)) is not listed in [deps], [weakdeps], or [extras]$location_string"
         )
     end
     for name in keys(project.compat)
         name == "julia" && continue
         name in listed ||
-            pkgerror("Compat `$name` not listed in `deps`, `weakdeps` or `extras` section" * location_string)
+            pkgerror("[compat] entry $(repr(name)) is not listed in [deps], [weakdeps], or [extras]$location_string")
     end
     listed_nonweak = listed_deps(project; include_weak = false)
     for name in keys(project.sources)
         name in listed_nonweak ||
-            pkgerror("Sources for `$name` not listed in `deps` or `extras` section" * location_string)
+            pkgerror("[sources] entry $(repr(name)) is not listed in [deps] or [extras]$location_string")
     end
     return
 end
 
 function parse_project(raw::Dict{String, Any}; file = nothing)
-    name = get(raw, "name", nothing)::Union{String, Nothing}
-    manifest_path = get(raw, "manifest", nothing)::Union{String, Nothing}
+    optional_string(key) = begin
+        value = get(raw, key, nothing)
+        value === nothing || value isa String || pkgerror(
+            "Project field $key must be a string in $(project_location(file)); got $(repr(value))"
+        )
+        value
+    end
+    name = optional_string("name")
+    manifest_path = optional_string("manifest")
     # legacy `path` key is accepted as `entryfile` on read; only `entryfile`
     # is ever written
-    entryfile = get(raw, "path", nothing)::Union{String, Nothing}
+    entryfile = optional_string("path")
     if entryfile === nothing
-        entryfile = get(raw, "entryfile", nothing)::Union{String, Nothing}
+        entryfile = optional_string("entryfile")
     end
-    uuid = read_project_uuid(get(raw, "uuid", nothing))
-    version = read_project_version(get(raw, "version", nothing))
-    deps = read_project_deps(get(raw, "deps", nothing), "deps")
-    weakdeps = read_project_deps(get(raw, "weakdeps", nothing), "weakdeps")
-    exts = read_project_exts(get(raw, "extensions", nothing))
-    sources = read_project_sources(get(raw, "sources", nothing))
-    extras = read_project_deps(get(raw, "extras", nothing), "extras")
+    uuid = read_project_uuid(get(raw, "uuid", nothing); file)
+    version = read_project_version(get(raw, "version", nothing); file)
+    deps = read_project_deps(get(raw, "deps", nothing), "deps"; file)
+    weakdeps = read_project_deps(get(raw, "weakdeps", nothing), "weakdeps"; file)
+    exts = read_project_exts(get(raw, "extensions", nothing); file)
+    sources = read_project_sources(get(raw, "sources", nothing); file)
+    extras = read_project_deps(get(raw, "extras", nothing), "extras"; file)
     compat = read_project_compat(get(raw, "compat", nothing); file)
-    targets = read_project_targets(get(raw, "targets", nothing))
-    workspace = read_project_workspace(get(raw, "workspace", nothing))
-    apps = read_project_apps(get(raw, "apps", nothing))
-    readonly = get(raw, "readonly", false)::Bool
-    syntax = get(raw, "syntax", nothing)::Union{Dict, Nothing}
+    targets = read_project_targets(get(raw, "targets", nothing); file)
+    workspace = read_project_workspace(get(raw, "workspace", nothing); file)
+    apps = read_project_apps(get(raw, "apps", nothing); file)
+    readonly = get(raw, "readonly", false)
+    readonly isa Bool || pkgerror("Project field readonly must be a Boolean in $(project_location(file)); got $(repr(readonly))")
+    syntax = get(raw, "syntax", nothing)
+    syntax === nothing || syntax isa Dict || pkgerror("Project field syntax must be a TOML table in $(project_location(file)); got $(repr(syntax))")
     julia_syntax_version = syntax === nothing ? nothing :
-        read_project_version(get(syntax, "julia_version", nothing))
+        read_project_version(get(syntax, "julia_version", nothing); file)
 
     # a name in both [deps] and [weakdeps] is weak-only in memory
     deps_weak = Dict(intersect(deps, weakdeps))
@@ -624,9 +642,11 @@ function read_project(f_or_io::Union{String, IO})
         end
     catch e
         if e isa TOML.ParserError
-            pkgerror("Could not parse project: ", sprint(showerror, e))
+            subject = f_or_io isa IO ? "streamed project" : "project at $(repr(f_or_io))"
+            pkgerror("Could not parse $subject: ", sprint(showerror, e))
         end
-        pkgerror("Errored when reading $f_or_io, got: ", sprint(showerror, e))
+        subject = f_or_io isa IO ? "streamed project" : "project at $(repr(f_or_io))"
+        pkgerror("Could not read $subject: ", sprint(showerror, e))
     end
     return parse_project(raw; file = f_or_io isa IO ? nothing : f_or_io)
 end
@@ -648,7 +668,7 @@ function destructure_project(project::Project)::Dict{String, Any}
     # sanity check for consistency between compat value and string representation
     for (name, compat) in project.compat
         if compat.val != semver_spec(compat.str)
-            pkgerror("inconsistency between compat values and string representation")
+            pkgerror("Internal error while writing [compat]: parsed value and stored text disagree for $(repr(name))")
         end
     end
 
@@ -709,12 +729,12 @@ function write_project(io::IO, raw::Dict)
     inline_tables = Base.IdSet{Dict}()
     if haskey(raw, "sources")
         for source in values(raw["sources"])
-            source isa Dict || error("Expected `sources` to be a table")
+            source isa Dict || pkgerror("Cannot write project: [sources] contains unsupported value $(repr(source)) of type $(typeof(source))")
             push!(inline_tables, source)
         end
     end
     TOML.print(io, raw; inline_tables, sorted = true, by = key -> (project_key_order(key), key)) do x
-        x isa UUID || x isa VersionNumber || pkgerror("unhandled type `$(typeof(x))`")
+        x isa UUID || x isa VersionNumber || pkgerror("Cannot write project value $(repr(x)): unsupported type $(typeof(x))")
         return string(x)
     end
     return nothing
@@ -733,96 +753,101 @@ end
 # Manifest reading #
 ####################
 
-function read_field(name::String, default, info, map)
+function read_field(name::String, default, info, map; context::String = "manifest entry")
     x = get(info, name, default)
     if default === nothing
         x === nothing && return nothing
     else
         x == default && return default
     end
-    x isa String || pkgerror("Expected field `$name` to be a String.")
+    x isa String || pkgerror("Manifest field $name must be a string for $context; got $(repr(x))")
     return map(x)
 end
 
-function read_pinned(pinned)
+function read_pinned(pinned; context::String = "manifest entry")
     pinned === nothing && return false
     pinned isa Bool && return pinned
-    pkgerror("Expected field `pinned` to be a Boolean.")
+    pkgerror("Manifest field pinned must be a Boolean for $context; got $(repr(pinned))")
 end
 
-function safe_SHA1(sha::String)
+function safe_SHA1(sha::String; context::String = "manifest entry")
     return try
         SHA1(sha)
     catch err
         err isa ArgumentError || rethrow()
-        pkgerror("Could not parse `git-tree-sha1` field as a SHA.")
+        pkgerror("Invalid Git tree SHA-1 $(repr(sha)) for $context")
     end
 end
 
-function safe_uuid(uuid::String)::UUID
+function safe_uuid(uuid::String; context::String = "manifest entry")::UUID
     return try
         UUID(uuid)
     catch err
         err isa ArgumentError || rethrow()
-        pkgerror("Could not parse `uuid` field as a UUID.")
+        pkgerror("Invalid UUID $(repr(uuid)) for $context")
     end
 end
 
-function safe_version(version::String)::VersionNumber
+function safe_version(version::String; context::String = "manifest entry")::VersionNumber
     return try
         VersionNumber(version)
     catch err
         err isa ArgumentError || rethrow()
-        pkgerror("Could not parse `version` as a `VersionNumber`.")
+        pkgerror("Invalid version $(repr(version)) for $context")
     end
 end
 
-read_deps(::Nothing) = Dict{String, UUID}()
-read_deps(deps) = pkgerror("Expected `deps` field to be either a list or a table.")
-function read_deps(deps::AbstractVector)
+read_deps(::Nothing; context::String = "manifest entry") = Dict{String, UUID}()
+read_deps(deps; context::String = "manifest entry") =
+    pkgerror("Manifest deps for $context must be an array of names or a name-to-UUID table; got $(repr(deps))")
+function read_deps(deps::AbstractVector; context::String = "manifest entry")
     ret = String[]
     for dep in deps
-        dep isa String || pkgerror("Expected `dep` entry to be a String.")
+        dep isa String || pkgerror("Manifest dependency in $context must be a string; got $(repr(dep))")
         push!(ret, dep)
     end
     return ret
 end
-function read_deps(raw::Dict{String, Any})::Dict{String, UUID}
+function read_deps(raw::Dict{String, Any}; context::String = "manifest entry")::Dict{String, UUID}
     deps = Dict{String, UUID}()
     for (name, uuid) in raw
-        uuid isa String || pkgerror("Expected value for `$name` in `deps` to be a string.")
-        deps[name] = safe_uuid(uuid)
+        uuid isa String || pkgerror("Manifest dependency $(repr(name)) in $context must map to a UUID string; got $(repr(uuid))")
+        deps[name] = safe_uuid(uuid; context = "dependency $(repr(name)) of $context")
     end
     return deps
 end
 
-read_apps(::Nothing) = Dict{String, AppInfo}()
-read_apps(::Any) = pkgerror("Expected `apps` field to be a Dict")
-function read_apps(apps::Dict)
+read_apps(::Nothing; context::String = "manifest entry") = Dict{String, AppInfo}()
+read_apps(apps; context::String = "manifest entry") =
+    pkgerror("Manifest apps for $context must be a TOML table; got $(repr(apps))")
+function read_apps(apps::Dict; context::String = "manifest entry")
     appinfos = Dict{String, AppInfo}()
     for (appname, app) in apps
-        appname isa String || pkgerror("Expected app names in a manifest to be strings")
+        appname isa String || pkgerror("Manifest app names for $context must be strings; got $(repr(appname))")
         validate_app_name(appname)
-        app isa Dict || pkgerror("Expected manifest entry for app `$appname` to be a table")
+        app isa Dict || pkgerror("Manifest app $(repr(appname)) for $context must be a TOML table; got $(repr(app))")
         submodule = validate_app_submodule(get(app, "submodule", nothing), appname; qualified = true)
         julia_flags_raw = get(app, "julia_flags", nothing)
         julia_flags = if julia_flags_raw === nothing
             String[]
         else
             julia_flags_raw isa Vector && all(flag -> flag isa String, julia_flags_raw) ||
-                pkgerror("Expected `julia_flags` for app `$appname` to be an array of strings")
+                pkgerror("Manifest app $(repr(appname)) field julia_flags must be an array of strings; got $(repr(julia_flags_raw))")
             String[String(flag) for flag in julia_flags_raw]
         end
         julia_command = get(app, "julia_command", nothing)
-        julia_command isa String || pkgerror("Expected `julia_command` for app `$appname` to be a string")
+        julia_command === nothing && pkgerror("Manifest app $(repr(appname)) for $context is missing string field julia_command")
+        julia_command isa String || pkgerror("Manifest app $(repr(appname)) field julia_command must be a string; got $(repr(julia_command))")
         appinfo = AppInfo(appname, julia_command, submodule, julia_flags, app)
         appinfos[appinfo.name] = appinfo
     end
     return appinfos
 end
 
-read_exts(::Nothing) = Dict{String, Union{String, Vector{String}}}()
-function read_exts(raw::Dict{String, Any})
+read_exts(::Nothing; context::String = "manifest entry") = Dict{String, Union{String, Vector{String}}}()
+read_exts(raw; context::String = "manifest entry") =
+    pkgerror("Manifest extensions for $context must be a TOML table; got $(repr(raw))")
+function read_exts(raw::Dict{String, Any}; context::String = "manifest entry")
     exts = Dict{String, Union{String, Vector{String}}}()
     for (key, val) in raw
         if val isa String
@@ -831,7 +856,7 @@ function read_exts(raw::Dict{String, Any})
             # an empty list round-trips through the manifest as Vector{Any}
             exts[key] = String[x for x in val]
         else
-            pkgerror("Expected `ext` entry to be a string or list of strings.")
+            pkgerror("Manifest extension $(repr(key)) for $context must be a string or array of strings; got $(repr(val))")
         end
     end
     return exts
@@ -874,7 +899,8 @@ end
 normalize_entry_deps(name, uuid, deps::Dict{String, UUID}, stage1, manifest_path; isext = false) = deps
 function normalize_entry_deps(name, uuid, deps::Vector{String}, stage1::Dict{String, Vector{EntryStage}}, manifest_path; isext = false)
     if length(deps) != length(unique(deps))
-        pkgerror("Duplicate entry in `$name=$uuid`'s `deps` field.")
+        duplicate = first(dep for dep in deps if count(==(dep), deps) > 1)
+        pkgerror("Manifest entry $name=$uuid contains duplicate dependency $(repr(duplicate)) in $(repr(manifest_path))")
     end
     final = Dict{String, UUID}()
     for dep in deps
@@ -890,16 +916,14 @@ function normalize_entry_deps(name, uuid, deps::Vector{String}, stage1::Dict{Str
         if !isext
             if infos === nothing
                 pkgerror(
-                    "`$name=$uuid` depends on `$dep`, ",
-                    "but no such entry exists in the manifest at `$manifest_path`."
+                    "Manifest entry $name=$uuid depends on $(repr(dep)), but no matching entry exists in $(repr(manifest_path))"
                 )
             end
         end
         # should have used dict format instead of vector format
         if isnothing(infos) || length(infos) != 1
             pkgerror(
-                "Invalid manifest format at `$manifest_path`. ",
-                "`$name=$uuid`'s dependency on `$dep` is ambiguous."
+                "Manifest entry $name=$uuid has an ambiguous dependency $(repr(dep)) in $(repr(manifest_path)); use the name-to-UUID table form"
             )
         end
         final[dep] = infos[1].uuid
@@ -919,20 +943,25 @@ function build_tracking(s::EntryStage)
     end
 end
 
-function read_registry_ref(id::String, info::Dict{String, Any})
+function read_registry_ref(id::String, info::Dict{String, Any}; manifest_path::String = "manifest")
     uuid_val = get(info, "uuid", nothing)
-    uuid_val isa String || pkgerror("Registry entry `$id` is missing a string `uuid` field.")
-    uuid = safe_uuid(uuid_val)
+    uuid_val isa String || pkgerror("Manifest registry $(repr(id)) in $(repr(manifest_path)) requires a string UUID; got $(repr(uuid_val))")
+    uuid = safe_uuid(uuid_val; context = "registry $(repr(id)) in $(repr(manifest_path))")
     url_val = get(info, "url", nothing)
-    url_val === nothing || url_val isa String || pkgerror("Field `url` for registry `$id` must be a String.")
+    url_val === nothing || url_val isa String || pkgerror("Manifest registry $(repr(id)) field url must be a string; got $(repr(url_val))")
     return RegistryRef(id, uuid, url_val === nothing ? nothing : String(url_val))
 end
 
 function parse_manifest(raw::Dict{String, Any}, f_or_io::Union{String, IO})::Manifest
-    julia_version = haskey(raw, "julia_version") ? VersionNumber(raw["julia_version"]::String) : nothing
-    project_hash = haskey(raw, "project_hash") ? SHA1(raw["project_hash"]::String) : nothing
+    manifest_path = manifest_path_str(f_or_io)
+    julia_version = haskey(raw, "julia_version") ?
+        read_field("julia_version", nothing, raw, x -> safe_version(x; context = repr(manifest_path)); context = repr(manifest_path)) : nothing
+    project_hash = haskey(raw, "project_hash") ?
+        read_field("project_hash", nothing, raw, x -> safe_SHA1(x; context = repr(manifest_path)); context = repr(manifest_path)) : nothing
 
-    manifest_format = VersionNumber(raw["manifest_format"]::String)
+    format_raw = get(raw, "manifest_format", nothing)
+    format_raw isa String || pkgerror("Manifest field manifest_format must be a string in $(repr(manifest_path)); got $(repr(format_raw))")
+    manifest_format = safe_version(format_raw; context = "manifest_format in $(repr(manifest_path))")
     if !in(manifest_format.major, 1:2)
         if f_or_io isa IO
             @warn "Unknown Manifest.toml format version detected in streamed manifest. Unexpected behavior may occur" manifest_format
@@ -943,20 +972,24 @@ function parse_manifest(raw::Dict{String, Any}, f_or_io::Union{String, IO})::Man
 
     stage1 = Dict{String, Vector{EntryStage}}()
     if haskey(raw, "deps") # deps field doesn't exist if there are no deps
-        deps_raw = raw["deps"]::Dict{String, Any}
+        deps_raw = raw["deps"]
+        deps_raw isa Dict{String, Any} || pkgerror("Manifest field deps must be a TOML table in $(repr(manifest_path)); got $(repr(deps_raw))")
         for (name, infos) in deps_raw
-            name = name::String
-            for info in infos::Vector{Any}
-                info = info::Dict{String, Any}
-                pinned = read_pinned(get(info, "pinned", nothing))
-                uuid = read_field("uuid", nothing, info, safe_uuid)::UUID
-                version = read_field("version", nothing, info, safe_version)
-                path = read_field("path", nothing, info, denormalize_path_from_toml)
-                repo_url = read_field("repo-url", nothing, info, identity)
-                repo_rev = read_field("repo-rev", nothing, info, identity)
-                repo_subdir = read_field("repo-subdir", nothing, info, identity)
-                tree_hash = read_field("git-tree-sha1", nothing, info, safe_SHA1)
-                entryfile = read_field("entryfile", nothing, info, identity)
+            infos isa Vector || pkgerror("Manifest entry $(repr(name)) in $(repr(manifest_path)) must be an array of tables; got $(repr(infos))")
+            for info in infos
+                info isa Dict{String, Any} || pkgerror("Manifest entry $(repr(name)) in $(repr(manifest_path)) must be a TOML table; got $(repr(info))")
+                context = "entry $(repr(name)) in $(repr(manifest_path))"
+                pinned = read_pinned(get(info, "pinned", nothing); context)
+                uuid_raw = read_field("uuid", nothing, info, identity; context)
+                uuid_raw === nothing && pkgerror("Manifest $context is missing required string field uuid")
+                uuid = safe_uuid(uuid_raw; context)
+                version = read_field("version", nothing, info, x -> safe_version(x; context); context)
+                path = read_field("path", nothing, info, denormalize_path_from_toml; context)
+                repo_url = read_field("repo-url", nothing, info, identity; context)
+                repo_rev = read_field("repo-rev", nothing, info, identity; context)
+                repo_subdir = read_field("repo-subdir", nothing, info, identity; context)
+                tree_hash = read_field("git-tree-sha1", nothing, info, x -> safe_SHA1(x; context); context)
+                entryfile = read_field("entryfile", nothing, info, identity; context)
                 reg_field = get(info, "registries", nothing)
                 registries = if reg_field isa String
                     [reg_field]
@@ -965,15 +998,16 @@ function parse_manifest(raw::Dict{String, Any}, f_or_io::Union{String, IO})::Man
                 elseif reg_field === nothing
                     String[]
                 else
-                    pkgerror("Expected `registries` field to be a String or Vector{String}, got $(typeof(reg_field)).")
+                    pkgerror("Manifest field registries for $context must be a string or array of strings; got $(repr(reg_field))")
                 end
-                deps = read_deps(get(info, "deps", nothing))
-                weakdeps = read_deps(get(info, "weakdeps", nothing))
-                apps = read_apps(get(info, "apps", nothing))
-                exts = read_exts(get(info, "extensions", nothing)::Union{Nothing, Dict{String, Any}})
-                syntax = get(info, "syntax", nothing)::Union{Dict{String, Any}, Nothing}
+                deps = read_deps(get(info, "deps", nothing); context)
+                weakdeps = read_deps(get(info, "weakdeps", nothing); context)
+                apps = read_apps(get(info, "apps", nothing); context)
+                exts = read_exts(get(info, "extensions", nothing); context)
+                syntax = get(info, "syntax", nothing)
+                syntax === nothing || syntax isa Dict{String, Any} || pkgerror("Manifest field syntax for $context must be a TOML table; got $(repr(syntax))")
                 julia_syntax_version = syntax === nothing ? nothing :
-                    read_field("julia_version", nothing, syntax, safe_version)
+                    read_field("julia_version", nothing, syntax, x -> safe_version(x; context); context)
                 stage = EntryStage(
                     name, uuid, pinned, version, path, repo_url, repo_rev,
                     repo_subdir, tree_hash, registries, deps, weakdeps, exts,
@@ -986,9 +1020,11 @@ function parse_manifest(raw::Dict{String, Any}, f_or_io::Union{String, IO})::Man
 
     registries = Dict{String, RegistryRef}()
     if haskey(raw, "registries")
-        regs_raw = raw["registries"]::Dict{String, Any}
+        regs_raw = raw["registries"]
+        regs_raw isa Dict{String, Any} || pkgerror("Manifest field registries must be a TOML table in $(repr(manifest_path)); got $(repr(regs_raw))")
         for (reg_id, info_any) in regs_raw
-            registries[reg_id] = read_registry_ref(reg_id, info_any::Dict{String, Any})
+            info_any isa Dict{String, Any} || pkgerror("Manifest registry $(repr(reg_id)) in $(repr(manifest_path)) must be a TOML table; got $(repr(info_any))")
+            registries[reg_id] = read_registry_ref(reg_id, info_any; manifest_path)
         end
     end
 
@@ -1000,7 +1036,6 @@ function parse_manifest(raw::Dict{String, Any}, f_or_io::Union{String, IO})::Man
         other[k] = v
     end
 
-    manifest_path = manifest_path_str(f_or_io)
     # expand vector-format deps now that all entries are known
     deps = Dict{UUID, ManifestEntry}()
     for (name, stages) in stage1, s in stages
@@ -1021,14 +1056,12 @@ function parse_manifest(raw::Dict{String, Any}, f_or_io::Union{String, IO})::Man
                 # stdlibs may be depended on without an entry of their own
                 stdlib_uuid_for_name(name) == uuid && continue
                 pkgerror(
-                    "`$(entry.name)=$(entry_uuid)` depends on `$name=$uuid`, ",
-                    "but no such entry exists in the manifest at `$manifest_path`."
+                    "Manifest entry $(entry.name)=$entry_uuid depends on $name=$uuid, but no matching entry exists in $(repr(manifest_path))"
                 )
             end
             if dep_entry.name != name
                 pkgerror(
-                    "`$(entry.name)=$(entry_uuid)` depends on `$name=$uuid`, ",
-                    "but entry with UUID `$uuid` has name `$(dep_entry.name)` in the manifest at `$manifest_path`."
+                    "Manifest entry $(entry.name)=$entry_uuid depends on $name=$uuid, but that UUID belongs to $(dep_entry.name) in $(repr(manifest_path))"
                 )
             end
         end
@@ -1054,7 +1087,8 @@ function read_manifest(f_or_io::Union{String, IO})
         end
     catch e
         if e isa TOML.ParserError
-            pkgerror("Could not parse manifest: ", sprint(showerror, e))
+            subject = f_or_io isa IO ? "streamed manifest" : "manifest at $(repr(f_or_io))"
+            pkgerror("Could not parse $subject: ", sprint(showerror, e))
         end
         rethrow()
     end
@@ -1136,7 +1170,9 @@ function destructure_manifest(manifest::Manifest)::Dict
     for (uuid, entry) in manifest
         tracking = entry.tracking
         if tracking isa RepoTracked && tracking.tree_hash === nothing
-            pkgerror("cannot write manifest entry for `$(entry.name)`: it tracks a repository but has no `git-tree-sha1`")
+            pkgerror(
+                "Cannot write manifest entry $(entry.name) [$uuid]: repository-tracked entries require git-tree-sha1"
+            )
         end
 
         new_entry = deepcopy(entry.raw)
@@ -1232,7 +1268,7 @@ function write_manifest(io::IO, raw_manifest::Dict)
     print(io, "# This file is machine-generated - editing it directly is not advised\n\n")
     TOML.print(io, raw_manifest, sorted = true) do x
         (typeof(x) in [String, Nothing, UUID, SHA1, VersionNumber]) && return string(x)
-        error("unhandled type `$(typeof(x))`")
+        error("Internal error while writing manifest: unsupported value type $(typeof(x))")
     end
     return nothing
 end
@@ -1242,8 +1278,8 @@ render_manifest(manifest::Manifest) = sprint(write_manifest, manifest)
 
 function write_manifest(manifest::Manifest, manifest_file::AbstractString)
     if manifest.manifest_format.major == 1
-        @warn """The active manifest file at `$(manifest_file)` has an old format.
-        Any package operation (add, remove, update, etc.) will automatically upgrade it to format v2.1.""" maxlog = 1 _id = Symbol(manifest_file)
+        @warn """Manifest $(repr(manifest_file)) uses an old format.
+        The next VibePkg operation that writes it will upgrade it to format v2.1.""" maxlog = 1 _id = Symbol(manifest_file)
     end
     str = render_manifest(manifest)
     mkpath(dirname(manifest_file))
@@ -1257,8 +1293,8 @@ end
 function check_manifest_julia_version_compat(manifest::Manifest, manifest_file::String; julia_version_strict::Bool = false)
     isempty(manifest.deps) && return
     if manifest.manifest_format < v"2"
-        msg = """The active manifest file is an older format with no julia version entry. Dependencies may have \
-        been resolved with a different julia version."""
+        msg = """Manifest $(repr(manifest_file)) uses an old format with no Julia version entry. Dependencies may have
+        been resolved with a different Julia version. Run VibePkg.resolve() to refresh the manifest."""
         if julia_version_strict
             pkgerror(msg)
         else
@@ -1268,8 +1304,8 @@ function check_manifest_julia_version_compat(manifest::Manifest, manifest_file::
     end
     v = manifest.julia_version
     if v === nothing
-        msg = """The active manifest file is missing a julia version entry. Dependencies may have \
-        been resolved with a different julia version."""
+        msg = """Manifest $(repr(manifest_file)) is missing a Julia version entry. Dependencies may have
+        been resolved with a different Julia version. Run VibePkg.resolve() to refresh the manifest."""
         if julia_version_strict
             pkgerror(msg)
         else
@@ -1278,8 +1314,8 @@ function check_manifest_julia_version_compat(manifest::Manifest, manifest_file::
         end
     end
     return if Base.thisminor(v) != Base.thisminor(VERSION)
-        msg = """The active manifest file has dependencies that were resolved with a different julia \
-        version ($(manifest.julia_version)). Unexpected behavior may occur."""
+        msg = """Manifest $(repr(manifest_file)) was resolved with Julia $(manifest.julia_version), but the running version is Julia $VERSION.
+        Run VibePkg.resolve() to refresh it for this Julia version."""
         if julia_version_strict
             pkgerror(msg)
         else

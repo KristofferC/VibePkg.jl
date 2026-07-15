@@ -262,19 +262,19 @@ function declared_apps(pkg_root::String, pkg_name::String)
             info.julia_flags, Dict{String, Any}(),
         )
     end
-    isempty(apps) && pkgerror("package `$pkg_name` at `$pkg_root` does not declare any apps (no `[apps]` section)")
+    isempty(apps) && pkgerror("Package $pkg_name has no [apps] table in $(repr(projectfile_path(pkg_root)))")
     return apps
 end
 
-function validate_app_collisions(manifest::Manifest, uuid::UUID, apps::Dict{String, AppInfo})
+function validate_app_collisions(manifest::Manifest, uuid::UUID, incoming::String, apps::Dict{String, AppInfo})
     for (other_uuid, entry) in manifest
         other_uuid == uuid && continue
         collisions = sort!(collect(intersect(keys(apps), keys(entry.apps))))
         isempty(collisions) && continue
-        noun = length(collisions) == 1 ? "app name" : "app names"
-        pkgerror(
-            "$noun $(join(repr.(collisions), ", ")) already installed by package `$(entry.name)`"
-        )
+        if length(collisions) == 1
+            pkgerror("Cannot install package $incoming: app name $(repr(only(collisions))) is already provided by installed package $(entry.name)")
+        end
+        pkgerror("Cannot install package $incoming: app names $(join(repr.(collisions), ", ")) are already provided by installed package $(entry.name)")
     end
     return nothing
 end
@@ -290,7 +290,7 @@ end
 
 function record_app_package!(d::DepotStack, entry::ManifestEntry)
     manifest = read_app_manifest(d)
-    validate_app_collisions(manifest, entry.uuid, entry.apps)
+    validate_app_collisions(manifest, entry.uuid, entry.name, entry.apps)
     previous = get(manifest, entry.uuid, nothing)
     deps = Dict{UUID, ManifestEntry}(manifest.deps)
     deps[entry.uuid] = entry
@@ -347,12 +347,12 @@ function app_develop(config::Config, registries::Vector{RegistryInstance}, path:
         migrate_shims!(d; io)
         dev_dir = abspath(path)
         project_file = projectfile_path(dev_dir; strict = true)
-        project_file === nothing && pkgerror("could not find project file in package at `$path`")
+        project_file === nothing && pkgerror("No Project.toml or JuliaProject.toml was found under $(repr(dev_dir))")
         project = read_project(project_file)
         (project.name === nothing || project.uuid === nothing) &&
-            pkgerror("expected a `name` and `uuid` entry in project file at `$project_file`")
+            pkgerror("App package project $(repr(project_file)) must define string name and UUID uuid fields")
         apps = declared_apps(dev_dir, project.name)
-        validate_app_collisions(read_app_manifest(d), project.uuid, apps)
+        validate_app_collisions(read_app_manifest(d), project.uuid, project.name, apps)
 
         # make the dev'd project itself loadable
         env = Environments.load_environment_from(project_file; depots = d)
@@ -414,7 +414,7 @@ function app_add(
             ent = result.env.manifest[uuid]
             source = Execution.entry_source_path(result.env.manifest_file, ent, d)
             aps = declared_apps(source, name)
-            validate_app_collisions(read_app_manifest(d), uuid, aps)
+            validate_app_collisions(read_app_manifest(d), uuid, name, aps)
             replace_app_environment!(staging, env_dir)
             (ent, aps)
         end
@@ -457,7 +457,7 @@ function app_rm(d::DepotStack, name::String; io::IO = stderr_f())
             end
         end
         isempty(removed_apps) && isempty(removed_pkgs) &&
-            pkgerror("no app or app-providing package named `$name` is installed")
+            pkgerror("No installed app or app-providing package is named $(repr(name)); run `vpkg> app status` to list installed apps")
         for uuid in removed_pkgs
             entry = deps[uuid]
             entry_path(entry) === nothing && Base.rm(joinpath(apps_dir(d), entry.name); force = true, recursive = true)
@@ -495,7 +495,7 @@ function app_update(
     end
     if isempty(targets)
         name === nothing ||
-            pkgerror("no app or app-providing package named `$name` is installed")
+            pkgerror("No installed app or app-providing package is named $(repr(name)); run `vpkg> app status` to list installed apps")
         printpkgstyle(io, :Info, "no apps installed", color = Base.info_color())
         return nothing
     end

@@ -19,7 +19,8 @@ using SHA: sha256
 using TOML: TOML
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f, mv_temp_dir_retries, create_cachedir_tag
+using ..Utils: stderr_f, mv_temp_dir_retries, create_cachedir_tag,
+    sanitize_url, sanitize_external_error
 using ..TreeHash
 using ..Depots: DepotStack, depots, depots1, artifacts_dir, log_usage
 import ..Fetch
@@ -119,7 +120,7 @@ function ignore_hashes(artifacts_dir::String)
     if get(ENV, "JULIA_PKG_IGNORE_HASHES", "") != ""
         ignore = Base.get_bool_env("JULIA_PKG_IGNORE_HASHES", false)
         ignore === nothing &&
-            @error "Invalid ENV[\"JULIA_PKG_IGNORE_HASHES\"] value" ENV["JULIA_PKG_IGNORE_HASHES"]
+            @error "Invalid JULIA_PKG_IGNORE_HASHES value $(repr(ENV["JULIA_PKG_IGNORE_HASHES"])); expected true/false or 1/0. Hash mismatches will not be ignored"
         return something(ignore, false)
     end
     return Sys.iswindows() && !mktempdir(can_symlink, artifacts_dir)
@@ -131,6 +132,7 @@ function try_install_from(
         depots::Union{Nothing, DepotStack} = nothing,
         io::IO = stderr_f(),
         progress_header::Union{Nothing, String} = nothing,
+        failures::Union{Nothing, Vector{String}} = nothing,
     )
     tarball = tempname()
     return try
@@ -138,10 +140,12 @@ function try_install_from(
             Fetch.download(url, tarball; io, depots, progress_header)
         catch err
             err isa InterruptException && rethrow()
+            failures === nothing || push!(failures, "$(repr(sanitize_url(url))): download failed: $(sanitize_external_error(err))")
             return false
         end
         if sha256_str !== nothing && !verify_sha256(tarball, sha256_str)
-            @warn "downloaded artifact does not match expected sha256; skipping this source" url
+            failures === nothing || push!(failures, "$(repr(sanitize_url(url))): SHA-256 mismatch (expected $sha256_str)")
+            @warn "Downloaded artifact does not match the expected SHA-256; skipping this source" url = sanitize_url(url) expected = sha256_str
             return false
         end
         # unpack on the same filesystem as the destination for atomic rename
@@ -155,7 +159,8 @@ function try_install_from(
                 Fetch.unpack(tarball, temp)
             catch err
                 err isa InterruptException && rethrow()
-                @warn "failed to extract artifact archive" url
+                failures === nothing || push!(failures, "$(repr(sanitize_url(url))): extraction failed: $(sanitize_external_error(err))")
+                @warn "Failed to extract artifact archive; skipping this source" url = sanitize_url(url) exception = err
                 return false
             end
             # tree_hash throws on unreadable content; treat that like any
@@ -167,15 +172,16 @@ function try_install_from(
                 c, lm
             catch err
                 err isa InterruptException && rethrow()
-                @warn "failed to verify unpacked artifact; skipping this source" url err
+                failures === nothing || push!(failures, "$(repr(sanitize_url(url))): tree-hash verification failed: $(sanitize_external_error(err))")
+                @warn "Failed to verify unpacked artifact; skipping this source" url = sanitize_url(url) exception = err
                 return false
             end
             if computed != hash && !legacy_matches
                 if ignore_hashes(dirname(dest))
-                    @error "artifact content does not match its tree hash; " *
-                        "ignoring the mismatch and installing anyway" url expected = hash computed
+                    @error "Artifact content does not match its Git tree SHA-1; ignoring the mismatch and installing anyway" url = sanitize_url(url) expected = hash computed
                 else
-                    @warn "artifact content does not match its tree hash; skipping this source" url expected = hash computed
+                    failures === nothing || push!(failures, "$(repr(sanitize_url(url))): Git tree SHA-1 mismatch (expected $hash, computed $computed)")
+                    @warn "Artifact content does not match its Git tree SHA-1; skipping this source" url = sanitize_url(url) expected = hash computed
                     return false
                 end
             end
@@ -208,33 +214,34 @@ function ensure_artifact_installed!(
         server === nothing || push!(sources, ("$server/artifact/$hash", nothing))
         dl = get(meta, "download", nothing)
         if dl !== nothing
-            dl isa Vector || pkgerror("`download` for artifact `$name` must be a list of tables")
+            dl isa Vector || pkgerror("Artifact $name field download must be an array of tables; got $(repr(dl))")
             for entry in dl
-                entry isa AbstractDict || pkgerror("`download` entries for artifact `$name` must be tables")
+                entry isa AbstractDict || pkgerror("Artifact $name contains a malformed download source; expected a table, got $(repr(entry))")
                 url = get(entry, "url", nothing)
-                url isa String || pkgerror("`url` for a download of artifact `$name` must be a string")
+                url isa String || pkgerror("Artifact $name download field url must be a string; got $(repr(url))")
                 sha = get(entry, "sha256", nothing)
-                sha isa Union{Nothing, String} || pkgerror("`sha256` for a download of artifact `$name` must be a string")
+                sha isa Union{Nothing, String} || pkgerror("Artifact $name download field sha256, if present, must be a string; got $(repr(sha))")
                 push!(sources, (url, sha))
             end
         end
-        isempty(sources) && pkgerror("artifact `$name` has no download sources")
+        isempty(sources) && pkgerror("Artifact $name has no download sources")
 
         adir = mkpath(artifacts_dir(depots1(d)))
         create_cachedir_tag(adir)
+        failures = String[]
         success = mkpidlock(path * ".pid", stale_age = 20) do
             isdir(path) && return true
             for (url, sha) in sources
                 try_install_from(
                     url, sha, hash, path;
-                    depots = d, io, progress_header = "Downloading artifact: $(name)",
+                    depots = d, io, progress_header = "Downloading artifact: $(name)", failures,
                 ) && return true
             end
             false
         end
         success || pkgerror(
-            "failed to install artifact `$name` [$hash] from any of: " *
-                join(first.(sources), ", ")
+            "Failed to install artifact $name [$hash]. Attempted sources:\n" *
+                join(("  - " * failure for failure in failures), "\n")
         )
     end
     return path, !installed
@@ -255,17 +262,17 @@ function selected_artifacts(pkg_root::String, artifacts_toml::String, platform::
             read(cmd, String)
         catch err
             err isa InterruptException && rethrow()
-            pkgerror("the artifact selector `$selector` failed to run")
+            pkgerror("Artifact selector $(repr(selector)) failed: $(sanitize_external_error(err))")
         end
         artifacts = try
             TOML.parse(out)
         catch err
             err isa InterruptException && rethrow()
-            pkgerror("the artifact selector `$selector` printed invalid TOML")
+            pkgerror("Failed to parse TOML output from artifact selector $(repr(selector)): $(sanitize_external_error(err))")
         end
         for (name, meta) in artifacts
             meta isa AbstractDict && get(meta, "git-tree-sha1", nothing) isa String || pkgerror(
-                "the artifact selector `$selector` printed a malformed entry for `$name`"
+                "Artifact selector $(repr(selector)) entry $(repr(name)) must be a TOML table containing a string git-tree-sha1"
             )
         end
         return artifacts
@@ -279,7 +286,7 @@ function selected_artifacts(pkg_root::String, artifacts_toml::String, platform::
     catch err
         err isa InterruptException && rethrow()
         err isa TypeError && err.expected === Base.BinaryPlatforms.Platform || rethrow()
-        pkgerror("malformed platform-specific entry in `$artifacts_toml` (a required `os`/`arch` key is missing)")
+        pkgerror("Malformed platform entry in $(repr(artifacts_toml)); platform tables require string os and arch keys")
     end
 end
 
@@ -309,7 +316,7 @@ function collect_artifact_installs(
             ov = override_for(overrides, pkg_uuid, name, hash)
             if ov !== nothing
                 ov isa String && !isdir(ov) &&
-                    @warn "override path for artifact `$name` does not exist" path = ov
+                    @warn "Artifact override does not exist; correct or remove the override" artifact = name override = ov
                 continue    # overridden artifacts are never downloaded
             end
             push!(out, (name, meta))

@@ -960,7 +960,7 @@ end
         close(repo)
 
         # the broken one is reported (not thrown), the good one updates
-        updated = @test_logs (:error, r"failed to update") match_mode = :any begin
+        updated = @test_logs (:error, r"(?i)failed to update") match_mode = :any begin
             Registries.update_registries!(depots; server = nothing, io = devnull)
         end
         @test updated == ["ZGood"]
@@ -1084,7 +1084,7 @@ end
             end
             @test err isa PkgError
             @test occursin(string(bogus), err.msg)
-            @test occursin("declares uuid", err.msg)
+        @test occursin("declares uuid", lowercase(err.msg))
             # nothing was installed
             @test !isfile(joinpath(depot, "registries", "General.toml"))
             @test !isfile(joinpath(depot, "registries", "General.tar.gz"))

@@ -617,7 +617,7 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("update", sprint(showerror, err))
+            @test occursin("VibePkg.up", sprint(showerror, err))
 
             # widened compat still conflicts with the manifest as-is, but
             # `up` re-resolves and lands on the newest allowed version

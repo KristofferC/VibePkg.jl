@@ -30,6 +30,34 @@ using VibePkg.EnvFiles: entry_version, entry_repo_url, entry_repo_rev,
 # IO; tests run it against devnull
 quiet(f) = Base.ScopedValues.with(f, DEFAULT_IO => devnull)
 
+@testset "Git diagnostics redact credentials" begin
+    mktempdir() do dir
+        secret = "super-secret-password"
+        remote = "https://user:$secret@127.0.0.1:1/private.git?token=query-secret"
+        output = IOBuffer()
+        err = withenv("JULIA_PKG_USE_CLI_GIT" => "true") do
+            try
+                Git.clone(
+                    output, remote, joinpath(dir, "clone");
+                    header = "Package source: $remote",
+                )
+                nothing
+            catch caught
+                caught
+            end
+        end
+        @test err isa PkgError
+        message = sprint(showerror, err)
+        @test occursin("Could not clone repository", message)
+        @test occursin("127.0.0.1", message)
+        @test !occursin(secret, message)
+        @test !occursin("query-secret", message)
+        progress = String(take!(output))
+        @test !occursin(secret, progress)
+        @test !occursin("query-secret", progress)
+    end
+end
+
 # embed a native filesystem path in a hand-written TOML basic string: a Windows
 # path's backslash separators (and any quotes) must be escaped so the parsed
 # value round-trips to the exact string (`\Users` would otherwise be read as an

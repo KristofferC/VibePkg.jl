@@ -45,7 +45,7 @@ end
 # the Pkg-compatible spelling of the same choice
 mode_symbol(mode::Symbol) =
     mode in (:project, :manifest) ? mode :
-    pkgerror("`mode` must be `:project` or `:manifest`")
+    pkgerror("Invalid mode $(repr(mode)); expected :project or :manifest")
 mode_symbol(mode::PackageMode) = mode == PKGMODE_PROJECT ? :project : :manifest
 
 "the default preserve strategy: tiered, or tiered-installed via env var"
@@ -72,9 +72,9 @@ function concurrent_downloads_env()
     val = get(ENV, "JULIA_PKG_CONCURRENT_DOWNLOADS", "8")
     num = tryparse(Int, val)
     num === nothing &&
-        pkgerror("Environment variable `JULIA_PKG_CONCURRENT_DOWNLOADS` expects an integer, instead found `$val`")
+        pkgerror("JULIA_PKG_CONCURRENT_DOWNLOADS must be an integer; got $(repr(val))")
     num < 1 &&
-        pkgerror("Environment variable `JULIA_PKG_CONCURRENT_DOWNLOADS` must be greater than 0, instead found `$num`")
+        pkgerror("JULIA_PKG_CONCURRENT_DOWNLOADS must be a positive integer; got $(repr(val))")
     return num
 end
 

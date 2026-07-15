@@ -203,7 +203,7 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("Cannot modify a readonly environment", err.msg)
+            @test occursin("Cannot modify read-only environment", err.msg)
 
             # An old snapshot has readonly=false, but it must not be able to
             # bypass the current environment's guard. The rejected write also

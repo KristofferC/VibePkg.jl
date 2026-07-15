@@ -724,22 +724,22 @@ end
 
     e_url = grab(() -> VibePkg.add("https://github.com"))
     @test e_url isa PkgError
-    @test e_url.msg == "`https://github.com` is not a valid package name\n" *
+    @test e_url.msg == "Invalid package name \"https://github.com\"\n" *
         "The argument appears to be a URL or path, perhaps you meant " *
-        "`Pkg.add(url=\"...\")` or `Pkg.add(path=\"...\")`."
+        "`VibePkg.add(url=\"...\")` or `VibePkg.add(path=\"...\")`."
 
     e_relname = grab(() -> VibePkg.add("./Foobar"))
     @test e_relname isa PkgError
-    @test e_relname.msg == "`./Foobar` is not a valid package name\n" *
+    @test e_relname.msg == "Invalid package name \"./Foobar\"\n" *
         "The argument appears to be a URL or path, perhaps you meant " *
-        "`Pkg.add(url=\"...\")` or `Pkg.add(path=\"...\")`."
+        "`VibePkg.add(url=\"...\")` or `VibePkg.add(path=\"...\")`."
 
     mktempdir() do dir
         cd(dir) do
             @test !isdir("Foobar")
             e_path = grab(() -> VibePkg.add(PackageSpec(; path = "./Foobar"); io = devnull))
             @test e_path isa PkgError
-            @test e_path.msg == "Path `$(abspath("./Foobar"))` does not exist."
+            @test e_path.msg == "Package path $(repr(abspath("./Foobar"))) does not exist"
         end
     end
 end
@@ -775,11 +775,11 @@ end
     end
 
     @test msg(() -> VibePkg.develop(name = "Foo Bar")) ==
-        "`Foo Bar` is not a valid package name"
+        "Invalid package name \"Foo Bar\""
     @test msg(() -> VibePkg.develop("./Foobar")) ==
-        "`./Foobar` is not a valid package name\nThe argument appears to be a URL or path, perhaps you meant `Pkg.develop(url=\"...\")` or `Pkg.develop(path=\"...\")`."
+        "Invalid package name \"./Foobar\"\nThe argument appears to be a URL or path, perhaps you meant `VibePkg.develop(url=\"...\")` or `VibePkg.develop(path=\"...\")`."
     @test msg(() -> VibePkg.develop("https://github.com")) ==
-        "`https://github.com` is not a valid package name\nThe argument appears to be a URL or path, perhaps you meant `Pkg.develop(url=\"...\")` or `Pkg.develop(path=\"...\")`."
+        "Invalid package name \"https://github.com\"\nThe argument appears to be a URL or path, perhaps you meant `VibePkg.develop(url=\"...\")` or `VibePkg.develop(path=\"...\")`."
 
     mktempdir() do dir
         depot = mkpath(joinpath(dir, "depot"))
@@ -870,7 +870,8 @@ end
             e
         end
         @test err isa PkgError
-        @test occursin("conflicts with existing registry", sprint(showerror, err))
+        @test occursin("Cannot install registry RegistryFoo", sprint(showerror, err))
+        @test occursin("already contains UUID", sprint(showerror, err))
         @test occursin("RegistryFoo", sprint(showerror, err))
 
         r2 = only(reachable_registries(depots))
@@ -972,7 +973,7 @@ end
             catch e
                 e isa PkgError ? e.msg : rethrow()
             end
-            @test occursin("unable to pin unregistered package", m)
+            @test occursin("Cannot pin unregistered package", m)
             @test occursin("MyDev", m) && occursin("to an arbitrary version", m)
         end
     end
@@ -1062,7 +1063,7 @@ end
             e
         end
         @test err isa PkgError
-        @test occursin("Two different dependencies can not have the same uuid", sprint(showerror, err))
+        @test occursin("in [deps] use the same UUID", sprint(showerror, err))
 
         badwdir = mkpath(joinpath(dir, "badweak"))
         write(
@@ -1082,7 +1083,7 @@ end
             e
         end
         @test errw isa PkgError
-        @test occursin("Two different weak dependencies can not have the same uuid", sprint(showerror, errw))
+        @test occursin("in [weakdeps] use the same UUID", sprint(showerror, errw))
     end
 end
 
@@ -1585,8 +1586,9 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("depends on `Missing`", err.msg)
-            @test occursin("no such entry exists in the manifest", err.msg)
+            @test occursin("depends on \"Missing\"", err.msg)
+            @test occursin("no matching entry exists", err.msg)
+            @test occursin("Manifest.toml", err.msg)
         end
 
         # dict form: [deps.Example.deps] Missing = "<unknown-uuid>"
@@ -1602,7 +1604,8 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("no such entry exists in the manifest", err.msg)
+            @test occursin("depends on Missing=99999999-9999-9999-9999-999999999999", err.msg)
+            @test occursin("no matching entry exists", err.msg)
         end
     end
 end

@@ -35,7 +35,7 @@ function ensure_artifact_installed(
         platform::AbstractPlatform = HostPlatform(), io::IO = stderr_f(),
     )
     meta = artifact_meta(name, artifacts_toml; platform)
-    meta === nothing && pkgerror("Cannot locate artifact `$name` in `$artifacts_toml`")
+    meta === nothing && pkgerror("Artifact $(repr(name)) has no entry matching platform $(triplet(platform)) in $(repr(artifacts_toml))")
     return ensure_artifact_installed(name, meta, artifacts_toml; platform, io)
 end
 function ensure_artifact_installed(
@@ -114,7 +114,9 @@ transact_artifacts_toml(f::Function, artifacts_toml::String) =
 function download_entry_dict(info::Tuple)
     url = String(info[1])
     sha = info[2] isa AbstractVector{UInt8} ? bytes2hex(info[2]) : String(info[2])
-    length(sha) == 64 || pkgerror("invalid sha256 hash `$sha` in download info")
+    (length(sha) == 64 && all(isxdigit, sha)) || pkgerror(
+        "Invalid SHA-256 digest $(repr(sha)); expected exactly 64 hexadecimal characters"
+    )
     entry = Dict{String, Any}("url" => url, "sha256" => lowercase(sha))
     length(info) >= 3 && Int64(info[3]) > 0 && (entry["size"] = Int64(info[3]))
     return entry
@@ -144,11 +146,11 @@ function bind_artifact!(
         if !force && haskey(artifact_dict, name)
             existing = artifact_dict[name]
             if !isa(existing, Vector) || platform === nothing
-                pkgerror("Mapping for '$name' within $(artifacts_toml) already exists!")
+                pkgerror("Artifact $(repr(name)) already has a mapping in $(repr(artifacts_toml)); pass force=true to replace it")
             else
                 plat = platform
                 any(x -> entry_platform_matches(x, name, artifacts_toml, plat), existing) &&
-                    pkgerror("Mapping for '$name'/$(triplet(plat)) within $(artifacts_toml) already exists!")
+                    pkgerror("Artifact $(repr(name)) already has a mapping for platform $(triplet(plat)) in $(repr(artifacts_toml)); pass force=true to replace it")
             end
         end
         meta = Dict{String, Any}("git-tree-sha1" => string(hash))

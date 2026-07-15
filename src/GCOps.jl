@@ -38,7 +38,7 @@ function condense_usage!(usage_file::String)
     usage = try
         TOML.parsefile(usage_file)
     catch err
-        @warn "Failed to parse usage file `$usage_file`; the content it tracks will not be collected." err
+        @warn "Could not parse usage log $(repr(usage_file)); its tracked content will be retained and the dependent garbage-collection sweep will be skipped" exception = err
         return nothing
     end
     # entries may have any shape (foreign writers, torn writes): salvage what
@@ -65,7 +65,7 @@ function condense_usage!(usage_file::String)
     try
         atomic_toml_write(usage_file, usage, sorted = true)
     catch err
-        @error "Failed to write valid usage file `$usage_file`" exception = err
+        @error "Could not rewrite usage log $(repr(usage_file)); the next garbage collection may retain unreachable content" exception = err
     end
     return collect(keys(usage))
 end
@@ -86,7 +86,7 @@ function artifact_hashes(artifacts_toml::String)
     raw = try
         TOML.parsefile(artifacts_toml)
     catch err
-        @warn "Reading artifacts file at $artifacts_toml failed with error" err
+        @warn "Could not read $(repr(artifacts_toml)) while determining live artifacts; entries referenced only by this file may be collected. Fix the file before running gc" exception = err
         return hashes
     end
     artifact_walk!(hashes, raw)
@@ -189,7 +189,7 @@ function gc(
             raw = try
                 TOML.parsefile(scratch_file)
             catch err
-                @warn "Failed to parse usage file `$scratch_file`; the content it tracks will not be collected." err
+                @warn "Could not parse scratch usage log $(repr(scratch_file)); its tracked content will be retained and scratchspace collection will be skipped" exception = err
                 sweep_scratch = false
                 Dict{String, Any}()
             end
@@ -223,7 +223,7 @@ function gc(
         manifest = try
             read_manifest(manifest_file)
         catch err
-            @warn "Reading manifest file at $manifest_file failed with error" err
+            @warn "Could not read $(repr(manifest_file)) while determining live packages; entries referenced only by this file may be collected. Fix the file before running gc" exception = err
             continue
         end
         for (uuid, entry) in manifest

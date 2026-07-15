@@ -13,6 +13,26 @@ using VibePkg
 using VibePkg.TreeHash: tree_hash, blob_hash
 using VibePkg.Fetch: read_tarball_simple
 
+@testset "download diagnostics redact credentials" begin
+    mktempdir() do dir
+        secret = "download-secret"
+        url = "http://user:$secret@127.0.0.1:1/archive?token=query-secret"
+        err = try
+            VibePkg.Fetch.download(
+                url, joinpath(dir, "archive"); io = devnull, show_progress = false,
+            )
+            nothing
+        catch caught
+            caught
+        end
+        @test err isa VibePkg.Fetch.Downloads.RequestError
+        message = sprint(showerror, err)
+        @test occursin("127.0.0.1", message)
+        @test !occursin(secret, message)
+        @test !occursin("query-secret", message)
+    end
+end
+
 # gzip a single (non-tar) file — used to fabricate a "valid gzip, corrupt
 # tar" archive; 7z appends .gz to extensionless archive names
 function gzip_plain_file(src::String, dest::String)
@@ -41,7 +61,7 @@ end
                 end
                 @test err isa ErrorException
                 @test occursin("secret.txt", err.msg)
-                @test occursin("git-tree-sha1", err.msg)
+                @test occursin("Git blob hash", err.msg)
                 # and through tree_hash of a containing directory
                 @test_throws ErrorException tree_hash(dir)
             finally
@@ -109,7 +129,7 @@ end
             "file://$(multiroot)" => false,
             "file://$(good)" => true,
         ]
-        ok = @test_logs (:warn, r"failed to extract") (:warn, r"single top-level directory") match_mode = :any begin
+        ok = @test_logs (:warn, r"(?i)failed to extract") (:warn, r"(?i)one top-level directory") match_mode = :any begin
             install(urls, hash, vp; io = devnull)
         end
         @test ok
@@ -117,7 +137,7 @@ end
 
         # hash mismatch on the only source: no install, normal false return
         vp2 = joinpath(pkgs, "Ex", "slug2")
-        ok2 = @test_logs (:warn, r"does not match expected hash") match_mode = :any begin
+        ok2 = @test_logs (:warn, r"(?i)does not match the expected Git tree SHA-1") match_mode = :any begin
             install(["file://$(good)" => true], SHA1("1"^40), vp2; io = devnull)
         end
         @test !ok2
@@ -125,7 +145,7 @@ end
 
         # all sources bad: false, not an exception
         vp3 = joinpath(pkgs, "Ex", "slug3")
-        ok3 = @test_logs (:warn, r"failed to extract") match_mode = :any begin
+        ok3 = @test_logs (:warn, r"(?i)failed to extract") match_mode = :any begin
             install([missing_url => true, "file://$(corrupt)" => true], hash, vp3; io = devnull)
         end
         @test !ok3

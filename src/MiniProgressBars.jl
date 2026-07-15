@@ -84,7 +84,7 @@ function show_progress(io::IO, p::MiniProgressBar; termwidth = nothing, carriage
     elseif p.mode == :data
         lpad(string(pkg_format_bytes(p.current; digits = 1), "/", pkg_format_bytes(p.max; digits = 1)), 20)
     else
-        error("Unknown mode $(p.mode)")
+        error("Unsupported progress-bar mode $(repr(p.mode)); expected :percentage, :int, or :data")
     end
     termwidth = @something termwidth displaysize(io)[2]
     max_progress_width = max(0, min(termwidth - textwidth(p.header) - textwidth(progress_text) - 10, p.width))

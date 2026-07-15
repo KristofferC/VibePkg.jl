@@ -13,18 +13,23 @@ mutable struct MaxSumParams
     max_time::Float64 # maximum allowed time
 
     function MaxSumParams()
-        accuracy = parse(
-            Int, get(
-                ENV, "JULIA_PKG_RESOLVE_ACCURACY",
-                # Allow for `JULIA_PKGRESOLVE_ACCURACY` for backward
-                # compatibility with Julia v1.7-
-                get(ENV, "JULIA_PKGRESOLVE_ACCURACY", "1")
-            )
+        accuracy_value = get(
+            ENV, "JULIA_PKG_RESOLVE_ACCURACY",
+            # Allow for `JULIA_PKGRESOLVE_ACCURACY` for backward
+            # compatibility with Julia v1.7-
+            get(ENV, "JULIA_PKGRESOLVE_ACCURACY", "1")
         )
-        accuracy > 0 || error("JULIA_PKG_RESOLVE_ACCURACY must be > 0")
+        accuracy = tryparse(Int, accuracy_value)
+        (accuracy !== nothing && accuracy > 0) || error(
+            "Invalid JULIA_PKG_RESOLVE_ACCURACY=$(repr(accuracy_value)); expected a positive integer"
+        )
         dec_interval = accuracy * 5
         dec_fraction = 0.05 / accuracy
-        max_time = parse(Float64, get(ENV, "JULIA_PKG_RESOLVE_MAX_TIME", DEFAULT_MAX_TIME))
+        max_time_value = get(ENV, "JULIA_PKG_RESOLVE_MAX_TIME", DEFAULT_MAX_TIME)
+        max_time = tryparse(Float64, max_time_value)
+        (max_time !== nothing && isfinite(max_time) && max_time > 0) || error(
+            "Invalid JULIA_PKG_RESOLVE_MAX_TIME=$(repr(max_time_value)); expected a positive number of seconds"
+        )
         return new(dec_interval, dec_fraction, max_time)
     end
 end

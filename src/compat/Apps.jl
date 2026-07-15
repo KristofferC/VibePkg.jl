@@ -42,7 +42,7 @@ function add(;
         )
         source = API.registry_repo_url(ctx.registries, resolved_uuid)
         source === nothing && pkgerror(
-            "could not find a repository url for package `$resolved_name` in any registry"
+            "No repository URL is recorded for package $resolved_name [$resolved_uuid] in the configured registries"
         )
         repo = Git.materialize_repo_package!(
             ctx.config.depots, source; rev = spec.rev, subdir = spec.subdir, io,
@@ -56,7 +56,7 @@ function develop(path::String; io::IO = stderr_f())
     return AppsOps.app_develop(ctx.config, ctx.registries, path; io)
 end
 function develop(; path::Union{Nothing, String} = nothing, io::IO = stderr_f())
-    path === nothing && pkgerror("app develop requires at least one package")
+    path === nothing && pkgerror("app develop requires path=<package-directory>")
     return develop(path; io)
 end
 # rm and status are local-only: no OpContext (which would bootstrap

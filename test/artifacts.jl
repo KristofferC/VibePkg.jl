@@ -207,7 +207,7 @@ end
             @test !ArtifactOps.ignore_hashes(adir)
         end
         withenv("JULIA_PKG_IGNORE_HASHES" => "sideways") do   # invalid: @error, then off
-            @test_logs (:error, r"Invalid ENV") @test !ArtifactOps.ignore_hashes(adir)
+            @test_logs (:error, r"Invalid JULIA_PKG_IGNORE_HASHES") @test !ArtifactOps.ignore_hashes(adir)
         end
         if !Sys.iswindows()
             withenv("JULIA_PKG_IGNORE_HASHES" => nothing) do

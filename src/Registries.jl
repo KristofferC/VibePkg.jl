@@ -71,7 +71,7 @@ function parsefile(in_memory_registry::Union{Dict, Nothing}, folder::AbstractStr
     else
         content = get(in_memory_registry, to_tar_path_format(file), nothing)
         content === nothing && pkgerror(
-            "registry is missing `$file`; try removing and re-adding the registry"
+            "Registry at $(repr(folder)) is missing $(repr(file)); remove and re-add the registry"
         )
         parser = Base.TOML.Parser{Dates}(content; filepath = file)
         return Base.TOML.parse(parser)
@@ -346,7 +346,9 @@ function registry_info(r::RegistryInstance, pkg::PkgEntry)
 
         d_p = parsefile(in_memory_registry, pkg.registry_path, joinpath(pkg.path, "Package.toml"))
         name = d_p["name"]::String
-        name != pkg.name && error("inconsistent name in Registry.toml ($(name)) and Package.toml ($(pkg.name)) for pkg at $(pkg.path)")
+        name != pkg.name && pkgerror(
+            "Registry.toml lists package $(repr(pkg.name)), but $(joinpath(pkg.path, "Package.toml")) declares $(repr(name))"
+        )
         repo = get(d_p, "repo", nothing)::Union{Nothing, String}
         subdir = get(d_p, "subdir", nothing)::Union{Nothing, String}
         metadata = get(d_p, "metadata", nothing)::Union{Nothing, Dict{String, Any}}
@@ -356,11 +358,21 @@ function registry_info(r::RegistryInstance, pkg::PkgEntry)
             parsefile(in_memory_registry, pkg.registry_path, joinpath(pkg.path, "Versions.toml")) : Dict{String, Any}()
         version_info = Dict{VersionNumber, VersionInfo}()
         for (k, v) in d_v
-            v isa Dict{String, Any} && haskey(v, "git-tree-sha1") || pkgerror(
-                "malformed entry for version `$k` in Versions.toml for package `$(pkg.name)` at `$(pkg.path)`"
+            v isa Dict{String, Any} || pkgerror(
+                "Invalid Versions.toml entry $(repr(k)) for $(pkg.name): expected a table containing string git-tree-sha1"
             )
-            version_info[VersionNumber(k)] =
-                VersionInfo(SHA1(v["git-tree-sha1"]::String), get(v, "yanked", false)::Bool)
+            sha = get(v, "git-tree-sha1", nothing)
+            sha isa String || pkgerror(
+                "Invalid Versions.toml entry $(repr(k)) for $(pkg.name): expected a table containing string git-tree-sha1"
+            )
+            parsed_version = tryparse(VersionNumber, k)
+            parsed_hash = tryparse_sha1(sha)
+            (parsed_version !== nothing && parsed_hash !== nothing) || pkgerror(
+                "Invalid Versions.toml entry $(repr(k)) for $(pkg.name): version and git-tree-sha1 must be valid strings"
+            )
+            yanked = get(v, "yanked", false)
+            yanked isa Bool || pkgerror("Versions.toml field yanked for $(pkg.name) $(repr(k)) must be a Boolean; got $(repr(yanked))")
+            version_info[parsed_version] = VersionInfo(parsed_hash, yanked)
         end
 
         # Deps.toml first: it builds the name → UUID mapping Compat needs
@@ -392,11 +404,13 @@ function load_deps_data(in_memory_registry, registry_path, pkg_path, filename, n
         parsefile(in_memory_registry, registry_path, joinpath(pkg_path, filename)) : Dict{String, Any}()
     deps = Dict{VersionRange, Set{UUID}}()
     for (v, data) in deps_data_toml
-        data = data::Dict{String, Any}
+        data isa Dict{String, Any} || pkgerror("$filename entry $(repr(v)) for package at $(repr(pkg_path)) must be a TOML table")
         vr = VersionRange(v)
         d = Set{UUID}()
         for (dep, uuid_str) in data
-            uuid_val = UUID(uuid_str::String)
+            uuid_str isa String || pkgerror("$filename dependency $(repr(dep)) for package at $(repr(pkg_path)) must be a UUID string; got $(repr(uuid_str))")
+            uuid_val = tryparse(UUID, uuid_str)
+            uuid_val === nothing && pkgerror("Invalid UUID $(repr(uuid_str)) for dependency $(repr(dep)) in $filename at $(repr(pkg_path))")
             push!(d, uuid_val)
             name_to_uuid[dep] = uuid_val
         end
@@ -410,15 +424,16 @@ function load_compat_data(in_memory_registry, registry_path, pkg_path, filename,
         parsefile(in_memory_registry, registry_path, joinpath(pkg_path, filename)) : Dict{String, Any}()
     compat = Dict{VersionRange, Dict{UUID, VersionSpec}}()
     for (v, data) in compat_data_toml
-        data = data::Dict{String, Any}
+        data isa Dict{String, Any} || pkgerror("$filename entry $(repr(v)) for package at $(repr(pkg_path)) must be a TOML table")
         vr = VersionRange(v)
         d = Dict{UUID, VersionSpec}()
-        for (dep, vr_dep::Union{String, Vector{String}}) in data
+        for (dep, vr_dep) in data
+            (vr_dep isa String || (vr_dep isa Vector && all(x -> x isa String, vr_dep))) || pkgerror("$filename entry $(repr(dep)) for package at $(repr(pkg_path)) must be a string or array of strings")
             uuid = get(name_to_uuid, dep, nothing)
             uuid === nothing && pkgerror(
-                "`$filename` for package at `$pkg_path` refers to `$dep` which has no entry in the corresponding deps file"
+                "$filename for package at $(repr(pkg_path)) refers to $(repr(dep)), which has no entry in $(startswith(filename, "Weak") ? "WeakDeps.toml" : "Deps.toml")"
             )
-            d[uuid] = VersionSpec(vr_dep)
+            d[uuid] = VersionSpec(vr_dep isa Vector ? String[x for x in vr_dep] : vr_dep)
         end
         compat[vr] = d
     end
@@ -518,7 +533,7 @@ function RegistryInstance(path::AbstractString)
                     nothing
                 end
                 tree_info === nothing &&
-                    @warn "ignoring corrupt `.tree_info.toml`" file = tree_info_file maxlog = 1
+                    @warn "Registry tree metadata is corrupt; re-add the registry to repair it" registry = path file = tree_info_file maxlog = 1
             end
         end
         if tree_info !== nothing
@@ -536,22 +551,22 @@ end
 function verify_compressed_registry_toml(path::String)
     d = TOML.tryparsefile(path)
     if d isa TOML.ParserError
-        @warn "Failed to parse registry TOML file at $(repr(path))" exception = d
+        @warn "Could not parse packed registry metadata $(repr(path))" exception = d
         return false
     end
     for key in ("git-tree-sha1", "uuid", "path")
         val = get(d, key, nothing)
         if val === nothing
-            @warn "Expected key $(repr(key)) to exist in registry TOML file at $(repr(path))"
+            @warn "Packed registry metadata $(repr(path)) is missing required string key $(repr(key))"
             return false
         elseif !(val isa String)
-            @warn "Expected key $(repr(key)) in registry TOML file at $(repr(path)) to be a string"
+            @warn "Packed registry metadata key $(repr(key)) in $(repr(path)) must be a string; got $(repr(val))"
             return false
         end
     end
     compressed_file = joinpath(dirname(path), d["path"]::String)
     if !isfile(compressed_file)
-        @warn "Expected the compressed registry for $(repr(path)) to exist at $(repr(compressed_file))"
+        @warn "Packed registry metadata $(repr(path)) refers to missing archive $(repr(compressed_file))"
         return false
     end
     return true
@@ -687,24 +702,26 @@ end
     try
         Fetch.download("$server/registry/$uuid/$hash", tmp; depots = DepotStack([depot]))
         computed = open(tar -> Tar.tree_hash(tar), get_extract_cmd(tmp))
-        SHA1(computed) == hash ||
-            pkgerror("downloaded registry $uuid does not match the expected tree hash $hash")
+        computed_hash = SHA1(computed)
+        computed_hash == hash || pkgerror(
+            "Downloaded registry $uuid has tree hash $computed_hash; expected $hash"
+        )
         reg_toml = read_file_from_tarball(tmp, "Registry.toml")
-        reg_toml === nothing && pkgerror("registry tarball for $uuid is missing Registry.toml")
+        reg_toml === nothing && pkgerror("Registry tarball for $uuid is missing Registry.toml")
         reg_data = TOML.tryparse(reg_toml)
-        reg_data isa TOML.ParserError &&
-            pkgerror("registry tarball for $uuid has a malformed Registry.toml")
+        reg_data isa TOML.ParserError && pkgerror(
+            "Could not parse Registry.toml in registry tarball for $uuid: $(sprint(showerror, reg_data))"
+        )
         # the embedded uuid must be the one the server was asked for: a
         # mismatched tarball must not be installed under the requested uuid
         embedded = get(reg_data, "uuid", nothing)
         embedded_uuid = embedded isa String ? tryparse(UUID, embedded) : nothing
-        embedded_uuid == uuid || pkgerror(
-            "Registry.toml in the registry downloaded for $uuid declares uuid " *
-                "`$(embedded_uuid === nothing ? "<missing or invalid>" : embedded_uuid)`"
-        )
+        embedded isa String || pkgerror("Registry.toml downloaded for $uuid is missing a string uuid field; got $(repr(embedded))")
+        embedded_uuid === nothing && pkgerror("Registry.toml downloaded for $uuid contains invalid UUID $(repr(embedded))")
+        embedded_uuid == uuid || pkgerror("Registry.toml downloaded for UUID $uuid declares UUID $embedded_uuid")
         reg_name = get(reg_data, "name", nothing)
         reg_name isa String ||
-            pkgerror("registry tarball for $uuid has no `name` in Registry.toml")
+            pkgerror("Registry.toml in registry tarball for $uuid requires a string name; got $(repr(reg_name))")
         name = validate_registry_name(reg_name)
 
         reg_dir = mkpath(registries_dir(depot))
@@ -717,7 +734,7 @@ end
                 "cannot determine the uuid of the existing registry at `$existing_dir` (corrupt Registry.toml); remove it to reinstall"
             )
             existing_uuid == uuid || pkgerror(
-                "registry `$name=\"$uuid\"` conflicts with existing registry `$name=\"$existing_uuid\"`"
+                "Cannot install registry $name (UUID $uuid): $(repr(existing_dir)) already contains UUID $existing_uuid"
             )
         end
         if unpack_registries()
@@ -795,7 +812,7 @@ function check_registry_dir!(reg_dir::String, name::String, uuid::UUID)
             "cannot determine the uuid of the existing registry at `$existing_dir` (corrupt Registry.toml); remove it to reinstall"
         )
         existing_uuid == uuid || pkgerror(
-            "registry `$name=\"$uuid\"` conflicts with existing registry `$name=\"$existing_uuid\"`"
+            "Cannot install registry $name (UUID $uuid): $(repr(existing_dir)) already contains UUID $existing_uuid"
         )
         return false     # already present
     end
@@ -817,14 +834,14 @@ function add_registry_from_source!(d::DepotStack, source::String; io::IO = stder
             if isdir(source) && !ispath(joinpath(source, ".git"))
                 # plain directory registry: copy it
                 isfile(joinpath(source, "Registry.toml")) ||
-                    pkgerror("no `Registry.toml` found at `$source`")
+                    pkgerror("Registry source $(repr(source)) is missing expected file $(repr(joinpath(source, "Registry.toml")))")
                 cp(source, tmp)
             else
                 repo = Git.ensure_clone(io, tmp, source)
                 close(repo)
             end
             reg_toml = joinpath(tmp, "Registry.toml")
-            isfile(reg_toml) || pkgerror("cloned registry at `$source` is missing Registry.toml")
+            isfile(reg_toml) || pkgerror("Registry source $(repr(source)) is missing expected file $(repr(reg_toml))")
             data = TOML.parsefile(reg_toml)
             name = validate_registry_name(data["name"]::String)
             uuid = UUID(data["uuid"]::String)
@@ -918,7 +935,7 @@ function add_registry!(depots::DepotStack, spec::String; io::IO = stderr_f())
             name = String(strip(spec[1:prevind(spec, equals)]))
             uuid_text = String(strip(spec[nextind(spec, equals):end]))
             uuid = tryparse(UUID, uuid_text)
-            uuid === nothing && pkgerror("`$spec` is not a valid registry specification")
+            uuid === nothing && pkgerror("Invalid registry specification $(repr(spec)); expected NAME, UUID, or NAME=UUID")
         end
     end
     idx = findfirst(
@@ -927,7 +944,7 @@ function add_registry!(depots::DepotStack, spec::String; io::IO = stderr_f())
         DEFAULT_REGISTRIES,
     )
     idx === nothing && pkgerror(
-        "registry `$spec` is not known; use a url or path to add a custom registry"
+        "Registry $(repr(spec)) is not known; add a custom registry with a URL, filesystem path, NAME, UUID, or NAME=UUID"
     )
     known = DEFAULT_REGISTRIES[idx]
     server = Fetch.pkg_server()
@@ -987,14 +1004,14 @@ function remove_registry!(
         depots::DepotStack, name::Union{Nothing, String}, uuid::Union{Nothing, UUID};
         io::IO = stderr_f(),
     )
-    name === nothing && uuid === nothing && pkgerror("no name or uuid specified for registry")
+    name === nothing && uuid === nothing && pkgerror("Registry removal requires a name or UUID")
     forms = installed_registry_forms(depots1(depots))
     matches = if uuid !== nothing
         filter(f -> f.uuid == uuid, forms)
     else
         named = filter(f -> f.name == name, forms)
         length(unique!([f.uuid for f in named])) > 1 && pkgerror(
-            "multiple registries with name `$name`, please specify with uuid `$name=uuid`"
+            "Multiple installed registries are named $(repr(name)); specify one as $name=<uuid>"
         )
         named
     end
@@ -1101,7 +1118,7 @@ updates the ~zero default).
                     server_registry_hashes(server; depots = depots_arg)
                 catch err
                     err isa InterruptException && rethrow()
-                    @error "Some registries failed to update:" exception = err
+                    @error "Failed to query package server $(repr(server)) for current registry versions" exception = err
                     Dict{UUID, SHA1}()
                 end
             end
@@ -1136,7 +1153,7 @@ updates the ~zero default).
                 stamp!(uuid)
             catch err
                 err isa InterruptException && rethrow()
-                @error "Some registries failed to update:" exception = err
+                @error "Failed to update packed registry $name [$uuid] from the package server" exception = err
             end
         end
         for dir in filter(isdir, readdir(reg_dir; join = true))
@@ -1156,7 +1173,7 @@ updates the ~zero default).
                     uuid === nothing || stamp!(uuid)
                 catch err
                     err isa InterruptException && rethrow()
-                    @error "Some registries failed to update:" exception = err
+                    @error "Failed to update Git registry $(repr(name)) at $(repr(dir))" exception = err
                 end
             elseif isfile(joinpath(dir, ".tree_info.toml")) && isfile(joinpath(dir, "Registry.toml"))
                 # unpacked server-installed registries (JULIA_PKG_UNPACK_REGISTRY)
@@ -1164,7 +1181,7 @@ updates the ~zero default).
                 hash_str = ti isa TOML.ParserError ? nothing : get(ti, "git-tree-sha1", nothing)
                 current = hash_str isa String ? tryparse_sha1(hash_str) : nothing
                 if current === nothing || uuid === nothing
-                    @error "Skipping registry at `$dir` during update: corrupt `.tree_info.toml` or `Registry.toml`"
+                    @error "Skipping registry $(repr(name)) at $(repr(dir)) during update: corrupt .tree_info.toml or Registry.toml. Re-add the registry to repair it"
                     continue
                 end
                 on_cooldown(uuid) && continue
@@ -1182,7 +1199,7 @@ updates the ~zero default).
                     stamp!(uuid)
                 catch err
                     err isa InterruptException && rethrow()
-                    @error "Some registries failed to update:" exception = err
+                    @error "Failed to update unpacked registry $(repr(name)) [$uuid] from the package server" exception = err
                 end
             end
         end

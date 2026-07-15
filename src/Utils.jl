@@ -5,7 +5,7 @@ using TOML: TOML
 
 export isurl, normalize_path_for_toml, denormalize_path_from_toml, stdout_f, stderr_f,
     unstableio, can_fancyprint, precompile_io, precompile_detach_kwargs,
-    printpkgstyle, pkgstyle_indent, pathrepr,
+    printpkgstyle, pkgstyle_indent, pathrepr, sanitize_url, sanitize_external_error,
     set_readonly, create_cachedir_tag, mv_temp_dir_retries, atomic_write, atomic_toml_write
 
 # IO indirection points. Lower layers must go through these so that
@@ -81,6 +81,26 @@ end
 const URL_SCHEME_RE = r"^(?:https?|git|ssh|file)://"i
 const SCP_LIKE_RE = r"^[\w\-\.]+@[\w\-\.]+:.+"s
 isurl(r::String) = occursin(URL_SCHEME_RE, r) || occursin(SCP_LIKE_RE, r)
+
+"""
+    sanitize_url(value) -> String
+
+Redact credentials embedded in a URL before including it in a diagnostic.
+The host and repository path remain visible so the message is still useful.
+"""
+function sanitize_url(value::AbstractString)
+    redacted = replace(
+        String(value),
+        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@" => s"\1***@",
+    )
+    return replace(
+        redacted,
+        r"(?i)([?&](?:access_token|auth|key|password|signature|token)=)[^&#\s]*" => s"\1***",
+    )
+end
+
+"Render an external failure without disclosing credentials embedded in URLs."
+sanitize_external_error(err) = sanitize_url(sprint(showerror, err))
 
 """
     normalize_path_for_toml(path::String)

@@ -441,7 +441,7 @@ end
         Base.ACTIVE_PROJECT[] = pf
         try
             buf = IOBuffer()
-            @test_logs (:warn, "`Bogus` not in project, ignoring") VibePkg.rm("Bogus"; io = buf)
+            @test_logs (:warn, r"Package .*Bogus.* is not in project .*Project\.toml.*ignoring") VibePkg.rm("Bogus"; io = buf)
             @test occursin("No changes", String(take!(buf)))
         finally
             Base.ACTIVE_PROJECT[] = old_active
@@ -992,7 +992,8 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("julia version requirement", err.msg)
+            @test occursin("requires Julia", err.msg)
+            @test occursin("selected Julia version", err.msg)
         end
     end
 end
@@ -1089,7 +1090,8 @@ end
                 e
             end
             @test err isa PkgError
-            @test occursin("This package is referenced in the manifest file:", err.msg)
+            @test occursin("expected at path", err.msg)
+            @test occursin("referenced by manifest", err.msg)
             @test occursin(env.manifest_file, err.msg)
         end
     end
@@ -1766,7 +1768,7 @@ reloadenv(envdir) = load_environment(envdir; depots = depot_stack())
         @test !manifest_matches_project(reloadenv(envdir))
 
         # default: warns, stays stale
-        @test_logs (:warn, r"different julia version") match_mode = :any VibePkg.instantiate(; io = devnull)
+        @test_logs (:warn, r"was resolved with Julia .* running version is Julia") match_mode = :any VibePkg.instantiate(; io = devnull)
         @test reloadenv(envdir).manifest.julia_version == other
 
         # update_on_mismatch=true: falls back to update, becomes current

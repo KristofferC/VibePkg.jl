@@ -135,11 +135,8 @@ function _resolve(graph::Graph, lower_bound::Union{Vector{Int}, Nothing}, previo
         log_event_global!(graph, "maxsum solver timed out")
         throw(
             ResolverTimeoutError(
-                """
-                The resolution process timed out. This is likely due to unsatisfiable requirements.
-                You can increase the maximum resolution time via the environment variable JULIA_PKG_RESOLVE_MAX_TIME
-                (the current value is $(get(ENV, "JULIA_PKG_RESOLVE_MAX_TIME", DEFAULT_MAX_TIME))).
-                """
+                "Dependency resolution did not finish within $(get(ENV, "JULIA_PKG_RESOLVE_MAX_TIME", DEFAULT_MAX_TIME)) seconds. " *
+                    "The constraints may be unusually complex or unsatisfiable. Increase JULIA_PKG_RESOLVE_MAX_TIME to allow more time"
             )
         )
     end
@@ -677,7 +674,7 @@ function trigger_failure!(graph::Graph, sol::Vector{Int}, staged::Tuple{Int, Int
     log_event_maxsumtrace!(graph, p0, v0)
     simplify_graph!(graph) # this may throw an error...
     outdict = resolve(graph) # ...otherwise, this MUST throw an error
-    error("this is not supposed to happen... $(Dict(pkgID(p, graph) => vn for (p, vn) in outdict))")
+    error("Internal resolver error: produced an inconsistent solution: $(Dict(pkgID(p, graph) => vn for (p, vn) in outdict))")
 end
 
 end # module

@@ -108,12 +108,13 @@ function run_build(
         end
     end
     if !ok && verbose
-        pkgerror("Error building `$(entry.name)`")
+        pkgerror("Build failed for $(entry.name)")
     elseif !ok
         tail = isfile(log_file) ? last(readlines(log_file), min(50, countlines(log_file))) : String[]
+        detail = isempty(tail) ? "Build log is missing or empty" :
+            "Error building $(entry.name); showing the last $(length(tail)) lines of the build log:\n" * join(tail, "\n")
         pkgerror(
-            "Error building `$(entry.name)`" *
-                (isempty(tail) ? "" : ": \n" * join(tail, "\n"))
+            "$detail\nFull log: $log_file"
         )
     end
     return

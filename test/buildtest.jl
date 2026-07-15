@@ -188,7 +188,7 @@ end
             e
         end
         @test err isa PkgError
-        @test err.msg == "Package BTPkg errored during testing"
+        @test err.msg == "Package BTPkg failed during testing"
         write(joinpath(pkg, "test", "runtests.jl"), "exit(2)\n")
         failed2 = TestOps.test!(env, RegistryInstance[], Config(depots), BT_UUID; io = devnull)
         err = try
@@ -198,7 +198,7 @@ end
             e
         end
         @test err isa PkgError
-        @test err.msg == "Packages errored during testing:\n• BTPkg\n• BTPkg (exit code: 2)"
+        @test err.msg == "The following packages failed during testing:\n• BTPkg\n• BTPkg (exit code: 2)"
     end
 end
 
@@ -328,7 +328,7 @@ end
             e
         end
         @test err isa PkgError
-        @test occursin("Error building `FailBuild`", err.msg)
+        @test occursin("Error building FailBuild", err.msg)
         @test occursin("kaboom-build-marker", err.msg)      # the log tail
         # the full log is on disk (deps/build.log for a dev'd package)
         @test isfile(joinpath(pkg, "deps", "build.log"))
@@ -502,7 +502,7 @@ end
         # tests run against the sources-based environment and pass; the
         # sandbox merge warns that the parent slice wins over the relative
         # path entry in test/Manifest.toml (documented parent-wins merge)
-        failed = @test_logs (:warn, r"overrides the one in test/Manifest\.toml") match_mode = :any begin
+        failed = @test_logs (:warn, r"Parent environment version .* overrides test manifest version") match_mode = :any begin
             TestOps.test!(env, RegistryInstance[], Config(depots), SP_UUID; io = devnull)
         end
         @test failed === nothing
@@ -1211,7 +1211,7 @@ end
             e
         end
         @test err isa PkgError
-        @test err.msg == "Error building `VerbosePkg`"
+        @test err.msg == "Build failed for VerbosePkg"
         @test occursin("verbose-kaboom-marker", String(take!(iob)))
         @test !isfile(joinpath(pkg, "deps", "build.log"))
     end

@@ -19,7 +19,8 @@ import p7zip_jll
 import Zstd_jll
 
 using ..Errors: pkgerror
-using ..Utils: stderr_f, can_fancyprint, set_readonly, create_cachedir_tag, mv_temp_dir_retries
+using ..Utils: stderr_f, can_fancyprint, set_readonly, create_cachedir_tag,
+    mv_temp_dir_retries, sanitize_url, sanitize_external_error
 using ..MiniProgressBars
 using ..TreeHash
 using ..Depots: DepotStack, depots1, find_installed
@@ -166,7 +167,7 @@ function get_auth_token(
                 Base.rm(tmp; force = true)
             catch err
                 err isa InterruptException && rethrow()
-                @warn "failed to refresh package server credentials" maxlog = 1
+                @warn "Could not refresh credentials for package server $(repr(sanitize_url(server))); continuing without refreshed credentials" cause = sanitize_external_error(err) maxlog = 1
             end
         end
         # an expired token that could not be refreshed is not sent
@@ -266,23 +267,34 @@ function download(
     server = pkg_server()
     is_server_url = server !== nothing && url_is_pkg_server(url, server)
     headers = is_server_url ? pkg_server_headers(server::String; depots) : Pair{String, String}[]
-    resp = _download(url, dest, headers; io, progress_header, show_progress)
+    perform_download() = try
+        _download(url, dest, headers; io, progress_header, show_progress)
+    catch err
+        if err isa Downloads.RequestError
+            throw(Downloads.RequestError(
+                sanitize_url(err.url), err.code, sanitize_url(err.message), err.response,
+            ))
+        end
+        rethrow()
+    end
+    resp = perform_download()
     if is_server_url && resp.status == 401
         # HTTP 401: the token was stale or revoked — refresh it and retry
         # once; a second 401 surfaces the server's response body
         headers = pkg_server_headers(server::String; depots, force_auth_refresh = true)
-        resp = _download(url, dest, headers; io, progress_header, show_progress)
+        resp = perform_download()
         if resp.status == 401
             body = isfile(dest) ? String(read(dest)) : ""
+            body = sanitize_url(first(body, min(length(body), 4096)))
             pkgerror(
-                "authentication failure (HTTP 401) downloading $url" *
+                "Authentication failure (HTTP 401) downloading $(sanitize_url(url))" *
                     (isempty(strip(body)) ? "" : ":\n" * body)
             )
         end
     end
     # Downloads.download semantics for every other failure status
     if resp.proto in ("http", "https") && !(200 <= resp.status < 300)
-        throw(Downloads.RequestError(url, 0, "", resp))
+        throw(Downloads.RequestError(sanitize_url(url), 0, "", resp))
     end
     return dest
 end
@@ -373,7 +385,7 @@ function read_tarball_simple(
         advanced = position(tar) - before
         expected = Tar.round_up(hdr.size)
         advanced == expected ||
-            error("callback read $advanced bytes instead of $expected")
+            error("Internal archive-reader error: callback read $advanced bytes; expected $expected")
     end
     return
 end
@@ -381,7 +393,7 @@ end
 "Read a packed registry tarball fully into memory as path => content."
 function uncompress_registry(compressed_tar::AbstractString)
     if !isfile(compressed_tar)
-        error("$(repr(compressed_tar)): No such file")
+        error("Registry or package archive $(repr(compressed_tar)) does not exist")
     end
     data = Dict{String, String}()
     buf = Vector{UInt8}(undef, Tar.DEFAULT_BUFFER_SIZE)
@@ -435,7 +447,7 @@ function install_archive(
                 unpack(path, dir)
             catch e
                 e isa InterruptException && rethrow()
-                @warn "failed to extract archive downloaded from $(url)" exception = e
+                @warn "Failed to extract archive downloaded from $(sanitize_url(url)); skipping this source" package = name exception = e
                 url_success = false
             end
             url_success || continue
@@ -446,7 +458,7 @@ function install_archive(
                 # 7z on Windows might create this spurious file
                 filter!(x -> x != "pax_global_header", dirs)
                 if length(dirs) != 1
-                    @warn "archive downloaded from $(url) does not contain a single top-level directory; skipping this source" package = name entries = length(dirs)
+                    @warn "Archive downloaded from $(sanitize_url(url)) must contain one top-level directory; skipping this source" package = name entries_found = length(dirs)
                     url_success = false
                     continue
                 end
@@ -456,12 +468,12 @@ function install_archive(
                 SHA1(TreeHash.tree_hash(unpacked))
             catch e
                 e isa InterruptException && rethrow()
-                @warn "failed to hash content of archive downloaded from $(url); skipping this source" package = name exception = e
+                @warn "Failed to compute the Git tree SHA-1 of content downloaded from $(sanitize_url(url)); skipping this source" package = name exception = e
                 url_success = false
                 continue
             end
             if computed_hash != hash
-                @warn "Downloaded package content does not match expected hash (git-tree-sha1); skipping this source" package = name url = url expected = hash computed = computed_hash
+                @warn "Downloaded package content does not match the expected Git tree SHA-1; skipping this source" package = name url = sanitize_url(url) expected = hash computed = computed_hash
                 url_success = false
             end
             url_success || continue

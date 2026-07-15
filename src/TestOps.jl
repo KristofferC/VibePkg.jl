@@ -55,14 +55,17 @@ function merge_test_manifest(manifest::Manifest, pkg_source::String)
     test_manifest = try
         read_manifest(test_manifest_file)
     catch err
-        @warn "failed to read test/Manifest.toml, ignoring it" err
+        err isa InterruptException && rethrow()
+        @warn "Could not read test manifest $(repr(test_manifest_file)); ignoring it" exception = err
         return manifest
     end
     entries = Dict{UUID, ManifestEntry}(manifest.deps)
     for (uuid, entry) in test_manifest
         if haskey(entries, uuid)
             if entries[uuid] != entry
-                @warn "the parent environment's version of $(entry.name) overrides the one in test/Manifest.toml"
+                parent_version = EnvFiles.entry_version(entries[uuid])
+                test_version = EnvFiles.entry_version(entry)
+                @warn "Parent environment version $parent_version of $(entry.name) overrides test manifest version $test_version" test_manifest = test_manifest_file
             end
         else
             # its paths are relative to test/, but the merged manifest is
@@ -145,7 +148,9 @@ function sandbox_project(pkg_source::String, pkg_name::String, pkg_uuid::UUID, p
         for target_dep in get(pkg_project.targets, "test", String[])
             uuid = get(pkg_project.extras, target_dep, nothing)
             uuid === nothing && (uuid = get(pkg_project.weakdeps, target_dep, nothing))
-            uuid === nothing && pkgerror("target dependency `$target_dep` not found in [extras] or [weakdeps]")
+            uuid === nothing && pkgerror(
+                "Test target dependency $(repr(target_dep)) is listed in [targets].test but has no UUID in [extras] or [weakdeps] of $(repr(EnvFiles.projectfile_path(pkg_source)))"
+            )
             deps[target_dep] = uuid
         end
         compat = Dict{String, EnvFiles.Compat}(
@@ -305,11 +310,11 @@ function test!(
     elseif env.project.uuid == pkg_uuid
         something(env.project.name, "unnamed project"), dirname(env.project_file)
     else
-        pkgerror("package with uuid $pkg_uuid not found in the environment")
+        pkgerror("Package UUID $pkg_uuid is not present in the active environment $(repr(env.project_file))")
     end
-    (source === nothing || !isdir(source)) && pkgerror("package $name is not installed")
+    (source === nothing || !isdir(source)) && pkgerror("Package $name is not installed; run VibePkg.instantiate() and retry")
     runtests = joinpath(source, "test", "runtests.jl")
-    isfile(runtests) || pkgerror("testing $name requires a `test/runtests.jl` file")
+    isfile(runtests) || pkgerror("Cannot test $name: expected test entry point at $(repr(runtests))")
 
     printpkgstyle(io, :Testing, name)
 
@@ -391,8 +396,8 @@ function test!(
                     "Note: if you do not check your manifest file into source control, ",
                     "then you can probably ignore this message. ",
                     "However, if you do check your manifest file into source control, ",
-                    "then you probably want to pass the `allow_reresolve = false` kwarg ",
-                    "when calling the `Pkg.test` function.",
+                    "then you probably want to pass allow_reresolve=false ",
+                    "when calling VibePkg.test.",
                 ),
                 color = Base.warn_color(),
             )
@@ -441,10 +446,10 @@ function report_test_failures(pkgs_errored::Vector{Tuple{String, Base.Process}})
     isempty(pkgs_errored) && return
     if length(pkgs_errored) == 1
         pkg_name, p = first(pkgs_errored)
-        pkgerror("Package $pkg_name errored during testing$(failure_reason(p))")
+        pkgerror("Package $pkg_name failed during testing$(failure_reason(p))")
     else
         failures = ["• $pkg_name$(failure_reason(p))" for (pkg_name, p) in pkgs_errored]
-        pkgerror("Packages errored during testing:\n", join(failures, "\n"))
+        pkgerror("The following packages failed during testing:\n", join(failures, "\n"))
     end
     return
 end

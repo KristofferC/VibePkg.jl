@@ -179,7 +179,7 @@ function __init__()
         try
             install_in(Base.active_repl)
         catch err
-            @warn "failed to install the VibePkg REPL mode" err
+            @warn "Initial installation of the VibePkg REPL mode failed" exception = err
         end
     else
         atreplinit() do repl
@@ -187,7 +187,7 @@ function __init__()
                 try
                     install_in(repl)
                 catch err
-                    @warn "failed to install the VibePkg REPL mode" err
+                    @warn "Deferred installation of the VibePkg REPL mode failed" exception = err
                 end
             end
         end

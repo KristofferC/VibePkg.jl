@@ -206,7 +206,7 @@ end
         pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
         clone = mkpath(joinpath(depot, "clones", "some-clone"))
         dead_art = mkpath(joinpath(depot, "artifacts", "feedfacefeedfacefeedfacefeedfacefeedface"))
-        @test_logs (:warn, r"Failed to parse usage file") match_mode = :any GCOps.gc(depots; io = devnull)
+        @test_logs (:warn, r"Could not parse usage log") match_mode = :any GCOps.gc(depots; io = devnull)
         @test isdir(pkg)                                    # liveness unknown -> kept
         @test isdir(clone)                                  # clones come from manifests too
         @test !isdir(dead_art)                              # artifact log fine -> still swept
@@ -232,7 +232,7 @@ end
         dead_pkg = mkpath(joinpath(depot, "packages", "Foo", "dead1"))
         art = mkpath(joinpath(depot, "artifacts", "feedfacefeedfacefeedfacefeedfacefeedface"))
         space = mkpath(joinpath(depot, "scratchspaces", string(FOO_UUID), "space1"))
-        @test_logs (:warn, r"Failed to parse usage file") match_mode = :any GCOps.gc(depots; io = devnull)
+        @test_logs (:warn, r"Could not parse (scratch )?usage log") match_mode = :any GCOps.gc(depots; io = devnull)
         @test isdir(art)        # liveness unknown -> kept
         @test isdir(space)      # liveness unknown -> kept
         @test !isdir(dead_pkg)  # manifest log fine -> still swept
@@ -296,7 +296,7 @@ end
         write(usage_file, "]]] this is not toml [==")
         manifest_file = joinpath(dir, "Manifest.toml")
         write(manifest_file, "")
-        @test_logs (:warn, r"Failed to parse usage file") log_usage(depots, manifest_file, "manifest_usage.toml")
+        @test_logs (:warn, r"Could not parse usage log") log_usage(depots, manifest_file, "manifest_usage.toml")
         @test haskey(TOML.parsefile(usage_file), manifest_file)   # valid again + new entry
     end
 end

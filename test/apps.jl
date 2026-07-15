@@ -436,7 +436,7 @@ end
                 )
             end
             bad_regs = reachable_registries(depots)
-            @test_throws ErrorException AppsOps.app_update(Config(depots), bad_regs; io = devnull)
+            @test_throws PkgError AppsOps.app_update(Config(depots), bad_regs; io = devnull)
             @test read(joinpath(env_dir, "Project.toml"), String) == project_before
             @test read(joinpath(env_dir, "Manifest.toml"), String) == manifest_before
             @test occursin("app v2.0.0 says: still-works", run_shim(shim, "still-works"))
@@ -491,7 +491,8 @@ end
             e
         end
         @test err isa PkgError
-        @test occursin("already installed by package `FirstApp`", err.msg)
+        @test occursin("Cannot install package SecondApp", err.msg)
+        @test occursin("app name \"shared\" is already provided by installed package FirstApp", err.msg)
         @test read(AppsOps.app_manifest_file(depots), String) == manifest_before
         @test read(shim, String) == shim_before
         @test occursin("first owner", run_shim(shim))

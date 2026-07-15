@@ -26,7 +26,7 @@ depot_stack(paths::Vector{String} = Base.DEPOT_PATH) = DepotStack(copy(paths))
 
 depots(d::DepotStack) = d.paths
 function depots1(d::DepotStack)
-    isempty(d.paths) && pkgerror("no depots found in DEPOT_PATH!")
+    isempty(d.paths) && pkgerror("No package depots are configured; DEPOT_PATH is empty. Add a writable directory to DEPOT_PATH and retry")
     return d.paths[1]
 end
 
@@ -89,7 +89,7 @@ function log_usage(d::DepotStack, source_files, usage_filename::AbstractString)
             try
                 TOML.parsefile(usage_file)
             catch err
-                @warn "Failed to parse usage file `$usage_file`, ignoring." err
+                @warn "Could not parse usage log $(repr(usage_file)); discarding its old entries before recording current usage" exception = err
                 Dict{String, Any}()
             end
         else
@@ -119,7 +119,7 @@ function log_usage(d::DepotStack, source_files, usage_filename::AbstractString)
         try
             atomic_toml_write(usage_file, usage, sorted = true)
         catch err
-            @error "Failed to write valid usage file `$usage_file`" exception = err
+            @error "Could not update usage log $(repr(usage_file)); referenced content may be unprotected from garbage collection" exception = err
         end
     end
     return
@@ -147,7 +147,7 @@ function log_scratch_usage(d::DepotStack, scratch_dir::AbstractString, parent_pr
             try
                 TOML.parsefile(usage_file)
             catch err
-                @warn "Failed to parse usage file `$usage_file`, ignoring." err
+                @warn "Could not parse scratch usage log $(repr(usage_file)); discarding its old entries before recording current usage" exception = err
                 Dict{String, Any}()
             end
         else
@@ -187,7 +187,7 @@ function log_scratch_usage(d::DepotStack, scratch_dir::AbstractString, parent_pr
         try
             atomic_toml_write(usage_file, usage, sorted = true)
         catch err
-            @error "Failed to write valid usage file `$usage_file`" exception = err
+            @error "Could not update scratch usage log $(repr(usage_file)); referenced content may be unprotected from garbage collection" exception = err
         end
     end
     return

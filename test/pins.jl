@@ -100,24 +100,24 @@ end
 
         # wrong-UUID quartet
         m = pin_msg(() -> Planning.check_registered(env, regs, "Example", UUID("00000000-0000-0000-0000-000000000001")))
-        @test occursin("expected package `Example [00000000]` to be registered", m)
-        @test occursin("You may have provided the wrong UUID for package Example.", m)
-        @test occursin("Found the following UUIDs for that name:", m)
-        @test occursin("- $PIN_EX from registry: TestRegistry", m)
+        @test occursin("Expected package `Example [00000000]` to be registered in the configured registries", m)
+        @test occursin("The supplied UUID may be wrong for package Example", m)
+        @test occursin("Registered candidates:", m)
+        @test occursin("- $PIN_EX from registry TestRegistry", m)
 
         # path/dev-path messages
         missing_path = joinpath(dir, "definitely", "not", "a", "path")
         @test pin_msg(() -> VibePkg.add(path = missing_path)) ==
-            "Path `$missing_path` does not exist."
+            "Package path $(repr(missing_path)) does not exist"
         m = pin_msg(() -> Planning.plan_develop(env, regs, Config(depots), joinpath(dir, "nope")))
-        @test m == "Dev path `$(joinpath(dir, "nope"))` does not exist."
+        @test m == "Development path $(repr(joinpath(dir, "nope"))) does not exist"
         f = joinpath(dir, "afile"); write(f, "x")
         m = pin_msg(() -> Planning.plan_develop(env, regs, Config(depots), f))
-        @test m == "Dev path `$f` is a file, but a directory is required."
+        @test m == "Development path $(repr(f)) is a file; expected a directory"
 
         # repo is a private field
         @test pin_msg(() -> PackageSpec(repo = "https://x.com/y.git")) ==
-            "`repo` is a private field of PackageSpec and should not be set directly"
+            "PackageSpec(repo=...) is unsupported; specify url, rev, and subdir instead"
     end
 end
 
@@ -278,13 +278,13 @@ end
 
 @testset "compat status mode pins" begin
     @test pin_msg(() -> VibePkg.status(compat = true, diff = true)) ==
-        "Compat status has no `diff` mode"
+        "Compat status does not support \"diff\"; supported options are package filters and current compatibility entries"
     @test pin_msg(() -> VibePkg.status(compat = true, outdated = true)) ==
-        "Compat status has no `outdated` mode"
+        "Compat status does not support \"outdated\"; supported options are package filters and current compatibility entries"
     @test pin_msg(() -> VibePkg.status(compat = true, deprecated = true)) ==
-        "Compat status has no `deprecated` mode"
+        "Compat status does not support \"deprecated\"; supported options are package filters and current compatibility entries"
     @test pin_msg(() -> VibePkg.status(compat = true, extensions = true)) ==
-        "Compat status has no `extensions` mode"
+        "Compat status does not support \"extensions\"; supported options are package filters and current compatibility entries"
 end
 
 @testset "status --diff pin" begin

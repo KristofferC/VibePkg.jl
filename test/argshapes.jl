@@ -110,31 +110,31 @@ end
         e isa PkgError ? e.msg : rethrow()
     end
 
-    @test msg(() -> VibePkg.add(name = "julia")) == "`julia` is not a valid package name"
-    @test msg(() -> VibePkg.add("***")) == "`***` is not a valid package name"
+    @test msg(() -> VibePkg.add(name = "julia")) == "Package name \"julia\" is reserved for the Julia runtime"
+    @test msg(() -> VibePkg.add("***")) == "Invalid package name \"***\""
     @test msg(() -> VibePkg.add("https://github.com")) ==
-        "`https://github.com` is not a valid package name\nThe argument appears to be a URL or path, perhaps you meant `Pkg.add(url=\"...\")` or `Pkg.add(path=\"...\")`."
+        "Invalid package name \"https://github.com\"\nThe argument appears to be a URL or path, perhaps you meant `VibePkg.add(url=\"...\")` or `VibePkg.add(path=\"...\")`."
     @test msg(() -> VibePkg.API.check_package_name("Example.jl")) ==
-        "`Example.jl` is not a valid package name. Perhaps you meant `Example`"
+        "Invalid package name \"Example.jl\". Perhaps you meant `Example`"
     @test msg(() -> VibePkg.add(PackageSpec())) ==
-        "name, UUID, URL, or filesystem path specification required when calling `add`"
+        "Package specification must include a name, UUID, URL, or filesystem path"
     @test msg(() -> VibePkg.add(name = "Example", rev = "master", version = "0.5.0")) ==
-        "version specification invalid when tracking a repository: `0.5.0` specified for package `Example`"
+        "Cannot specify version \"0.5.0\" for repository-tracked package `Example`"
     @test msg(() -> VibePkg.add(PackageSpec[])) == "add requires at least one package"
     @test msg(() -> VibePkg.develop(name = "Example", rev = "master")) ==
-        "rev argument not supported by `develop`; consider using `add` instead"
+        "develop does not accept rev; use add to track a repository revision"
     @test msg(() -> VibePkg.develop(name = "Example", version = "0.5.0")) ==
-        "version specification invalid when calling `develop`: `0.5.0` specified for package `Example`"
+        "develop does not accept version \"0.5.0\" for package `Example`"
     @test msg(() -> VibePkg.add(["Example", "Example"])) ==
-        "it is invalid to specify multiple packages with the same name: `Example`"
+        "Duplicate package name \"Example\" in specifications `Example` and `Example`"
     let u = UUID("7876af07-990d-54b4-ab0e-23690620f79a")
         @test msg(() -> VibePkg.add([PackageSpec(; name = "A", uuid = u), PackageSpec(; name = "B", uuid = u)])) ==
-            "it is invalid to specify multiple packages with the same UUID: `A [7876af07]`"
+            "Duplicate package UUID $u in specifications `A [7876af07]` and `B [7876af07]`"
     end
 
     # Pkg.jl#901: AbstractString names (e.g. SubString) dispatch like String
-    @test msg(() -> VibePkg.add(strip(" *** "))) == "`***` is not a valid package name"
-    @test msg(() -> VibePkg.add(split("*** ***"))) == "`***` is not a valid package name"
+    @test msg(() -> VibePkg.add(strip(" *** "))) == "Invalid package name \"***\""
+    @test msg(() -> VibePkg.add(split("*** ***"))) == "Invalid package name \"***\""
 
     # Pkg.jl#1345: a uuid-only spec for an unknown package errors early and clearly
     mktempdir() do dir
@@ -144,7 +144,7 @@ end
             withenv("JULIA_PKG_SERVER" => "", "JULIA_PKG_OFFLINE" => "true") do
                 u = UUID("deadbeef-dead-beef-dead-beefdeadbeef")
                 @test occursin(
-                    "cannot find name corresponding to UUID $u",
+                    "No package named by UUID $u was found in the project, manifest, configured registries, or standard libraries",
                     msg(() -> VibePkg.add(VibePkg.PackageSpec(; uuid = u); io = devnull))
                 )
             end
