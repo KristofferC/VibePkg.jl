@@ -17,7 +17,7 @@ using ..Utils: stderr_f
 using ..EnvFiles
 using ..EnvFiles: entry_tree_hash, entry_repo_url
 using ..Depots: DepotStack, depots, depots1, logdir, packages_dir, clones_dir,
-    artifacts_dir, scratchspaces_dir, atomic_toml_write
+    registries_dir, artifacts_dir, scratchspaces_dir, atomic_toml_write
 using ..Utils: printpkgstyle, pathrepr
 import ..Git
 
@@ -124,6 +124,31 @@ function sweep!(dir::String, keep::Set{String}; verbose::Bool, io::IO, label::St
         deleted += 1
     end
     return deleted, freed
+end
+
+# Directory registries installed from Git retain their repository so updates can
+# fast-forward them. Match Pkg's maintenance step: compact each such repository
+# after the depot sweep, while leaving packed registries and plain directories
+# alone. Registry maintenance is best-effort and must not make package garbage
+# collection fail.
+function gc_registries!(gc_depots::Vector{String}; verbose::Bool, io::IO)
+    git = Sys.which("git")
+    git === nothing && return
+    for depot in gc_depots
+        reg_dir = registries_dir(depot)
+        isdir(reg_dir) || continue
+        for reg_name in readdir(reg_dir)
+            reg_path = joinpath(reg_dir, reg_name)
+            isdir(joinpath(reg_path, ".git")) || continue
+            try
+                verbose && printpkgstyle(io, :GC, "running git gc on registry $reg_name")
+                run(pipeline(`$git -C $reg_path gc --quiet`; stdout = devnull, stderr = devnull))
+            catch err
+                verbose && @warn "git gc failed for registry $reg_name" exception = err
+            end
+        end
+    end
+    return
 end
 
 """
@@ -290,6 +315,7 @@ function gc(
     else
         printpkgstyle(io, :Deleted, join(parts, ", ") * " ($(format_mib(freed)))")
     end
+    gc_registries!(gc_depots; verbose, io)
     touch(gc_stamp(depots1(d)))
     return nothing
 end

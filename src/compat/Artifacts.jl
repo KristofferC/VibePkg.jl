@@ -89,7 +89,7 @@ function create_artifact(f::Function; legacy_symlink_size::Bool = false)
         hash = SHA1(TreeHash.tree_hash(temp_dir; legacy_symlink_size))
         # duplicate content: the existing tree already is this artifact
         new_path = joinpath(store, string(hash))
-        isdir(new_path) || mv_temp_dir_retries(temp_dir, new_path; set_permissions = false)
+        isdir(new_path) || mv_temp_dir_retries(temp_dir, new_path)
         hash
     finally
         Base.rm(temp_dir; recursive = true, force = true)

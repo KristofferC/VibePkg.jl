@@ -570,6 +570,7 @@ function parse_statement(words::Vector{Word})
     spec = get(command_specs(), cmdword, nothing)
     spec === nothing && pkgerror("`$cmdword` is not a recognized command")
     opts = Dict{Symbol, Any}()
+    option_for_kwarg = Dict{Symbol, String}()
     positional = Word[]
     for w in words[2:end]
         word = w.raw
@@ -583,6 +584,11 @@ function parse_statement(words::Vector{Word})
             optspec = get(spec.opts, key, nothing)
             optspec === nothing && pkgerror("invalid option `--$key` for command `$(spec.canonical)`")
             kwarg, fixed_value = optspec
+            if haskey(option_for_kwarg, kwarg)
+                previous = option_for_kwarg[kwarg]
+                pkgerror("conflicting options `$previous` and `--$key` for command `$(spec.canonical)`")
+            end
+            option_for_kwarg[kwarg] = "--$key"
             opts[kwarg] = if fixed_value isa Function
                 fixed_value(val)
             elseif fixed_value === nothing
@@ -595,6 +601,11 @@ function parse_statement(words::Vector{Word})
             long = get(spec.shorts, word[2:end], nothing)
             long === nothing && pkgerror("invalid option `$word` for command `$(spec.canonical)`")
             kwarg, fixed_value = spec.opts[long]
+            if haskey(option_for_kwarg, kwarg)
+                previous = option_for_kwarg[kwarg]
+                pkgerror("conflicting options `$previous` and `$word` for command `$(spec.canonical)`")
+            end
+            option_for_kwarg[kwarg] = word
             opts[kwarg] = fixed_value
         else
             push!(positional, w)
@@ -617,7 +628,18 @@ function parse_statement(words::Vector{Word})
         end
         Any[specs]
     elseif spec.arg_kind === :splat
-        Any[(w.raw for w in positional)...]
+        vals = String[w.raw for w in positional]
+        if spec.canonical in ("activate", "generate")
+            for i in eachindex(vals)
+                vals[i] = try
+                    expanduser(vals[i])
+                catch err
+                    err isa ArgumentError || rethrow()
+                    pkgerror("cannot expand path `$(vals[i])`: $(err.msg)")
+                end
+            end
+        end
+        Any[vals...]
     elseif spec.arg_kind === :strings
         isempty(positional) ? Any[] : Any[String[w.raw for w in positional]]
     else

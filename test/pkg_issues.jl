@@ -2468,7 +2468,12 @@ end
             env = load_environment(envdir; depots)
 
             # develop records a valid path-tracked direct dep, not a broken orphan
-            developed = plan_develop(env, regs, Config(depots), devpkg)
+            # Pkg's test harness disables sysimage-version respect while it
+            # substitutes external stdlibs. Mirror that explicit escape hatch:
+            # Random is itself baked into the running sysimage.
+            developed = plan_develop(
+                env, regs, Config(depots; respect_sysimage_versions = false), devpkg,
+            )
             @test haskey(developed.manifest, random_uuid)
             @test is_path_tracked(developed.manifest[random_uuid])
             @test developed.project.deps["Random"] == random_uuid

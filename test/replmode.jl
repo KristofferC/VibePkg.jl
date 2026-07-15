@@ -15,7 +15,7 @@ using VibePkg
 using VibePkg.REPLMode
 using VibePkg.REPLMode: parse_package_word
 using VibePkg: PackageSpec
-using VibePkg.Planning: UPLEVEL_MINOR
+using VibePkg.Planning: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR
 using VibePkg.Errors: PkgError
 
 @testset "REPLMode" begin
@@ -129,18 +129,65 @@ using VibePkg.Errors: PkgError
         @test api === VibePkg.API.rm && opts[:mode] === :manifest && args[1] == ["Foo"]
         api, _, opts = capture("st -m")
         @test api === VibePkg.API.status && opts[:mode] === :manifest
-        api, _, opts = capture("up --minor")
-        @test api === VibePkg.API.up && opts[:level] == UPLEVEL_MINOR
-        # Pkg.jl repl.jl rejects conflicting level flags; VibePkg instead takes
-        # the last one given (last-wins), so `up --major --minor` == `up --minor`.
-        api, _, opts = capture("up --major --minor")
-        @test api === VibePkg.API.up && opts[:level] == UPLEVEL_MINOR
+        @testset "REPL API `up` option conflicts" begin
+            # Upgrade-level switches are individually valid and mutually exclusive.
+            # Exercise both string input (`vpkg>` / pkgstr) and the argv driver used
+            # by the `vpkg` app. Pkg's parser treats even a repeated switch as a
+            # conflict because both occurrences map to the same `level` keyword.
+            levels = (
+                ("major", UPLEVEL_MAJOR),
+                ("minor", UPLEVEL_MINOR),
+                ("patch", UPLEVEL_PATCH),
+                ("fixed", UPLEVEL_FIXED),
+            )
+            for (flag, level) in levels
+                api, _, opts = capture("up --$flag")
+                @test api === VibePkg.API.up && opts[:level] == level
+                api, _, opts = only(do_cmd(["update", "--$flag"]))
+                @test api === VibePkg.API.up && opts[:level] == level
+                @test_throws PkgError do_cmd("up --$flag --$flag")
+            end
+            for first in eachindex(levels), second in (first + 1):length(levels)
+                first_flag = levels[first][1]
+                second_flag = levels[second][1]
+                for command in (
+                        "up --$first_flag --$second_flag",
+                        "up --$second_flag --$first_flag",
+                    )
+                    err = try
+                        do_cmd(command)
+                        nothing
+                    catch caught
+                        caught
+                    end
+                    @test err isa PkgError
+                    if err isa PkgError
+                        @test occursin("conflicting options", err.msg)
+                        @test occursin("--$first_flag", err.msg)
+                        @test occursin("--$second_flag", err.msg)
+                    end
+                end
+                @test_throws PkgError do_cmd(
+                    [
+                        "update", "--$first_flag", "--$second_flag",
+                    ]
+                )
+            end
+        end
         api, _, opts = capture("gc --verbose")
         @test api === VibePkg.API.gc && opts[:verbose] === true
         api, _, opts = capture("gc -v")
         @test api === VibePkg.API.gc && opts[:verbose] === true
         api, args, opts = capture("activate --temp")
         @test api === VibePkg.API.activate && opts[:temp] === true && isempty(args)
+        api, args, opts = capture("generate Foo")
+        @test api === VibePkg.API.generate && args == Any["Foo"] && isempty(opts)
+        withenv("HOME" => mktempdir()) do
+            api, args, opts = capture("generate ~/HomePkg")
+            @test api === VibePkg.API.generate
+            @test args[1] == joinpath(ENV["HOME"], "HomePkg")
+            @test isempty(opts)
+        end
         api, _, opts = capture("test --coverage Foo")
         @test api === VibePkg.API.test && opts[:coverage] === true
         api, _, opts = capture("instantiate --julia_version_strict")
@@ -450,47 +497,113 @@ end
 end
 
 # Pkg.jl repl.jl "unit test for REPLMode.promptf" + JuliaLang/julia #55850 —
-# the interactive prompt reflects the active project's name, marks a shared
-# `@vX.Y` environment, appends `[offline]`, and is cached until invalidated.
+# the interactive prompt reflects project names and workspace paths, truncates
+# long names, marks shared environments, and is cached until invalidated.
 @testset "REPL prompt (promptf)" begin
     ext = Base.get_extension(VibePkg, :REPLExt)
-    old = Base.ACTIVE_PROJECT[]
+    old_project = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    fresh_prompt() = (ext.invalidate_prompt!(); ext.promptf())
     try
+        VibePkg.API.OFFLINE_MODE[] = false
         mktempdir() do d
-            # a named project → "(Name) vpkg> "
-            proj = joinpath(d, "MyProj", "Project.toml")
-            mkpath(dirname(proj))
-            touch(proj)
-            Base.ACTIVE_PROJECT[] = proj
-            ext.invalidate_prompt!()
-            @test ext.promptf() == "(MyProj) vpkg> "
+            # A nameless project falls back to its directory name.
+            fallback = joinpath(d, "SomeEnv", "Project.toml")
+            mkpath(dirname(fallback))
+            write(fallback, "")
+            Base.ACTIVE_PROJECT[] = fallback
+            @test fresh_prompt() == "(SomeEnv) vpkg> "
 
-            # a shared vX.Y environment → "(@vX.Y) vpkg> " (#55850)
+            # Long root names are capped at 30 columns (27 plus an ellipsis).
+            long = joinpath(
+                d,
+                "this_is_a_test_for_truncating_long_folder_names_in_the_prompt",
+                "Project.toml",
+            )
+            mkpath(dirname(long))
+            write(long, "")
+            Base.ACTIVE_PROJECT[] = long
+            @test fresh_prompt() == "(this_is_a_test_for_truncati...) vpkg> "
+
+            # A declared name wins over the directory. The cached result is
+            # stable across file edits until explicitly invalidated; afterward
+            # both cwd contexts observe the edited name.
+            declared = joinpath(d, "FolderName", "Project.toml")
+            mkpath(dirname(declared))
+            write(declared, "name = \"DeclaredName\"\n")
+            Base.ACTIVE_PROJECT[] = declared
+            @test fresh_prompt() == "(DeclaredName) vpkg> "
+            write(declared, "name = \"ChangedName\"\n")
+            @test ext.promptf() == "(DeclaredName) vpkg> "
+            @test ext.invalidate_prompt!() === nothing
+            @test ext.CACHED_PROMPT[] === nothing
+            @test ext.promptf() == "(ChangedName) vpkg> "
+            cd(dirname(declared)) do
+                @test fresh_prompt() == "(ChangedName) vpkg> "
+            end
+            @test fresh_prompt() == "(ChangedName) vpkg> "
+
+            # A workspace member shows the root name and member-relative path.
+            workspace = joinpath(d, "workspace")
+            member = joinpath(workspace, "member")
+            mkpath(member)
+            root_project = joinpath(workspace, "Project.toml")
+            member_project = joinpath(member, "Project.toml")
+            write(
+                root_project,
+                "name = \"WorkspaceRoot\"\n[workspace]\nprojects = [\"member\"]\n",
+            )
+            write(member_project, "name = \"MemberName\"\n")
+            Base.ACTIVE_PROJECT[] = member_project
+            @test fresh_prompt() == "(WorkspaceRoot/member) vpkg> "
+
+            # Shared environments are detected from the depot path, rather
+            # than merely because their directory happens to start with `v`.
+            depot = mkpath(joinpath(d, "depot"))
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots])
             vname = "v$(VERSION.major).$(VERSION.minor)"
-            venv = joinpath(d, vname, "Project.toml")
+            venv = joinpath(depot, "environments", vname, "Project.toml")
             mkpath(dirname(venv))
-            touch(venv)
+            write(venv, "")
             Base.ACTIVE_PROJECT[] = venv
-            ext.invalidate_prompt!()
-            @test ext.promptf() == "(@$vname) vpkg> "
+            @test fresh_prompt() == "(@$vname) vpkg> "
 
-            # caching: the prompt is not recomputed until invalidated
-            Base.ACTIVE_PROJECT[] = proj
+            # Offline-mode changes also become visible only after invalidation.
+            Base.ACTIVE_PROJECT[] = declared
             ext.invalidate_prompt!()
             p1 = ext.promptf()
             VibePkg.API.OFFLINE_MODE[] = true
-            try
-                @test ext.promptf() == p1                 # still the cached value
-                ext.invalidate_prompt!()
-                @test ext.promptf() == "(MyProj) [offline] vpkg> "
-            finally
-                VibePkg.API.OFFLINE_MODE[] = false
-                ext.invalidate_prompt!()
-            end
+            @test ext.promptf() == p1
+            @test fresh_prompt() == "(ChangedName) [offline] vpkg> "
         end
     finally
-        Base.ACTIVE_PROJECT[] = old
+        Base.ACTIVE_PROJECT[] = old_project
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
         ext.invalidate_prompt!()
+    end
+
+    # Prove default-environment discovery in a fresh Julia process, not just
+    # by assigning Base.ACTIVE_PROJECT[] to a version-shaped test path.
+    mktempdir() do depot
+        code = """
+        using VibePkg, REPL
+        VibePkg.activate(; io = devnull)
+        ext = Base.get_extension(VibePkg, :REPLExt)
+        print(ext.promptf())
+        """
+        sep = Sys.iswindows() ? ';' : ':'
+        cmd = addenv(
+            `$(Base.julia_cmd()) --startup-file=no --project=$(pkgdir(VibePkg)) -e $code`,
+            "JULIA_DEPOT_PATH" => join(
+                [depot, LocalPkgServer.worker_depot_path()], sep
+            ),
+            "JULIA_LOAD_PATH" => nothing,
+            "JULIA_PROJECT" => nothing,
+        )
+        @test read(cmd, String) ==
+            "(@v$(VERSION.major).$(VERSION.minor)) vpkg> "
     end
 end
 
@@ -525,6 +638,154 @@ end
         @test api === VibePkg.API.activate && args == Any["-"] && isempty(opts)
     finally
         REPLMode.TEST_MODE[] = false
+    end
+end
+
+@testset "activate matrix (repl.jl:249)" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_prev = VibePkg.API.PREV_ENV_PATH[]
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        mktempdir() do root
+            root = realpath(root)
+            depot = mkpath(joinpath(root, "depot"))
+            work = mkdir(joinpath(root, "work"))
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+
+            cd(work) do
+                # `activate .` targets the cwd without eagerly creating a
+                # project file.
+                do_cmd("activate ."; io = devnull)
+                root_project = joinpath(work, "Project.toml")
+                @test Base.active_project() == root_project
+                @test !isfile(root_project)
+
+                # Shared environments accept names, never path spellings, and
+                # a rejected spelling must leave the active environment alone.
+                for bad in (".", "./Foo", "Foo/Bar", "../Bar")
+                    @test_throws PkgError do_cmd("activate --shared $bad"; io = devnull)
+                    @test Base.active_project() == root_project
+                end
+
+                # A cwd directory wins over a same-named path-tracked dep.
+                foo_uuid = UUID("f00f0001-f00f-4000-8000-f00f00000001")
+                foo = mkpath(joinpath(work, "modules", "Foo"))
+                mkpath(joinpath(foo, "src"))
+                write(
+                    joinpath(foo, "Project.toml"),
+                    "name = \"Foo\"\nuuid = \"$foo_uuid\"\nversion = \"0.1.0\"\n",
+                )
+                write(joinpath(foo, "src", "Foo.jl"), "module Foo end\n")
+                mkdir(joinpath(work, "Foo"))
+                do_cmd("develop modules/Foo"; io = devnull)
+
+                do_cmd("activate Foo"; io = devnull)
+                @test Base.active_project() == joinpath(work, "Foo", "Project.toml")
+                do_cmd("activate ."; io = devnull)
+
+                # The explicit shared spelling bypasses both cwd and deps.
+                do_cmd("activate --shared Foo"; io = devnull)
+                @test Base.active_project() ==
+                    joinpath(depot, "environments", "Foo", "Project.toml")
+                do_cmd("activate ."; io = devnull)
+
+                # Once the cwd path is gone, a plain name resolves to the
+                # developed dependency, including from a different cwd.
+                Base.rm(joinpath(work, "Foo"); recursive = true)
+                other_cwd = mkdir(joinpath(work, "elsewhere"))
+                cd(other_cwd) do
+                    do_cmd("activate Foo"; io = devnull)
+                    @test Base.active_project() == joinpath(foo, "Project.toml")
+                end
+
+                # An explicit path never falls back to a dependency. A new
+                # target is activated lazily: neither dir nor file is created.
+                do_cmd("activate ."; io = devnull)
+                do_cmd("activate ./Foo"; io = devnull)
+                @test Base.active_project() == joinpath(work, "Foo", "Project.toml")
+                @test !isdir(joinpath(work, "Foo"))
+                @test !isfile(joinpath(work, "Foo", "Project.toml"))
+                do_cmd("activate ."; io = devnull)
+
+                # A registry-added (non-path-tracked) dependency is not an
+                # activation target. Exercise the real add through the local
+                # package server, then prove its name still means a new cwd
+                # environment rather than the immutable installed source.
+                LocalPkgServer.ensure!()
+                VibePkg.API.OFFLINE_MODE[] = false
+                try
+                    do_cmd("add Example"; io = devnull)
+                finally
+                    VibePkg.API.OFFLINE_MODE[] = true
+                end
+                installed = VibePkg.dependencies()[
+                    UUID("7876af07-990d-54b4-ab0e-23690620f79a"),
+                ].source
+                @test isdir(installed)
+                do_cmd("activate Example"; io = devnull)
+                @test Base.active_project() ==
+                    joinpath(work, "Example", "Project.toml")
+                @test dirname(Base.active_project()) != installed
+                do_cmd("activate ."; io = devnull)
+
+                # REPL activation expands HOME before dispatch.
+                fake_home = mkdir(joinpath(root, "home"))
+                withenv("HOME" => fake_home) do
+                    do_cmd("activate ~/HomeEnv"; io = devnull)
+                    @test Base.active_project() ==
+                        joinpath(fake_home, "HomeEnv", "Project.toml")
+                end
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.PREV_ENV_PATH[] = old_prev
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+    end
+end
+
+@testset "cwd-relative develop forms (new.jl:1739)" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        cases = (
+            (".", "CwdDot", UUID("c0dd0001-c0dd-4000-8000-c0dd00000001"), :package),
+            ("..", "CwdParent", UUID("c0dd0002-c0dd-4000-8000-c0dd00000002"), :src),
+            ("./CwdNamed", "CwdNamed", UUID("c0dd0003-c0dd-4000-8000-c0dd00000003"), :parent),
+        )
+        for (form, name, uuid, cwd_kind) in cases
+            mktempdir() do root
+                root = realpath(root)
+                envdir = mkdir(joinpath(root, "env"))
+                package = mkdir(joinpath(root, name))
+                src = mkdir(joinpath(package, "src"))
+                write(
+                    joinpath(package, "Project.toml"),
+                    "name = \"$name\"\nuuid = \"$uuid\"\nversion = \"0.1.0\"\n",
+                )
+                write(joinpath(src, "$name.jl"), "module $name end\n")
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+
+                command_cwd = cwd_kind === :package ? package :
+                    cwd_kind === :src ? src : root
+                cd(command_cwd) do
+                    do_cmd("develop $form"; io = devnull)
+                end
+
+                info = VibePkg.dependencies()[uuid]
+                @test info.name == name
+                @test info.is_tracking_path
+                @test isdir(info.source)
+                @test Base.samefile(info.source, package)
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        VibePkg.API.OFFLINE_MODE[] = old_offline
     end
 end
 
@@ -640,4 +901,94 @@ end
     @test isempty(REPLMode.completions_for("?act")[1])
     # never throws on `?`-prefixed input
     @test REPLMode.completions_for("? ad")[1] isa Vector
+end
+
+@testset "tab completion while offline (repl.jl:331)" begin
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        mktempdir() do dir
+            depot = mkpath(joinpath(dir, "depot"))
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            REPLMode.reset_completion_cache!()
+
+            # Offline mode must not invent remote completions when no registry
+            # is installed.
+            @test isempty(REPLMode.completions_for("add Exam")[1])
+
+            # Once a registry is present, the same offline completion is
+            # entirely local and should discover its package names.
+            registry = mkpath(joinpath(depot, "registries", "OfflineReg"))
+            package = mkpath(joinpath(registry, "E", "Example"))
+            write(
+                joinpath(registry, "Registry.toml"), """
+                name = "OfflineReg"
+                uuid = "55558594-aafe-5451-b93e-139f81909106"
+
+                [packages]
+                7876af07-990d-54b4-ab0e-23690620f79a = { name = "Example", path = "E/Example" }
+                """
+            )
+            write(
+                joinpath(package, "Package.toml"), """
+                name = "Example"
+                uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+                repo = "https://example.invalid/Example.jl.git"
+                """
+            )
+            write(
+                joinpath(package, "Versions.toml"), """
+                ["0.5.3"]
+                git-tree-sha1 = "1111111111111111111111111111111111111111"
+                """
+            )
+            REPLMode.reset_completion_cache!()
+            @test REPLMode.completions_for("add Exam")[1] == ["Example"]
+            @test VibePkg.API.OFFLINE_MODE[]
+        end
+    finally
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+        REPLMode.reset_completion_cache!()
+    end
+end
+
+@testset "generate/develop validation errors (repl.jl:40)" begin
+    old_active = Base.ACTIVE_PROJECT[]
+    old_depots = copy(Base.DEPOT_PATH)
+    old_offline = VibePkg.API.OFFLINE_MODE[]
+    try
+        VibePkg.API.OFFLINE_MODE[] = true
+        mktempdir() do dir
+            depot = mkpath(joinpath(dir, "depot"))
+            environment = mkpath(joinpath(dir, "environment"))
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            Base.ACTIVE_PROJECT[] = joinpath(environment, "Project.toml")
+            cd(dir) do
+                @test_throws PkgError do_cmd("develop Example#blergh"; io = devnull)
+                @test_throws PkgError do_cmd("add ÖÖÖ"; io = devnull)
+                @test_throws PkgError do_cmd("generate 2019Julia"; io = devnull)
+
+                do_cmd("generate Foo"; io = devnull)
+                do_cmd("develop ./Foo"; io = devnull)
+
+                source = joinpath("Foo", "src", "Foo.jl")
+                moved_source = joinpath("Foo", "src", "Foo2.jl")
+                mv(source, moved_source)
+                @test_throws PkgError do_cmd("develop ./Foo"; io = devnull)
+
+                mv(moved_source, source)
+                project = joinpath("Foo", "Project.toml")
+                write(project, "name = \"Foo\"\n")
+                @test_throws PkgError do_cmd("develop ./Foo"; io = devnull)
+                write(project, "uuid = \"b7b78b08-812d-11e8-33cd-11188e330cbe\"\n")
+                @test_throws PkgError do_cmd("develop ./Foo"; io = devnull)
+            end
+        end
+    finally
+        Base.ACTIVE_PROJECT[] = old_active
+        append!(empty!(Base.DEPOT_PATH), old_depots)
+        VibePkg.API.OFFLINE_MODE[] = old_offline
+    end
 end

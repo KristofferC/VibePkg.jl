@@ -10,11 +10,64 @@ LocalPkgServer.isolate!()
 
 using Test
 using VibePkg
+import LibGit2
+import TOML
 using VibePkg.Depots: depot_stack
+using VibePkg.Depots: find_installed
+using VibePkg.EnvFiles: entry_tree_hash
 using VibePkg.Registries: add_default_registries!
 
 const EX_UUID = "7876af07-990d-54b4-ab0e-23690620f79a"
 const TST_UUID = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+const ROOT_DEP_UUID = "77777777-7777-4777-8777-777777777777"
+
+function make_root_dep_registry!(dir, depot)
+    repo_dir = mkpath(joinpath(dir, "RootDep.jl"))
+    mkpath(joinpath(repo_dir, "src"))
+    write(
+        joinpath(repo_dir, "Project.toml"), """
+        name = "RootDep"
+        uuid = "$ROOT_DEP_UUID"
+        version = "1.0.0"
+        """
+    )
+    write(joinpath(repo_dir, "src", "RootDep.jl"), "module RootDep end\n")
+    tree_hash = bytes2hex(VibePkg.TreeHash.tree_hash(repo_dir))
+    repo = LibGit2.init(repo_dir)
+    try
+        LibGit2.add!(repo, ".")
+        sig = LibGit2.Signature("fixture", "fixture@localhost")
+        LibGit2.commit(repo, "RootDep v1.0.0"; author = sig, committer = sig)
+    finally
+        close(repo)
+    end
+
+    registry = joinpath(depot, "registries", "WorkspaceRootRegistry")
+    package = mkpath(joinpath(registry, "R", "RootDep"))
+    write(
+        joinpath(registry, "Registry.toml"), """
+        name = "WorkspaceRootRegistry"
+        uuid = "55555555-5555-4555-8555-555555555555"
+        repo = "https://example.invalid/WorkspaceRootRegistry.git"
+
+        [packages]
+        $ROOT_DEP_UUID = { name = "RootDep", path = "R/RootDep" }
+        """
+    )
+    open(joinpath(package, "Package.toml"), "w") do io
+        TOML.print(
+            io,
+            Dict("name" => "RootDep", "uuid" => ROOT_DEP_UUID, "repo" => repo_dir),
+        )
+    end
+    write(
+        joinpath(package, "Versions.toml"), """
+        ["1.0.0"]
+        git-tree-sha1 = "$tree_hash"
+        """
+    )
+    return Base.SHA1(tree_hash)
+end
 
 # run `f` with `proj` active and the depot stack (incl. env, for the test
 # sandbox subprocess) pointed at `depot` + bundled stdlibs, and precompilation on.
@@ -67,6 +120,78 @@ end
             @test VibePkg.test(io = devnull) === nothing
         end
         @test isdir(joinpath(depot, "packages", "Example"))   # reinstalled
+    end
+end
+
+# With a resolved workspace manifest, the default instantiate scope downloads
+# only the active root project's loadable closure. `workspace = true` widens
+# that scope to member-only dependencies too. This is the on-disk half of
+# Pkg.jl's `is_instantiated(env, false/true)` distinction.
+@testset "selective workspace package installation" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        add_default_registries!(depots; io = devnull)
+        root_hash = make_root_dep_registry!(dir, depot)
+
+        root = mkpath(joinpath(dir, "root"))
+        write(
+            joinpath(root, "Project.toml"), """
+            [workspace]
+            projects = ["member"]
+
+            [deps]
+            RootDep = "$ROOT_DEP_UUID"
+            """
+        )
+        member = mkpath(joinpath(root, "member"))
+        write(joinpath(member, "Project.toml"), "[deps]\nExample = \"$EX_UUID\"\n")
+
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+        try
+            # Resolve the union first, then remove both installed trees so
+            # instantiate's download scope is observable from an empty depot.
+            with_ws_env(root, depot) do
+                VibePkg.resolve(; io = devnull)
+            end
+            manifest = VibePkg.EnvFiles.read_manifest(joinpath(root, "Manifest.toml"))
+            root_uuid = Base.UUID(ROOT_DEP_UUID)
+            example_uuid = Base.UUID(EX_UUID)
+            @test haskey(manifest, root_uuid)
+            @test haskey(manifest, example_uuid)
+            @test entry_tree_hash(manifest[root_uuid]) == root_hash
+
+            Base.rm(joinpath(depot, "packages", "RootDep"); recursive = true, force = true)
+            Base.rm(joinpath(depot, "packages", "Example"); recursive = true, force = true)
+
+            with_ws_env(root, depot) do
+                VibePkg.instantiate(; workspace = false, io = devnull)
+            end
+            _, root_installed = find_installed(
+                depots, "RootDep", root_uuid, entry_tree_hash(manifest[root_uuid])
+            )
+            _, example_installed = find_installed(
+                depots, "Example", example_uuid, entry_tree_hash(manifest[example_uuid])
+            )
+            @test root_installed       # active project is complete
+            @test !example_installed   # workspace union is not complete
+
+            with_ws_env(root, depot) do
+                VibePkg.instantiate(; workspace = true, io = devnull)
+            end
+            _, root_installed = find_installed(
+                depots, "RootDep", root_uuid, entry_tree_hash(manifest[root_uuid])
+            )
+            _, example_installed = find_installed(
+                depots, "Example", example_uuid, entry_tree_hash(manifest[example_uuid])
+            )
+            @test root_installed
+            @test example_installed
+        finally
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
     end
 end
 

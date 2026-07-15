@@ -140,6 +140,23 @@ end
             @test p.name == "NewPkg" && p.version == v"0.1.0" && p.uuid !== nothing
             @test_throws PkgError VibePkg.generate(gen; io = devnull)      # exists
             @test_throws PkgError VibePkg.generate(joinpath(dir, "not valid"); io = devnull)
+
+            # Pkg.jl#2821: an existing but empty cwd is a valid generation
+            # target; its directory name supplies the package name.
+            cwdpkg = mkpath(joinpath(dir, "CwdPkg"))
+            cd(cwdpkg) do
+                cwdresult = VibePkg.generate("."; io = devnull)
+                @test haskey(cwdresult, "CwdPkg")
+                @test VibePkg.EnvFiles.read_project("Project.toml").name == "CwdPkg"
+                @test isfile(joinpath("src", "CwdPkg.jl"))
+            end
+
+            # Pkg.jl#1435: user-home expansion works through the API too.
+            withenv("HOME" => dir) do
+                homeresult = VibePkg.generate("~/HomePkg"; io = devnull)
+                @test haskey(homeresult, "HomePkg")
+                @test isfile(joinpath(dir, "HomePkg", "src", "HomePkg.jl"))
+            end
         end
     end
 end
@@ -1015,7 +1032,11 @@ end
             end
             @test err isa VibePkg.Resolve.ResolverError
             out = String(take!(buf))
-            @test occursin("yanked", out) && occursin("Example", out)
+            @test occursin(
+                "The following package versions were yanked from their registry and are not resolvable:",
+                out,
+            )
+            @test occursin("- Example [7876af07] 1.0.0", out)
         end
     end
 end
@@ -1026,7 +1047,14 @@ end
 @testset "add of a bare local path errors" begin
     mktempdir() do dir
         touch(joinpath(dir, "Project.toml"))
-        @test_throws PkgError VibePkg.add(; path = dir, io = devnull)
+        err = try
+            VibePkg.add(; path = dir, io = devnull)
+            nothing
+        catch e
+            e
+        end
+        @test err isa PkgError
+        @test occursin("perhaps you meant `VibePkg.develop`?", err.msg)
     end
 end
 
@@ -1054,7 +1082,15 @@ end
             write_environment(env, plan_develop(env, regs, Config(depots), B))
             env = load_environment(envdir; depots)
             Base.rm(B; recursive = true)                    # the source disappears
-            @test_throws PkgError plan_resolve(env, regs, Config(depots))
+            err = try
+                plan_resolve(env, regs, Config(depots))
+                nothing
+            catch e
+                e
+            end
+            @test err isa PkgError
+            @test occursin("This package is referenced in the manifest file:", err.msg)
+            @test occursin(env.manifest_file, err.msg)
         end
     end
 end
@@ -1808,5 +1844,65 @@ end
 
         VibePkg.undo(; io = devnull)
         @test entry_version(reloadenv(envdir).manifest[EX]) == version_pre
+    end
+end
+
+# Pkg.jl new.jl "relative depot path" — Base deliberately retains a relative
+# JULIA_DEPOT_PATH entry. A cwd-relative repository add must therefore resolve
+# both the package path and every depot write against the operation cwd.
+@testset "relative JULIA_DEPOT_PATH supports a repository add" begin
+    LibGit2 = VibePkg.Git.LibGit2
+    pkg_uuid = UUID("de901234-5678-49ab-8cde-f0123456789a")
+    mktempdir() do dir
+        pkg = joinpath(dir, "BasicSandbox")
+        mkpath(joinpath(pkg, "src"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "BasicSandbox"
+            uuid = "$pkg_uuid"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "BasicSandbox.jl"), "module BasicSandbox\nend\n")
+        repo = LibGit2.init(pkg)
+        try
+            LibGit2.add!(repo, ".")
+            sig = LibGit2.Signature("fixture", "fixture@localhost")
+            LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+        finally
+            close(repo)
+        end
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_depot_env = get(ENV, "JULIA_DEPOT_PATH", nothing)
+        old_offline = API.OFFLINE_MODE[]
+        try
+            cd(dir) do
+                ENV["JULIA_DEPOT_PATH"] = "relative-depot"
+                Base.init_depot_path()
+                @test Base.DEPOT_PATH == ["relative-depot"]
+                API.OFFLINE_MODE[] = true
+                envdir = mkpath(joinpath(dir, "env"))
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+
+                VibePkg.add(VibePkg.PackageSpec(path = "BasicSandbox"); io = devnull)
+
+                relative_depot = joinpath(dir, "relative-depot")
+                @test isdir(joinpath(relative_depot, "clones"))
+                @test isdir(joinpath(relative_depot, "packages", "BasicSandbox"))
+                info = VibePkg.dependencies()[pkg_uuid]
+                @test info.is_tracking_repo
+                @test startswith(realpath(info.source), realpath(relative_depot))
+                @test isfile(joinpath(envdir, "Manifest.toml"))
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            empty!(Base.DEPOT_PATH)
+            append!(Base.DEPOT_PATH, old_depots)
+            old_depot_env === nothing ? delete!(ENV, "JULIA_DEPOT_PATH") :
+                (ENV["JULIA_DEPOT_PATH"] = old_depot_env)
+            API.OFFLINE_MODE[] = old_offline
+        end
     end
 end

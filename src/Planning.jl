@@ -1353,7 +1353,8 @@ function version_satisfied_by_entry(entry::ManifestEntry, version)
 end
 
 """
-    plan_promote(env, registries, requests) -> Union{Nothing, Tuple{Environment, Vector{String}}}
+    plan_promote(env, registries, requests; respect_sysimage_versions) ->
+        Union{Nothing, Tuple{Environment, Vector{String}}}
 
 Add's already-present fast path. If every request names a package that is
 already a registry-tracked, unpinned manifest entry whose version satisfies
@@ -1365,7 +1366,7 @@ the full resolve.
 """
 function plan_promote(
         env::Environment, registries::Vector{RegistryInstance},
-        requests::Vector{PackageRequest},
+        requests::Vector{PackageRequest}; respect_sysimage_versions::Bool = true,
     )
     isempty(requests) && return nothing
     new_deps = Dict{String, UUID}(env.project.deps)
@@ -1375,6 +1376,12 @@ function plan_promote(
         entry = get(env.manifest, uuid, nothing)
         entry === nothing && return nothing
         entry_isfixed(entry) && return nothing          # pinned or path/repo-tracked
+        # Turning off sysimage-version respect is an explicit request to
+        # return to ordinary resolution. Do not let add's promotion fast path
+        # preserve the baked version without consulting the resolver.
+        if !respect_sysimage_versions && Base.in_sysimage(Base.PkgId(uuid, name))
+            return nothing
+        end
         version_satisfied_by_entry(entry, request_version_spec(r, name)) || return nothing
         new_deps[name] = uuid
         push!(names, name)
@@ -1389,6 +1396,16 @@ end
 
 "What `add` operates on: a registry request or a materialized git source."
 const AddTarget = Union{PackageRequest, RepoPackage}
+
+function error_if_in_sysimage(name::String, uuid::UUID, config::Config)
+    config.respect_sysimage_versions || return
+    pkgid = Base.PkgId(uuid, name)
+    Base.in_sysimage(pkgid) || return
+    pkgerror(
+        "Tried to develop or add by URL package $pkgid which is already in the sysimage, " *
+            "use `VibePkg.respect_sysimage_versions(false)` to disable this check."
+    )
+end
 
 # seed the resolve node (and the new direct dep) for one add target
 function add_target_node!(
@@ -1453,6 +1470,7 @@ function plan_add(
     nodes = Node[]
     new_deps = Dict{String, UUID}(env.project.deps)
     for t in targets
+        t isa RepoPackage && error_if_in_sysimage(t.name, t.uuid, config)
         add_target_node!(nodes, new_deps, env, registries, t, preserve)
     end
     repos = RepoPackage[t for t in targets if t isa RepoPackage]
@@ -1620,6 +1638,7 @@ function plan_develop(
         if uuid == env.project.uuid
             pkgerror("cannot develop package $(err_rep(name, uuid)) into itself")
         end
+        error_if_in_sysimage(name, uuid, config)
 
         # store manifest-relative (or absolute) like the manifest wants it
         node_path = isabspath(path) ? path : relpath(dev_dir, dirname(env.manifest_file))

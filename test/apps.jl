@@ -14,7 +14,8 @@ using VibePkg.Configs: Config
 using VibePkg.Registries: RegistryInstance, reachable_registries
 using VibePkg.Planning: PackageRequest
 using VibePkg.AppsOps
-using VibePkg.EnvFiles: read_manifest, entry_version, entry_path, is_path_tracked
+using VibePkg.EnvFiles: read_manifest, entry_version, entry_path, entry_tree_hash,
+    is_path_tracked, is_repo_tracked
 using VibePkg.Errors: PkgError
 import TOML
 
@@ -106,6 +107,35 @@ end
         out = run_shim(shim, "--threads=2", "--", "a", "b")
         @test occursin("app says: a+b", out)
 
+        # Assert the exact argv rebuilt by the Unix shim.  A mock Julia makes
+        # this independent of Julia's own option parser, so even a Julia option
+        # containing whitespace can be checked byte-for-byte.  Keep the mock
+        # and matching files in the caller's cwd so an unquoted `*` would
+        # visibly expand.
+        if !Sys.iswindows()
+            argv_julia = joinpath(dir, "argv-julia")
+            write(
+                argv_julia,
+                "#!/bin/sh\nfor arg in \"\$@\"; do printf '%s\\n' \"\$arg\"; done\n",
+            )
+            chmod(argv_julia, 0o755)
+            write(joinpath(dir, "would-expand"), "")
+            shim_argv(args) = withenv("JULIA_APPS_JULIA_CMD" => argv_julia) do
+                output = cd(dir) do
+                    run_shim(shim, args...)
+                end
+                split(output, '\n'; keepempty = true)[1:(end - 1)]
+            end
+
+            @test shim_argv(["a b", "", "c"]) ==
+                ["--startup-file=no", "-m", "AppPkg", "a b", "", "c"]
+            @test shim_argv(["--project=a b", "--", "z"]) ==
+                ["--startup-file=no", "--project=a b", "-m", "AppPkg", "z"]
+            @test shim_argv(["--", "a", "--", "b"]) ==
+                ["--startup-file=no", "-m", "AppPkg", "a", "--", "b"]
+            @test shim_argv(["*"]) == ["--startup-file=no", "-m", "AppPkg", "*"]
+        end
+
         # literal '!' in arguments survives the shim (on Windows, delayed
         # expansion would corrupt it — the .bat keeps it disabled throughout)
         out = run_shim(shim, "a!b", "!c!")
@@ -147,12 +177,104 @@ end
         @test !isfile(shim)
         @test isempty(read_manifest(AppsOps.app_manifest_file(depots)))
         @test_throws PkgError AppsOps.app_rm(depots, "AppPkg"; io = devnull)
+
+        # Pkg.Apps rejects empty add/develop requests with its public error
+        # type rather than falling through to keyword dispatch.
+        @test_throws PkgError VibePkg.Apps.add(; io = devnull)
+        @test_throws PkgError VibePkg.Apps.develop(; io = devnull)
     end
 end
 
-# Pkg.jl apps.jl "relocated depot keeps working" — the shim derives its depot
-# from its own location (`$DEPOT` = SCRIPT_DIR/..), so moving the whole depot
-# to a new path and running the relocated shim still works.
+# Pkg.jl#4634 — an app installed from a git repository tracks the repository's
+# branch, so update must fetch a moved tip, reinstall the new tree, rewrite the
+# surviving shim, and remove shims for apps no longer declared upstream.  The
+# repository and depot are both local; the test's dead proxy guarantees this
+# flow cannot accidentally use the internet.
+@testset "apps: repo-tracked update fetches upstream and removes stale shims" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        pkg = mkpath(joinpath(dir, "RepoApp.jl"))
+        repo = LibGit2.init(pkg)
+        sig = LibGit2.Signature("fixture", "fixture@localhost")
+
+        function write_repo_app(version::String; stale::Bool)
+            mkpath(joinpath(pkg, "src"))
+            apps = stale ? "repoapp = {}\nstaleapp = { submodule = \"Stale\" }" : "repoapp = {}"
+            write(
+                joinpath(pkg, "Project.toml"), """
+                name = "RepoApp"
+                uuid = "$APP_UUID"
+                version = "$version"
+
+                [apps]
+                $apps
+                """
+            )
+            write(
+                joinpath(pkg, "src", "RepoApp.jl"), """
+                module RepoApp
+                function (@main)(args)
+                    println("repo app v$version")
+                    return 0
+                end
+                module Stale
+                function (@main)(args)
+                    println("stale app")
+                    return 0
+                end
+                end
+                end
+                """
+            )
+            LibGit2.add!(repo, "Project.toml", "src/RepoApp.jl")
+            return LibGit2.commit(repo, "RepoApp v$version"; author = sig, committer = sig)
+        end
+
+        first_commit = write_repo_app("1.0.0"; stale = true)
+        first_tree = commit_tree_hash(repo, first_commit)
+
+        depot = mkpath(joinpath(dir, "depot"))
+        saved_stack = copy(Base.DEPOT_PATH)
+        saved_env = get(ENV, "JULIA_DEPOT_PATH", nothing)
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            ENV["JULIA_DEPOT_PATH"] = depot
+
+            VibePkg.Apps.add(; path = pkg, io = devnull)
+            manifest_file = joinpath(depot, "environments", "apps", "AppManifest.toml")
+            installed_entry() = read_manifest(manifest_file)[APP_UUID]
+            suffix = Sys.iswindows() ? ".bat" : ""
+            repo_shim = joinpath(depot, "bin", "repoapp$suffix")
+            stale_shim = joinpath(depot, "bin", "staleapp$suffix")
+
+            @test is_repo_tracked(installed_entry())
+            @test string(entry_tree_hash(installed_entry())) == first_tree
+            @test isfile(repo_shim)
+            @test isfile(stale_shim)
+            @test occursin("repo app v1.0.0", run_shim(repo_shim))
+
+            second_commit = write_repo_app("2.0.0"; stale = false)
+            second_tree = commit_tree_hash(repo, second_commit)
+            @test second_tree != first_tree
+
+            # Select by app name, matching Pkg.Apps.update's public behavior.
+            VibePkg.Apps.update("repoapp"; io = devnull)
+            @test string(entry_tree_hash(installed_entry())) == second_tree
+            @test occursin("repo app v2.0.0", run_shim(repo_shim))
+            @test !isfile(stale_shim)
+        finally
+            close(repo)
+            append!(empty!(Base.DEPOT_PATH), saved_stack)
+            saved_env === nothing ? delete!(ENV, "JULIA_DEPOT_PATH") :
+                (ENV["JULIA_DEPOT_PATH"] = saved_env)
+        end
+    end
+end
+
+# Pkg.jl apps.jl "relocated depot keeps working" — a git-added app uses a
+# depot-relative load path. Copying exactly the runtime-bearing depot entries
+# (`bin`, `environments`, and `packages`) must therefore leave the copied shim
+# runnable without the original depot.
 @testset "apps: relocated depot keeps working" begin
     Sys.iswindows() && return @test_skip "app shim end-to-end run not exercised on Windows"
     mktempdir() do dir
@@ -178,18 +300,32 @@ end
             end
             """
         )
+        repo = LibGit2.init(pkg)
+        sig = LibGit2.Signature("fixture", "fixture@localhost")
+        LibGit2.add!(repo, "Project.toml", "src/RelocPkg.jl")
+        LibGit2.commit(repo, "initial app"; author = sig, committer = sig)
+
         depot = mkpath(joinpath(dir, "depot"))
         depots = depot_stack([depot])
-        AppsOps.app_develop(Config(depots), RegistryInstance[], pkg; io = devnull)
-        shim = joinpath(depot, "bin", "reloc")
-        @test occursin("reloc says: x+y", run_shim(shim, "x", "y"))
+        try
+            package = VibePkg.Git.materialize_repo_package!(depots, pkg; io = devnull)
+            AppsOps.app_add(Config(depots), RegistryInstance[], package; io = devnull)
+            shim = joinpath(depot, "bin", "reloc")
+            @test occursin("\$DEPOT/environments/apps/RelocPkg", read(shim, String))
+            @test occursin("reloc says: x+y", run_shim(shim, "x", "y"))
 
-        # move the entire depot elsewhere and run the relocated shim
-        newdepot = joinpath(dir, "moved-depot")
-        mv(depot, newdepot)
-        newshim = joinpath(newdepot, "bin", "reloc")
-        @test isfile(newshim)
-        @test occursin("reloc says: x+y", run_shim(newshim, "x", "y"))
+            # Match upstream's relocation shape rather than moving the source
+            # checkout: only the installed runtime state is copied.
+            newdepot = mkpath(joinpath(dir, "copied-depot"))
+            for entry in ("bin", "environments", "packages")
+                cp(joinpath(depot, entry), joinpath(newdepot, entry))
+            end
+            newshim = joinpath(newdepot, "bin", "reloc")
+            @test isfile(newshim)
+            @test occursin("reloc says: x+y", run_shim(newshim, "x", "y"))
+        finally
+            close(repo)
+        end
     end
 end
 
@@ -568,8 +704,125 @@ end
     end
 end
 
-# `app dev .` from inside the package directory  # Pkg.jl#4480
-@testset "apps: develop pwd" begin
+# Pkg.jl#4697 — developing an app must resolve and instantiate the app's own
+# environment in place.  In particular, its dependencies belong in the
+# checkout's Manifest.toml and must be available to a fresh shim process.  The
+# dependency registry and repository are both local, so this exercises the
+# public Apps API without internet access.
+@testset "apps: develop resolves dependencies into the checkout manifest" begin
+    mktempdir() do dir
+        sig = LibGit2.Signature("fixture", "fixture@localhost")
+
+        dep = joinpath(dir, "DepPkg")
+        mkpath(joinpath(dep, "src"))
+        write(
+            joinpath(dep, "Project.toml"), """
+            name = "DepPkg"
+            uuid = "$DEP_UUID"
+            version = "1.0.0"
+            """
+        )
+        write(
+            joinpath(dep, "src", "DepPkg.jl"), """
+            module DepPkg
+            greet() = "hello from developed dependency"
+            end
+            """
+        )
+        repo = LibGit2.init(dep)
+        LibGit2.add!(repo, "Project.toml", "src/DepPkg.jl")
+        commit = LibGit2.commit(repo, "DepPkg v1.0.0"; author = sig, committer = sig)
+        dep_hash = commit_tree_hash(repo, commit)
+        close(repo)
+
+        pkg = joinpath(dir, "AppPkg")
+        mkpath(joinpath(pkg, "src"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "AppPkg"
+            uuid = "$APP_UUID"
+            version = "1.0.0"
+
+            [deps]
+            DepPkg = "$DEP_UUID"
+
+            [apps]
+            hello = {}
+            """
+        )
+        write(
+            joinpath(pkg, "src", "AppPkg.jl"), """
+            module AppPkg
+            using DepPkg
+            function (@main)(args)
+                println(DepPkg.greet())
+                return 0
+            end
+            end
+            """
+        )
+
+        depot = mkpath(joinpath(dir, "depot"))
+        reg = joinpath(depot, "registries", "TestRegistry")
+        write(
+            joinpath(mkpath(reg), "Registry.toml"), """
+            name = "TestRegistry"
+            uuid = "23338594-aafe-5451-b93e-139f81909106"
+            repo = "https://example.invalid/TestRegistry.git"
+
+            [packages]
+            $DEP_UUID = { name = "DepPkg", path = "D/DepPkg" }
+            """
+        )
+        reg_dep = mkpath(joinpath(reg, "D", "DepPkg"))
+        write_app_package_toml(joinpath(reg_dep, "Package.toml"), "DepPkg", DEP_UUID, dep)
+        write(
+            joinpath(reg_dep, "Versions.toml"), """
+            ["1.0.0"]
+            git-tree-sha1 = "$dep_hash"
+            """
+        )
+
+        saved_stack = copy(Base.DEPOT_PATH)
+        saved_env = get(ENV, "JULIA_DEPOT_PATH", nothing)
+        try
+            append!(empty!(Base.DEPOT_PATH), [depot])
+            ENV["JULIA_DEPOT_PATH"] = depot
+            withenv("JULIA_PKG_SERVER" => "") do
+                @test VibePkg.Apps.develop(; path = pkg, io = devnull) === nothing
+            end
+
+            manifest_file = joinpath(pkg, "Manifest.toml")
+            @test isfile(manifest_file)
+            manifest = read_manifest(manifest_file)
+            @test haskey(manifest, DEP_UUID)
+            dep_entry = manifest[DEP_UUID]
+            @test dep_entry.name == "DepPkg"
+            @test entry_version(dep_entry) == v"1.0.0"
+            @test string(entry_tree_hash(dep_entry)) == dep_hash
+            @test !is_path_tracked(dep_entry)
+
+            app_entry = read_manifest(
+                joinpath(depot, "environments", "apps", "AppManifest.toml")
+            )[APP_UUID]
+            @test is_path_tracked(app_entry)
+            @test realpath(entry_path(app_entry)) == realpath(pkg)
+
+            shim = AppsOps.shim_path(depot_stack([depot]), "hello")
+            @test isfile(shim)
+            @test occursin("hello from developed dependency", run_shim(shim))
+        finally
+            append!(empty!(Base.DEPOT_PATH), saved_stack)
+            saved_env === nothing ? delete!(ENV, "JULIA_DEPOT_PATH") :
+                (ENV["JULIA_DEPOT_PATH"] = saved_env)
+        end
+    end
+end
+
+# Absolute and cwd-relative app develop must use the checkout itself as its
+# environment: no `<depot>/environments/apps/<Name>` is created, and a fresh
+# shim process observes source edits immediately.  # Pkg.jl#4258, #4480
+@testset "apps: develop absolute path and pwd are live" begin
     mktempdir() do dir
         pkg = joinpath(dir, "AppPkg")
         mkpath(joinpath(pkg, "src"))
@@ -583,27 +836,49 @@ end
             hello = {}
             """
         )
-        write(
-            joinpath(pkg, "src", "AppPkg.jl"), """
-            module AppPkg
-            function (@main)(args)
-                println("app says: hi")
-                return 0
-            end
-            end
-            """
-        )
+        source_file = joinpath(pkg, "src", "AppPkg.jl")
+        function write_app(message::String)
+            return write(
+                source_file, """
+                module AppPkg
+                function (@main)(args)
+                    println("$message")
+                    return 0
+                end
+                end
+                """
+            )
+        end
+        write_app("app says: original")
 
         depot = mkpath(joinpath(dir, "depot"))
         depots = depot_stack([depot])
-        cd(pkg) do
-            AppsOps.app_develop(Config(depots), RegistryInstance[], "."; io = devnull)
+        env_dir = joinpath(depot, "environments", "apps", "AppPkg")
+        for path in (pkg, ".")
+            if path == "."
+                cd(pkg) do
+                    AppsOps.app_develop(Config(depots), RegistryInstance[], path; io = devnull)
+                end
+            else
+                AppsOps.app_develop(Config(depots), RegistryInstance[], path; io = devnull)
+            end
+            shim = AppsOps.shim_path(depots, "hello")
+            @test isfile(shim)
+            @test !isdir(env_dir)
+            @test occursin("app says: original", run_shim(shim))
+
+            if path == pkg
+                write_app("app says: edited")
+                @test occursin("app says: edited", run_shim(shim))
+                write_app("app says: original")
+            end
+
+            entry = read_manifest(AppsOps.app_manifest_file(depots))[APP_UUID]
+            recorded = entry_path(entry)
+            @test isabspath(recorded)
+            @test realpath(recorded) == realpath(pkg)
+            AppsOps.app_rm(depots, "AppPkg"; io = devnull)
         end
-        @test isfile(AppsOps.shim_path(depots, "hello"))
-        entry = read_manifest(AppsOps.app_manifest_file(depots))[APP_UUID]
-        recorded = entry_path(entry)
-        @test isabspath(recorded)
-        @test realpath(recorded) == realpath(pkg)
     end
 end
 

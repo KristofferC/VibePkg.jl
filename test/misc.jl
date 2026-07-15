@@ -28,13 +28,16 @@ end
         @test normalize_path_for_toml("..\\parent\\dir") == "../parent/dir"
         @test normalize_path_for_toml(".\\current") == "./current"
         @test normalize_path_for_toml("C:\\absolute\\path") == "C:\\absolute\\path"
+        @test normalize_path_for_toml("\\\\network\\share") == "\\\\network\\share"
         # round trip back to native separators
         @test denormalize_path_from_toml("foo/bar/baz") == "foo\\bar\\baz"
     else
         @test normalize_path_for_toml("foo/bar/baz") == "foo/bar/baz"
+        @test normalize_path_for_toml("foo\\bar\\baz") == "foo\\bar\\baz"
         @test normalize_path_for_toml("../parent/dir") == "../parent/dir"
         @test normalize_path_for_toml("./current") == "./current"
         @test normalize_path_for_toml("/absolute/path") == "/absolute/path"
+        @test normalize_path_for_toml("\\\\network\\share") == "\\\\network\\share"
         @test denormalize_path_from_toml("foo/bar/baz") == "foo/bar/baz"
     end
 end

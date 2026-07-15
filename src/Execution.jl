@@ -440,10 +440,11 @@ end
 """
     instantiate!(env, registries, config; julia_version_strict, workspace, io) -> installed
 
-Make everything the manifest records present on disk:
+Make the active project's loadable dependency closure present on disk:
 never rewrites the manifest. Errors when a direct dependency is missing
-from the manifest; warns on a stale project hash. `workspace = true` also
-requires every workspace member's direct dependencies to have entries.
+from the manifest; warns on a stale project hash. `workspace = true` widens
+installation to the whole manifest and also requires every workspace member's
+direct dependencies to have entries.
 """
 function instantiate!(
         env::Environment, registries::Vector{RegistryInstance}, config::Config;
@@ -468,8 +469,9 @@ function instantiate!(
         It is advised to run `Pkg.resolve()` (or `Pkg.update()`) to synchronize them.""" maxlog = 1
     end
     check_manifest_julia_version_compat(env.manifest, env.manifest_file; julia_version_strict)
-    installed = ensure_sources_installed!(env, registries, config; io)
-    ensure_artifacts!(env, config; io)
+    loadable = workspace ? nothing : loadable_uuids(env)
+    installed = ensure_sources_installed!(env, registries, config; io, loadable)
+    ensure_artifacts!(env, config; io, only = loadable)
     return installed
 end
 

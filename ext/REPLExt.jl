@@ -12,6 +12,8 @@ using REPL: REPL
 using REPL.LineEdit: LineEdit
 
 import VibePkg
+using VibePkg.Environments: find_workspace_root, safe_realpath
+using VibePkg.EnvFiles: read_project
 using VibePkg.REPLMode: REPLMode, do_cmd
 using VibePkg.Errors: PkgError
 using VibePkg.Utils: unstableio
@@ -23,18 +25,54 @@ const CACHED_PROMPT = Ref{Union{Nothing, String}}(nothing)
 
 invalidate_prompt!() = (CACHED_PROMPT[] = nothing; nothing)
 
+function project_name(project_file::String)
+    project = try
+        read_project(project_file)
+    catch err
+        err isa InterruptException && rethrow()
+        nothing
+    end
+    name = if project === nothing || project.name === nothing
+        basename(dirname(project_file))
+    else
+        project.name::String
+    end
+    project_path = safe_realpath(project_file)
+    for depot in Base.DEPOT_PATH
+        environments = safe_realpath(joinpath(depot, "environments"))
+        relative = try
+            relpath(project_path, environments)
+        catch
+            continue
+        end
+        if !isabspath(relative) && first(splitpath(relative)) != ".."
+            return "@" * name
+        end
+    end
+    return name
+end
+
 function promptf()
     cached = CACHED_PROMPT[]
     cached === nothing || return cached
-    proj = Base.active_project()
-    name = if proj === nothing
-        "v$(VERSION.major).$(VERSION.minor)"
-    else
-        base = basename(dirname(proj))
-        startswith(base, "v$(VERSION.major).") ? "@" * base : base
+    project_file = Base.active_project()
+    prefix = ""
+    if project_file !== nothing
+        root = find_workspace_root(project_file)
+        root_name = project_name(root)
+        if textwidth(root_name) > 30
+            root_name = first(root_name, 27) * "..."
+        end
+        path_prefix = if root == project_file
+            ""
+        else
+            relative = replace(relpath(dirname(project_file), dirname(root)), '\\' => '/')
+            "/" * relative
+        end
+        prefix = "($(root_name)$(path_prefix)) "
     end
-    offline = VibePkg.API.OFFLINE_MODE[] ? "[offline] " : ""
-    prompt = "($name) $(offline)vpkg> "
+    VibePkg.API.OFFLINE_MODE[] && (prefix *= "[offline] ")
+    prompt = "$(prefix)vpkg> "
     CACHED_PROMPT[] = prompt
     return prompt
 end

@@ -320,6 +320,71 @@ end
     end
 end
 
+# Pkg.jl test/artifacts.jl "Artifact Usage" (line 396): one porous target
+# selection must simultaneously omit a non-matching eager artifact, retain a
+# platform-independent lazy artifact without installing it, and install a
+# platform-independent eager artifact.
+@testset "porous platform artifact installation" begin
+    mktempdir() do dir
+        nonmatching = make_gz_artifact(dir, "nonmatching")
+        lazy_present = make_gz_artifact(dir, "lazy_present")
+        portable = make_gz_artifact(dir, "portable")
+        pkg = mkpath(joinpath(dir, "PorousPkg"))
+        artifacts_toml = joinpath(pkg, "Artifacts.toml")
+        write(
+            artifacts_toml, """
+            [[nonmatching]]
+            git-tree-sha1 = "$(nonmatching.hash)"
+            arch = "x86_64"
+            os = "linux"
+
+                [[nonmatching.download]]
+                url = "$(file_url(nonmatching.gz))"
+                sha256 = "$(nonmatching.sha)"
+
+            [lazy_present]
+            git-tree-sha1 = "$(lazy_present.hash)"
+            lazy = true
+
+                [[lazy_present.download]]
+                url = "$(file_url(lazy_present.gz))"
+                sha256 = "$(lazy_present.sha)"
+
+            [portable]
+            git-tree-sha1 = "$(portable.hash)"
+
+                [[portable.download]]
+                url = "$(file_url(portable.gz))"
+                sha256 = "$(portable.sha)"
+            """
+        )
+
+        bogus = Platform("bogus", "linux")
+        depot = mkpath(joinpath(dir, "depot"))
+        d = depot_stack([depot])
+
+        # With lazy entries included in selection, the platform-independent
+        # lazy and eager entries remain visible, but the eager x86_64 entry
+        # does not match the deliberately porous target.
+        selected = ArtifactOps.selected_artifacts(pkg, artifacts_toml, bogus; include_lazy = true)
+        @test Set(keys(selected)) == Set(["lazy_present", "portable"])
+        @test VibePkg.Artifacts.artifact_hash("nonmatching", artifacts_toml; platform = bogus) === nothing
+        @test VibePkg.Artifacts.artifact_hash("lazy_present", artifacts_toml; platform = bogus) == lazy_present.hash
+        @test VibePkg.Artifacts.artifact_hash("portable", artifacts_toml; platform = bogus) == portable.hash
+
+        installs = ArtifactOps.collect_artifact_installs(d, pkg; platform = bogus)
+        @test only(first.(installs)) == "portable"
+        @test all(!last(artifact_tree_path(d, hash)) for hash in (nonmatching.hash, lazy_present.hash, portable.hash))
+
+        @test ensure_artifacts_installed!(d, pkg; platform = bogus, server = nothing, io = devnull) == ["portable"]
+        @test !last(artifact_tree_path(d, nonmatching.hash))
+        @test !last(artifact_tree_path(d, lazy_present.hash))
+        portable_path, installed = artifact_tree_path(d, portable.hash)
+        @test installed
+        @test read(joinpath(portable_path, "portable.txt"), String) == "portable payload\n"
+    end
+end
+
 # source ordering + verification: a 404 first source falls through to the
 # second; sha256 and tree-hash mismatches reject the download entirely
 @testset "download fallback and rejection" begin
@@ -467,6 +532,7 @@ end
 @testset "instantiate installs artifacts" begin
     mktempdir() do dir
         art = make_gz_artifact(dir, "instart")
+        preserved = make_gz_artifact(dir, "preserved")
         pkg_uuid = Base.UUID("55555555-5555-5555-5555-555555555555")
         pkg = mkpath(joinpath(dir, "ArtPkg"))
         write(
@@ -509,12 +575,37 @@ end
         depot = mkpath(joinpath(dir, "depot"))
         d = depot_stack([depot])
         env = load_environment(envdir; depots = d)
+
+        # Instantiation installs what the environment references, but must not
+        # delete an unrelated artifact that already exists in the same depot.
+        preserved_meta = Dict{String, Any}(
+            "git-tree-sha1" => string(preserved.hash),
+            "download" => [
+                Dict{String, Any}(
+                    "url" => file_url(preserved.gz),
+                    "sha256" => preserved.sha,
+                ),
+            ],
+        )
+        preserved_path, preserved_new = ensure_artifact_installed!(
+            d, "preserved", preserved_meta; server = nothing, io = devnull,
+        )
+        @test preserved_new
+        @test read(joinpath(preserved_path, "preserved.txt"), String) == "preserved payload\n"
+        @test SHA1(tree_hash(preserved_path)) == preserved.hash
+
         withenv("JULIA_PKG_SERVER" => "") do
             instantiate!(env, RegistryInstance[], Config(d); io = devnull)
         end
         path, installed = artifact_tree_path(d, art.hash)
         @test installed
         @test read(joinpath(path, "instart.txt"), String) == "instart payload\n"
+
+        preserved_after, preserved_installed = artifact_tree_path(d, preserved.hash)
+        @test preserved_installed
+        @test preserved_after == preserved_path
+        @test read(joinpath(preserved_after, "preserved.txt"), String) == "preserved payload\n"
+        @test SHA1(tree_hash(preserved_after)) == preserved.hash
     end
 end
 
@@ -848,6 +939,44 @@ end
         @test basename(A.artifact_path(hash)) == known_hash
         @test A.artifact_exists(hash)
         @test A.verify_artifact(hash)
+    end
+end
+
+# Pkg.jl test/artifacts.jl "Artifact Creation → File permissions" (line 126):
+# created artifacts make files read-only without making directories read-only,
+# including when those modes are observed through file/directory symlinks.
+@testset "Artifact Creation file permissions" begin
+    if !Sys.iswindows()
+        A = VibePkg.Artifacts
+        nonce = Random.randstring(16)
+        hash = A.create_artifact() do dir
+            subdir = mkpath(joinpath(dir, "subdir"))
+            write(joinpath(subdir, "file1"), nonce)
+            write(joinpath(subdir, "file2"), "second file")
+            symlink("subdir", joinpath(dir, "dir_link"))
+            symlink("file1", joinpath(subdir, "file_link"))
+        end
+        artifact_dir = A.artifact_path(hash)
+        subdir = joinpath(artifact_dir, "subdir")
+        file1 = joinpath(subdir, "file1")
+        file2 = joinpath(subdir, "file2")
+        file_link = joinpath(subdir, "file_link")
+        dir_link = joinpath(artifact_dir, "dir_link")
+
+        @test islink(file_link)
+        @test iszero(filemode(file1) & 0o222)
+        @test iszero(filemode(file2) & 0o222)
+        @test iszero(filemode(file_link) & 0o222)
+
+        @test islink(dir_link)
+        @test !iszero(filemode(subdir) & 0o222)
+        @test !iszero(filemode(dir_link) & 0o222)
+        @test !iszero(filemode(subdir) & 0o111)
+        @test !iszero(filemode(dir_link) & 0o111)
+
+        # Read-only files must not require a chmod pass before tree removal.
+        Base.rm(artifact_dir; recursive = true)
+        @test !ispath(artifact_dir)
     end
 end
 

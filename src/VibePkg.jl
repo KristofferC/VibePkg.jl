@@ -63,6 +63,7 @@ const activate = API.activate
 const generate = API.generate
 const why = API.why
 const offline = API.offline
+const respect_sysimage_versions = API.respect_sysimage_versions
 const precompile = API.precompile
 const gc = API.gc
 const build = API.build
@@ -97,7 +98,7 @@ export PreserveLevel, PRESERVE_TIERED_INSTALLED, PRESERVE_TIERED, PRESERVE_ALL_I
 export Registry, Apps
 
 public gc, precompile, readonly, redo, undo, offline, dependencies, project,
-    setprotocol!, PackageInfo, ProjectInfo
+    respect_sysimage_versions, setprotocol!, PackageInfo, ProjectInfo
 
 """
     vpkg command [arguments...]

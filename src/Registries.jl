@@ -770,12 +770,19 @@ unpack_registries() = Base.get_bool_env("JULIA_PKG_UNPACK_REGISTRY", false) == t
 
 # uuid of the directory registry at `dir`, or nothing if its Registry.toml
 # is unreadable or malformed
-function directory_registry_uuid(dir::String)
+function directory_registry_identity(dir::String)
     d = TOML.tryparsefile(joinpath(dir, "Registry.toml"))
     d isa TOML.ParserError && return nothing
+    n = get(d, "name", nothing)
     u = get(d, "uuid", nothing)
-    u isa String || return nothing
-    return tryparse(UUID, u)
+    n isa String && u isa String || return nothing
+    uuid = tryparse(UUID, u)
+    uuid === nothing && return nothing
+    return (name = n, uuid)
+end
+function directory_registry_uuid(dir::String)
+    identity = directory_registry_identity(dir)
+    return identity === nothing ? nothing : identity.uuid
 end
 
 # A same-named registry with a different uuid is a conflict; the same uuid
@@ -895,16 +902,32 @@ end
     add_registry!(depots, spec; io) -> name
 
 Install one registry: `spec` is a git url, a local path, or a registry
-name known via `DEFAULT_REGISTRIES` (name adds prefer the package server
-when it advertises that registry, and fall back to a git clone).
+known via `DEFAULT_REGISTRIES`, selected by name, uuid, or `name=uuid`.
+Known-registry adds prefer the package server when it advertises that
+registry, and fall back to a git clone.
 """
 function add_registry!(depots::DepotStack, spec::String; io::IO = stderr_f())
     if occursin(r"^\w+://", spec) || occursin('@', spec) || ispath(spec)
         return add_registry_from_source!(depots, spec; io)
     end
-    idx = findfirst(reg -> reg.name == spec, DEFAULT_REGISTRIES)
+    uuid = tryparse(UUID, spec)
+    name = uuid === nothing ? spec : nothing
+    if uuid === nothing
+        equals = findfirst('=', spec)
+        if equals !== nothing
+            name = String(strip(spec[1:prevind(spec, equals)]))
+            uuid_text = String(strip(spec[nextind(spec, equals):end]))
+            uuid = tryparse(UUID, uuid_text)
+            uuid === nothing && pkgerror("`$spec` is not a valid registry specification")
+        end
+    end
+    idx = findfirst(
+        reg -> (name === nothing || reg.name == name) &&
+            (uuid === nothing || reg.uuid == uuid),
+        DEFAULT_REGISTRIES,
+    )
     idx === nothing && pkgerror(
-        "registry `$spec` is not known by name; use a url or path to add a custom registry"
+        "registry `$spec` is not known; use a url or path to add a custom registry"
     )
     known = DEFAULT_REGISTRIES[idx]
     server = Fetch.pkg_server()
@@ -1020,26 +1043,40 @@ function save_registry_update_log(depot::String, log::Dict{String, Any})
     return atomic_toml_write(file, log)
 end
 
+const RegistrySelector = NamedTuple{
+    (:name, :uuid), Tuple{Union{Nothing, String}, Union{Nothing, UUID}},
+}
+
 """
-    update_registries!(depots; names, io, update_cooldown) -> Vector{String}
+    update_registries!(depots; names, selectors, io, update_cooldown) -> Vector{String}
 
 Update registries in place: packed server-backed ones by tree-hash
 comparison, unpacked server-installed directories likewise, git-backed
-directories by fetch + fast-forward. `names` restricts the update to the
-named registries (`nothing` updates all). Registries whose entry in the
-persisted update log is more recent than `update_cooldown` are skipped
-(Pkg parity: `add` passes one day, explicit updates the ~zero default).
+directories by fetch + fast-forward. `names` is the legacy name-only filter;
+`selectors` accepts `(name, uuid)` identities, with uuid taking precedence as
+in Pkg's `RegistrySpec` matching (`nothing` for both filters updates all).
+Registries whose entry in the persisted update log is more recent than
+`update_cooldown` are skipped (Pkg parity: `add` passes one day, explicit
+updates the ~zero default).
 """
 @timeit TIMER "update registries" function update_registries!(
         depots_arg::DepotStack; io::IO = stderr_f(),
         names::Union{Nothing, Vector{String}} = nothing,
+        selectors::Union{Nothing, Vector{RegistrySelector}} = nothing,
         server::Union{Nothing, String} = Fetch.pkg_server(),
         update_cooldown::Dates.Period = Dates.Second(1),
     )
     depot = depots1(depots_arg)
     reg_dir = registries_dir(depot)
     isdir(reg_dir) || return String[]
-    wanted(name) = names === nothing || name in names
+    function wanted(name::String, uuid::Union{Nothing, UUID})
+        if selectors !== nothing
+            return any(selectors) do selector
+                selector.uuid === nothing ? selector.name == name : selector.uuid == uuid
+            end
+        end
+        return names === nothing || name in names
+    end
     updated = String[]
     update_log = read_registry_update_log(depot)
     log_dirty = Ref(false)
@@ -1074,7 +1111,6 @@ persisted update log is more recent than `update_cooldown` are skipped
     mkpidlock(joinpath(reg_dir, ".pid"), stale_age = 10) do
         # packed server-backed registries
         for stub_file in filter(endswith(".toml"), readdir(reg_dir; join = true))
-            wanted(splitext(basename(stub_file))[1]) || continue
             stub = TOML.tryparsefile(stub_file)
             stub isa TOML.ParserError && continue
             uuid_str = get(stub, "uuid", nothing)
@@ -1083,6 +1119,8 @@ persisted update log is more recent than `update_cooldown` are skipped
             uuid = tryparse(UUID, uuid_str)
             current = tryparse_sha1(hash_str)
             (uuid === nothing || current === nothing) && continue
+            name = splitext(basename(stub_file))[1]
+            wanted(name, uuid) || continue
             on_cooldown(uuid) && continue
             latest = latest_hash(uuid)
             latest === nothing && continue
@@ -1102,15 +1140,17 @@ persisted update log is more recent than `update_cooldown` are skipped
             end
         end
         for dir in filter(isdir, readdir(reg_dir; join = true))
-            wanted(basename(dir)) || continue
+            identity = directory_registry_identity(dir)
+            name = identity === nothing ? basename(dir) : identity.name
+            uuid = identity === nothing ? nothing : identity.uuid
+            wanted(name, uuid) || continue
             if ispath(joinpath(dir, ".git"))
                 # git-backed registry directories
-                uuid = directory_registry_uuid(dir)
                 uuid !== nothing && on_cooldown(uuid) && continue
                 server !== nothing && basename(dir) == "General" &&
                     warn_general_registry_format("git")
                 try
-                    update_git_registry!(dir; io) && push!(updated, basename(dir))
+                    update_git_registry!(dir; io) && push!(updated, name)
                     # Pkg parity: a successful fetch + merge stamps the log
                     # even when it was already current
                     uuid === nothing || stamp!(uuid)
@@ -1123,7 +1163,6 @@ persisted update log is more recent than `update_cooldown` are skipped
                 ti = TOML.tryparsefile(joinpath(dir, ".tree_info.toml"))
                 hash_str = ti isa TOML.ParserError ? nothing : get(ti, "git-tree-sha1", nothing)
                 current = hash_str isa String ? tryparse_sha1(hash_str) : nothing
-                uuid = directory_registry_uuid(dir)
                 if current === nothing || uuid === nothing
                     @error "Skipping registry at `$dir` during update: corrupt `.tree_info.toml` or `Registry.toml`"
                     continue

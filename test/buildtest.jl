@@ -7,17 +7,23 @@ LocalPkgServer.isolate!()
 
 using Test
 using Base: UUID, SHA1
-using VibePkg.Depots: depot_stack
+import LibGit2
+import VibePkg
+using VibePkg.Depots: depot_stack, find_installed
 using VibePkg.Configs: Config
-using VibePkg.Registries: RegistryInstance, reachable_registries
+using VibePkg.Registries: RegistryInstance, reachable_registries,
+    add_default_registries!, registry_info
 using VibePkg.Environments
-using VibePkg.Planning: plan_develop, plan_resolve
+using VibePkg.Planning: plan_add, plan_develop, plan_resolve
 using VibePkg.Execution
 using VibePkg.BuildOps
 using VibePkg.TestOps
 using VibePkg.EnvFiles: Project, Compat, with_project, read_manifest,
-    entry_path, entry_version, entry_tree_hash
+    entry_path, entry_version, entry_tree_hash, entry_repo_url,
+    is_repo_tracked
 using VibePkg.Errors: PkgError
+using VibePkg.TreeHash: tree_hash
+import TOML
 
 const BT_UUID = UUID("bbbbbbbb-1111-2222-3333-444444444444")
 const FB_UUID = UUID("facadefa-1111-2222-3333-444444444444")
@@ -31,6 +37,14 @@ const LD_UUID = UUID("babababa-1111-2222-3333-444444444444")
 const PR_UUID = UUID("dededede-1111-2222-3333-444444444444")
 const CL_UUID = UUID("acacacac-1111-2222-3333-444444444444")
 const VB_UUID = UUID("bcbcbcbc-1111-2222-3333-444444444444")
+const LW_UUID = UUID("aeaeaeae-1111-2222-3333-444444444444")
+const NF_UUID = UUID("adadadad-1111-2222-3333-444444444444")
+const TC_UUID = UUID("afafafaf-1111-2222-3333-444444444444")
+const MT_UUID = UUID("cececece-1111-2222-3333-444444444444")
+const RG_UUID = UUID("dfdfdfdf-1111-2222-3333-444444444444")
+const AI_UUID = UUID("edededed-1111-2222-3333-444444444444")
+const TH_UUID = UUID("edededed-2222-3333-4444-555555555555")
+const INSTALLED_BUILD_UUID = UUID("74736554-676b-5064-6c69-75426c696146")
 const EX_UUID = UUID("7876af07-990d-54b4-ab0e-23690620f79a")   # Example
 
 # a fresh single-depot environment with `pkg` dev'd into it
@@ -42,6 +56,68 @@ function dev_fixture(dir, pkg)
     planned = plan_develop(env, RegistryInstance[], Config(depots), pkg)
     write_environment(env, planned)
     return load_environment(envdir; depots), depots
+end
+
+# A one-package pkg server scoped to the installed-build-log test. Keeping it
+# separate from LocalPkgServer's shared General fixture prevents the extra
+# registered name from changing registry enumeration or completion tests.
+function installed_build_server(dir)
+    files = mkpath(joinpath(dir, "build-server", "files"))
+    pkg = mkpath(joinpath(dir, "build-server", "package"))
+    mkpath(joinpath(pkg, "src"))
+    mkpath(joinpath(pkg, "deps"))
+    write(
+        joinpath(pkg, "Project.toml"), """
+        name = "FailBuild"
+        uuid = "$INSTALLED_BUILD_UUID"
+        version = "0.1.0"
+        """
+    )
+    write(joinpath(pkg, "src", "FailBuild.jl"), "module FailBuild\nend\n")
+    write(
+        joinpath(pkg, "deps", "build.jl"),
+        "println(\"installed-build-log-marker\")\nerror(\"installed-build-failure\")\n",
+    )
+    package_hash = bytes2hex(tree_hash(pkg))
+    LocalPkgServer.gzip_tarball(
+        pkg, joinpath(files, "package", string(INSTALLED_BUILD_UUID), package_hash),
+    )
+
+    registry = mkpath(joinpath(dir, "build-server", "registry"))
+    write(
+        joinpath(registry, "Registry.toml"), """
+        name = "General"
+        uuid = "$(LocalPkgServer.GENERAL_UUID)"
+        repo = "https://example.invalid/General"
+
+        [packages]
+        $INSTALLED_BUILD_UUID = { name = "FailBuild", path = "F/FailBuild" }
+        """
+    )
+    reg_pkg = mkpath(joinpath(registry, "F", "FailBuild"))
+    write(
+        joinpath(reg_pkg, "Package.toml"), """
+        name = "FailBuild"
+        uuid = "$INSTALLED_BUILD_UUID"
+        repo = "https://example.invalid/FailBuild.jl"
+        """
+    )
+    write(
+        joinpath(reg_pkg, "Versions.toml"), """
+        ["0.1.0"]
+        git-tree-sha1 = "$package_hash"
+        """
+    )
+    registry_hash = bytes2hex(tree_hash(registry))
+    LocalPkgServer.gzip_tarball(
+        registry,
+        joinpath(files, "registry", LocalPkgServer.GENERAL_UUID, registry_hash),
+    )
+    write(
+        joinpath(files, "registries"),
+        "/registry/$(LocalPkgServer.GENERAL_UUID)/$registry_hash\n",
+    )
+    return LocalPkgServer.start_server(files)
 end
 
 @testset "build and test ops" begin
@@ -260,6 +336,64 @@ end
     end
 end
 
+# Pkg.jl new.jl "Build log location" — content-addressed packages are
+# immutable depot installs, so add-triggered build output belongs to Pkg's
+# tree-hash-keyed scratchspace rather than the installed package's deps/ dir.
+@testset "build: installed package log uses Pkg scratchspace" begin
+    mktempdir() do dir
+        server = installed_build_server(dir)
+        depot = mkpath(joinpath(dir, "depot"))
+        envdir = mkpath(joinpath(dir, "env"))
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            copy!(Base.DEPOT_PATH, [depot])
+            err = withenv("JULIA_PKG_SERVER" => server.url) do
+                try
+                    VibePkg.add("FailBuild"; io = devnull)
+                    nothing
+                catch e
+                    e
+                end
+            end
+            @test err isa PkgError
+            @test occursin("installed-build-log-marker", err.msg)
+
+            depots = depot_stack([depot])
+            env = load_environment(envdir; depots)
+            entry = env.manifest[INSTALLED_BUILD_UUID]
+            hash = entry_tree_hash(entry)
+            source, installed = find_installed(
+                depots, "FailBuild", INSTALLED_BUILD_UUID, hash,
+            )
+            @test installed
+            @test !isfile(joinpath(source, "deps", "build.log"))
+
+            scratch_root = joinpath(depot, "scratchspaces")
+            log_file = joinpath(
+                scratch_root, VibePkg.BuildOps.PKG_SCRATCH_UUID, string(hash), "build.log",
+            )
+            @test isfile(log_file)
+            @test occursin("installed-build-log-marker", read(log_file, String))
+            tag = joinpath(scratch_root, "CACHEDIR.TAG")
+            @test isfile(tag)
+            @test startswith(
+                read(tag, String), "Signature: 8a477f597d28d172789f06886806bc55",
+            )
+            usage_file = joinpath(depot, "logs", "scratch_usage.toml")
+            @test isfile(usage_file)
+            usage = TOML.parsefile(usage_file)
+            @test haskey(usage, dirname(log_file))
+            @test only(usage[dirname(log_file)])["parent_projects"] == [env.project_file]
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+            close(server.server)
+        end
+    end
+end
+
 # the `[sources]` alternative to workspaces: test/Project.toml declares the
 # parent package via a path source and gets its OWN test/Manifest.toml,
 # resolved independently of the package's own manifest; running the tests
@@ -469,6 +603,277 @@ end
     end
 end
 
+# Pkg.jl new.jl "test sandboxing" — an explicit test/Project.toml's
+# compatibility bounds constrain its test-only dependencies, and a test dep
+# already tracking an unregistered repository in the active graph keeps that
+# source in the temporary sandbox manifest. Both fixtures are hermetic: Example
+# comes from LocalPkgServer and RepoTestDep from a local git repository.
+@testset "test: modern test deps honor compat and preserve repo source" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        # An unregistered test dependency with a real git source.
+        repo_dep = realpath(mkpath(joinpath(dir, "RepoTestDep")))
+        mkpath(joinpath(repo_dep, "src"))
+        write(
+            joinpath(repo_dep, "Project.toml"), """
+            name = "RepoTestDep"
+            uuid = "$RG_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(
+            joinpath(repo_dep, "src", "RepoTestDep.jl"),
+            "module RepoTestDep\nanswer() = 48\nend\n",
+        )
+        repo = LibGit2.init(repo_dep)
+        LibGit2.add!(repo, ".")
+        sig = LibGit2.Signature("fixture", "fixture@localhost")
+        LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+        LibGit2.close(repo)
+
+        pkg = joinpath(dir, "ModernTestDeps")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "ModernTestDeps"
+            uuid = "$MT_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "ModernTestDeps.jl"), "module ModernTestDeps\nend\n")
+        write(
+            joinpath(pkg, "test", "Project.toml"), """
+            [deps]
+            Example = "$EX_UUID"
+            RepoTestDep = "$RG_UUID"
+            TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+
+            [compat]
+            Example = "=0.5.2"
+            RepoTestDep = "0.1"
+            """
+        )
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using Example, RepoTestDep, TOML
+            pkgversion(Example) == v"0.5.2" ||
+                error("modern test compat was ignored: loaded Example \$(pkgversion(Example))")
+            RepoTestDep.answer() == 48 || error("repo-tracked test dependency did not load")
+            manifest = TOML.parsefile(joinpath(dirname(Base.active_project()), "Manifest.toml"))
+            repo_entry = only(manifest["deps"]["RepoTestDep"])
+            get(repo_entry, "repo-url", nothing) == $(repr(repo_dep)) ||
+                error("repo source was lost in the sandbox manifest: \$repo_entry")
+            """
+        )
+
+        env, depots = dev_fixture(dir, pkg)
+        add_default_registries!(depots; io = devnull)
+        regs = reachable_registries(depots)
+        example_reg = only(filter(reg -> haskey(reg, EX_UUID), regs))
+        @test maximum(keys(registry_info(example_reg, example_reg[EX_UUID]).version_info)) == v"0.5.5"
+
+        # Put the unregistered test dep in the active graph as repo-tracked;
+        # sandbox_preserve must carry this exact source into Pkg.test.
+        repo_pkg = VibePkg.Git.materialize_repo_package!(depots, repo_dep; io = devnull)
+        planned = plan_add(env, regs, Config(depots), [repo_pkg])
+        write_environment(env, planned)
+        env = load_environment(dirname(env.project_file); depots)
+        repo_entry = env.manifest[RG_UUID]
+        @test is_repo_tracked(repo_entry)
+        @test entry_repo_url(repo_entry) == repo_dep
+
+        sandbox = TestOps.sandbox_project(pkg, "ModernTestDeps", MT_UUID, env.project)
+        @test sandbox.compat["Example"] == Compat("=0.5.2")
+        @test sandbox.compat["RepoTestDep"] == Compat("0.1")
+        test_io = IOBuffer()
+        subprocess_depots = join([joinpath(dir, "depot"); Base.DEPOT_PATH[2:end]], LocalPkgServer.DEPOT_SEP)
+        result = withenv("JULIA_DEPOT_PATH" => subprocess_depots) do
+            TestOps.test!(env, regs, Config(depots), MT_UUID; io = test_io)
+        end
+        result === nothing || error("ModernTestDeps test subprocess failed:\n" * String(take!(test_io)))
+        @test result === nothing
+    end
+end
+
+# Pkg.jl new.jl "test targets should also honor compat" — the legacy test
+# target's compat is part of the synthesized sandbox project and constrains
+# resolution of a registry-backed, test-only dependency.  The local package
+# server offers Example through 0.5.5, so loading 0.5.2 proves the constraint
+# was applied rather than merely accepting the resolver's latest version.
+@testset "test: legacy target honors compat" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        pkg = joinpath(dir, "TargetCompat")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        selected = joinpath(pkg, "test", "selected-version.txt")
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "TargetCompat"
+            uuid = "$TC_UUID"
+            version = "0.1.0"
+
+            [extras]
+            Example = "$EX_UUID"
+
+            [targets]
+            test = ["Example"]
+
+            [compat]
+            Example = "=0.5.2"
+            """
+        )
+        write(joinpath(pkg, "src", "TargetCompat.jl"), "module TargetCompat\nend\n")
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using Example
+            selected = pkgversion(Example)
+            write($(repr(selected)), string(selected))
+            selected == v"0.5.2" || error("legacy test-target compat was ignored: loaded Example \$selected")
+            """
+        )
+
+        env, depots = dev_fixture(dir, pkg)
+        add_default_registries!(depots; io = devnull)
+        regs = reachable_registries(depots)
+        example_reg = only(filter(reg -> haskey(reg, EX_UUID), regs))
+        @test maximum(keys(registry_info(example_reg, example_reg[EX_UUID]).version_info)) == v"0.5.5"
+        sandbox = TestOps.sandbox_project(pkg, "TargetCompat", TC_UUID, env.project)
+        @test sandbox.deps["Example"] == EX_UUID
+        @test sandbox.compat["Example"] == Compat("=0.5.2")
+        test_io = IOBuffer()
+        # The subprocess must search the same operation depot into which
+        # Execution.apply! installs the registry-backed test dependency.
+        subprocess_depots = join([joinpath(dir, "depot"); Base.DEPOT_PATH[2:end]], LocalPkgServer.DEPOT_SEP)
+        result = withenv("JULIA_DEPOT_PATH" => subprocess_depots) do
+            TestOps.test!(env, regs, Config(depots), TC_UUID; io = test_io)
+        end
+        result === nothing || error("TargetCompat test subprocess failed:\n" * String(take!(test_io)))
+        @test result === nothing
+        @test read(selected, String) == "0.5.2"
+    end
+end
+
+# Pkg.jl new.jl "test: fallback when no project file exists" — a package
+# with neither test/Project.toml nor legacy [extras]/[targets] still gets a
+# runnable sandbox containing the tested package and its regular dependencies.
+@testset "test: fallback without test project or targets" begin
+    mktempdir() do dir
+        pkg = joinpath(dir, "NoTargets")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "NoTargets"
+            uuid = "$NF_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "NoTargets.jl"), "module NoTargets\nanswer() = 47\nend\n")
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using NoTargets
+            NoTargets.answer() == 47 || error("fallback sandbox did not load the tested package")
+            """
+        )
+
+        env, depots = dev_fixture(dir, pkg)
+        sandbox = TestOps.sandbox_project(pkg, "NoTargets", NF_UUID, env.project)
+        @test sandbox.deps == Dict("NoTargets" => NF_UUID)
+        @test isempty(sandbox.sources)
+        @test TestOps.test!(env, RegistryInstance[], Config(depots), NF_UUID; io = devnull) === nothing
+    end
+end
+
+# Pkg.jl pkg.jl "test should instantiate" / #324 — testing an active package
+# must materialize a registry-backed dependency recorded in its manifest even
+# when the operation starts from a depot containing neither a registry nor the
+# package source. The fixture is served entirely by LocalPkgServer.
+@testset "test auto-instantiates a missing manifest source" begin
+    server = LocalPkgServer.ensure!()
+    mktempdir() do dir
+        pkg = joinpath(dir, "AutoInstantiate")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "AutoInstantiate"
+            uuid = "$AI_UUID"
+            version = "0.1.0"
+
+            [deps]
+            Example = "$EX_UUID"
+
+            [extras]
+            Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+            [targets]
+            test = ["Test"]
+            """
+        )
+        write(
+            joinpath(pkg, "src", "AutoInstantiate.jl"),
+            "module AutoInstantiate\nusing Example\nanswer() = Example.domath(37)\nend\n",
+        )
+        marker = joinpath(pkg, "test", "ran.txt")
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using AutoInstantiate, Example, Test
+            @test AutoInstantiate.answer() == 42
+            @test pkgversion(Example) == v"0.5.2"
+            write($(repr(marker)), "ok")
+            """
+        )
+        example_hash = server.version_hashes["0.5.2"]
+        write(
+            joinpath(pkg, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.Example]]
+            git-tree-sha1 = "$example_hash"
+            uuid = "$EX_UUID"
+            version = "0.5.2"
+            """
+        )
+
+        depot = realpath(mkpath(joinpath(dir, "fresh-depot")))
+        operation_depots = [depot; Base.DEPOT_PATH[2:end]]
+        _, installed_before = find_installed(
+            depot_stack([depot]), "Example", EX_UUID, SHA1(example_hash),
+        )
+        @test !installed_before
+        @test !ispath(joinpath(depot, "registries"))
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        test_io = IOBuffer()
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(pkg, "Project.toml")
+            copy!(Base.DEPOT_PATH, operation_depots)
+            withenv(
+                "JULIA_DEPOT_PATH" => join(operation_depots, LocalPkgServer.DEPOT_SEP),
+                "JULIA_PKG_SERVER" => server.url,
+            ) do
+                VibePkg.test(; io = test_io)
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+        end
+
+        output = String(take!(test_io))
+        source, installed_after = find_installed(
+            depot_stack([depot]), "Example", EX_UUID, SHA1(example_hash),
+        )
+        @test installed_after
+        @test TOML.parsefile(joinpath(source, "Project.toml"))["version"] == "0.5.2"
+        @test read(marker, String) == "ok"
+        @test occursin("AutoInstantiate tests passed", output)
+    end
+end
+
 # a single-package fixture registry (the make_test_registry pattern) where
 # Example 0.5.1's julia compat excludes the running julia
 function make_flc_registry(depot)
@@ -622,6 +1027,71 @@ end
     end
 end
 
+# Pkg.jl new.jl "test/threads" — exercise the complete boundary, not only the
+# string helper above: both JULIA_NUM_THREADS and an explicit --threads flag
+# must determine the default and interactive pools observed by runtests.jl.
+@testset "test thread pools propagate to the subprocess" begin
+    mktempdir() do dir
+        pkg = joinpath(dir, "ThreadFixture")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        marker = joinpath(pkg, "test", "observed.txt")
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "ThreadFixture"
+            uuid = "$TH_UUID"
+            version = "0.1.0"
+            """
+        )
+        write(joinpath(pkg, "src", "ThreadFixture.jl"), "module ThreadFixture\nend\n")
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using ThreadFixture
+            observed = (Threads.nthreads(:default), Threads.nthreads(:interactive))
+            expected = (
+                parse(Int, ENV["EXPECTED_NUM_THREADS_DEFAULT"]),
+                parse(Int, ENV["EXPECTED_NUM_THREADS_INTERACTIVE"]),
+            )
+            observed == expected || error("thread pools: observed=\$observed expected=\$expected")
+            write($(repr(marker)), join(observed, ','))
+            """
+        )
+        env, depots = dev_fixture(dir, pkg)
+        config = Config(depots)
+
+        function run_threads(expected::Tuple{Int, Int}; env_threads = nothing, julia_args = String[])
+            Base.rm(marker; force = true)
+            result = withenv(
+                "JULIA_NUM_THREADS" => env_threads,
+                "EXPECTED_NUM_THREADS_DEFAULT" => string(expected[1]),
+                "EXPECTED_NUM_THREADS_INTERACTIVE" => string(expected[2]),
+            ) do
+                TestOps.test!(
+                    env, RegistryInstance[], config, TH_UUID;
+                    julia_args, autoprecompile = false, io = devnull,
+                )
+            end
+            @test result === nothing
+            @test read(marker, String) == join(expected, ',')
+        end
+
+        for (spec, expected) in (
+                ("1", (1, 0)),
+                ("2", (2, 1)),
+                ("2,0", (2, 0)),
+            )
+            run_threads(expected; env_threads = spec)
+        end
+        for (spec, expected) in (
+                ("1", (1, 0)),
+                ("2", (2, 1)),
+                ("2,0", (2, 0)),
+            )
+            run_threads(expected; julia_args = ["--threads=$spec"])
+        end
+    end
+end
+
 # Pkg.jl pkg.jl "coverage specific path" — the test subprocess coverage flag
 # accepts a bare bool (tracked at the package source, or off) or a string that
 # is passed through verbatim as the --code-coverage argument (e.g. a tracefile).
@@ -744,5 +1214,61 @@ end
         @test err.msg == "Error building `VerbosePkg`"
         @test occursin("verbose-kaboom-marker", String(take!(iob)))
         @test !isfile(joinpath(pkg, "deps", "build.log"))
+    end
+end
+
+# Pkg.jl#4700 — test-sandbox precompilation runs in this process, but the
+# tests themselves run in a fresh subprocess. A stale package that is loaded
+# here therefore must not produce Base's "different version is currently
+# loaded" warning during Pkg.test precompilation.
+@testset "test precompile suppresses loaded-package warning (#4700)" begin
+    mktempdir() do dir
+        pkg = joinpath(dir, "LoadedDuringTest")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        write(
+            joinpath(pkg, "Project.toml"), """
+            name = "LoadedDuringTest"
+            uuid = "$LW_UUID"
+            version = "0.1.0"
+            """
+        )
+        source = joinpath(pkg, "src", "LoadedDuringTest.jl")
+        write(source, "module LoadedDuringTest\nvalue() = 1\nend\n")
+        write(
+            joinpath(pkg, "test", "runtests.jl"),
+            "using LoadedDuringTest\nLoadedDuringTest.value() == 3 || error(\"wrong source\")\n",
+        )
+
+        env, depots = dev_fixture(dir, pkg)
+        old_project = Base.ACTIVE_PROJECT[]
+        Base.ACTIVE_PROJECT[] = env.project_file
+        try
+            loaded = Base.require(Base.PkgId(LW_UUID, "LoadedDuringTest"))
+            @test Base.invokelatest(loaded.value) == 1
+
+            # Prove the fixture exercises Base's loaded-package warning: the
+            # ordinary precompile path emits it after the loaded source changes.
+            write(source, "module LoadedDuringTest\nvalue() = 2\nend\n")
+            control_io = IOBuffer()
+            Base.Precompilation.precompilepkgs(; warn_loaded = true, io = control_io)
+            @test occursin("currently loaded", String(take!(control_io)))
+        finally
+            Base.ACTIVE_PROJECT[] = old_project
+        end
+
+        # Make the cache stale again. TestOps precompiles this source with the
+        # loaded v1 module still in Base.loaded_modules, then a fresh subprocess
+        # loads v3 and runs the package's tests.
+        write(source, "module LoadedDuringTest\nvalue() = 3\nend\n")
+        test_io = IOBuffer()
+        result = TestOps.test!(
+            env, RegistryInstance[], Config(depots), LW_UUID;
+            autoprecompile = true, io = test_io,
+        )
+        output = String(take!(test_io))
+        @test result === nothing
+        @test !occursin("currently loaded", output)
+        @test !occursin("Restart julia", output)
     end
 end

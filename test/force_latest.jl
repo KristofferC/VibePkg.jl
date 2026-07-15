@@ -19,6 +19,20 @@ using VibePkg.Resolve: ResolverError
 const SOME_UUID = "50e11ece-0000-0000-0000-000000000001"
 const EX_UUID_STR = "7876af07-990d-54b4-ab0e-23690620f79a"
 const TEST_UUID_STR = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+const UNSATISFIABLE_REQUIREMENTS = "Unsatisfiable requirements detected for package"
+
+function test_unsatisfiable(f::Function)
+    err = try
+        f()
+        nothing
+    catch err
+        err
+    end
+    @test err isa ResolverError
+    msg = err isa Exception ? sprint(showerror, err) : ""
+    @test occursin(UNSATISFIABLE_REQUIREMENTS, msg)
+    return nothing
+end
 
 git_tree_hash(repo, rev) = LibGit2.with(LibGit2.GitRepo(repo)) do r
     LibGit2.with(LibGit2.GitObject(r, rev)) do o
@@ -139,6 +153,12 @@ end
         mktempdir() do dir
             depot = setup_flc(dir)
             pkg = make_testpkg(dir, "OldOnly1", "=0.1.0")
+            for flc in (false, true)
+                @test run_flc_test(
+                    depot, pkg;
+                    force_latest_compatible_version = flc,
+                ) === nothing
+            end
             for flc in (false, true), allow_earlier in (false, true)
                 @test run_flc_test(
                     depot, pkg;
@@ -156,17 +176,29 @@ end
         mktempdir() do dir
             depot = setup_flc(dir)
             pkg = make_testpkg(dir, "OldOnly2", "0.1")
-            @test run_flc_test(depot, pkg; force_latest_compatible_version = false) === nothing
-            @test_throws ResolverError run_flc_test(
-                depot, pkg;
-                force_latest_compatible_version = true,
-                allow_earlier_backwards_compatible_versions = false,
-            )
-            @test run_flc_test(
-                depot, pkg;
-                force_latest_compatible_version = true,
-                allow_earlier_backwards_compatible_versions = true,
-            ) === nothing
+            for flc in (false, true)
+                @test run_flc_test(
+                    depot, pkg;
+                    force_latest_compatible_version = flc,
+                ) === nothing
+            end
+            for allow_earlier in (false, true), flc in (false, true)
+                if flc && !allow_earlier
+                    test_unsatisfiable() do
+                        run_flc_test(
+                            depot, pkg;
+                            force_latest_compatible_version = flc,
+                            allow_earlier_backwards_compatible_versions = allow_earlier,
+                        )
+                    end
+                else
+                    @test run_flc_test(
+                        depot, pkg;
+                        force_latest_compatible_version = flc,
+                        allow_earlier_backwards_compatible_versions = allow_earlier,
+                    ) === nothing
+                end
+            end
         end
     end
 
@@ -176,13 +208,37 @@ end
         mktempdir() do dir
             depot = setup_flc(dir)
             pkg = make_testpkg(dir, "BothOldAndNew", "0.1, 0.2")
-            @test run_flc_test(depot, pkg; force_latest_compatible_version = false) === nothing
-            for allow_earlier in (false, true)
-                @test_throws ResolverError run_flc_test(
-                    depot, pkg;
-                    force_latest_compatible_version = true,
-                    allow_earlier_backwards_compatible_versions = allow_earlier,
-                )
+            for flc in (false, true)
+                if flc
+                    test_unsatisfiable() do
+                        run_flc_test(
+                            depot, pkg;
+                            force_latest_compatible_version = flc,
+                        )
+                    end
+                else
+                    @test run_flc_test(
+                        depot, pkg;
+                        force_latest_compatible_version = flc,
+                    ) === nothing
+                end
+            end
+            for allow_earlier in (false, true), flc in (false, true)
+                if flc
+                    test_unsatisfiable() do
+                        run_flc_test(
+                            depot, pkg;
+                            force_latest_compatible_version = flc,
+                            allow_earlier_backwards_compatible_versions = allow_earlier,
+                        )
+                    end
+                else
+                    @test run_flc_test(
+                        depot, pkg;
+                        force_latest_compatible_version = flc,
+                        allow_earlier_backwards_compatible_versions = allow_earlier,
+                    ) === nothing
+                end
             end
         end
     end
@@ -193,12 +249,22 @@ end
         mktempdir() do dir
             depot = setup_flc(dir)
             pkg = make_testpkg(dir, "NewOnly", "0.2")
+            for flc in (false, true)
+                test_unsatisfiable() do
+                    run_flc_test(
+                        depot, pkg;
+                        force_latest_compatible_version = flc,
+                    )
+                end
+            end
             for flc in (false, true), allow_earlier in (false, true)
-                @test_throws ResolverError run_flc_test(
-                    depot, pkg;
-                    force_latest_compatible_version = flc,
-                    allow_earlier_backwards_compatible_versions = allow_earlier,
-                )
+                test_unsatisfiable() do
+                    run_flc_test(
+                        depot, pkg;
+                        force_latest_compatible_version = flc,
+                        allow_earlier_backwards_compatible_versions = allow_earlier,
+                    )
+                end
             end
         end
     end

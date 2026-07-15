@@ -60,19 +60,29 @@ function rm(; name = nothing, uuid = nothing, io::IO = stderr_f())
 end
 
 """
-    update(names...; io)
+    update(specs...; io)
 
-Update installed registries (all of them, or only the named ones).
+Update installed registries (all of them, or those selected by name, uuid,
+or `name=uuid`).
 """
-function update(names::String...; io::IO = stderr_f())
+function update(specs::String...; io::IO = stderr_f())
     if API.is_offline()
         # offline mode issues no network requests at all (Pkg.jl#4579)
         printpkgstyle(io, :Offline, "skipping registry update", color = Base.info_color())
         return nothing
     end
-    Registries.update_registries!(
-        depot_stack(); names = isempty(names) ? nothing : collect(String, names), io,
-    )
+    depots = depot_stack()
+    selectors = if isempty(specs)
+        nothing
+    else
+        resolved = Registries.RegistrySelector[]
+        for spec in specs
+            name, uuid = parse_registry_spec(spec)
+            push!(resolved, (name, uuid))
+        end
+        unique(resolved)
+    end
+    Registries.update_registries!(depots; selectors, io)
     return nothing
 end
 

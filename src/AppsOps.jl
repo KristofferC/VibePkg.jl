@@ -37,6 +37,7 @@ using ..Environments
 using ..Planning
 using ..Planning: PackageRequest
 using ..Execution
+import ..Git
 using ..Utils: printpkgstyle, pathrepr
 
 export app_add, app_develop, app_rm, app_update, app_status
@@ -375,23 +376,31 @@ function app_develop(config::Config, registries::Vector{RegistryInstance}, path:
 end
 
 """
-    app_add(config, registries, request; io)
+    app_add(config, registries, target; io)
 
-Install a registered package as an app: a dedicated environment under
-`environments/apps/<Name>/` is resolved and instantiated, and shims are
-written for every app the package declares.
+Install a registered request or materialized git repository as an app: a
+dedicated environment under `environments/apps/<Name>/` is resolved and
+instantiated, and shims are written for every app the package declares.
 """
-function app_add(config::Config, registries::Vector{RegistryInstance}, request::PackageRequest; io::IO = stderr_f())
+function app_add(
+        config::Config, registries::Vector{RegistryInstance}, target::AddTarget;
+        io::IO = stderr_f(),
+    )
     d = config.depots
     return app_lock(d) do
         migrate_shims!(d; io)
-        # resolve the request up-front (against an empty environment, so
-        # purely from registries/stdlibs): the environment directory and the
-        # shim load path must use the same name, also for uuid-only requests
-        name, uuid = Planning.resolve_request(
-            Environments.load_environment_from(joinpath(apps_dir(d), "Project.toml"); depots = d),
-            registries, request,
-        )
+        # Resolve registry requests up-front (against an empty environment, so
+        # purely from registries/stdlibs). A materialized repo already carries
+        # its verified identity. In both cases the environment directory and
+        # shim load path use the resolved package name.
+        name, uuid = if target isa PackageRequest
+            Planning.resolve_request(
+                Environments.load_environment_from(joinpath(apps_dir(d), "Project.toml"); depots = d),
+                registries, target,
+            )
+        else
+            (target.name, target.uuid)
+        end
         # Build the per-package environment off to the side. A failed resolve,
         # download, or metadata check must leave the currently installed app
         # runnable.
@@ -400,7 +409,7 @@ function app_add(config::Config, registries::Vector{RegistryInstance}, request::
         # destructuring (a shared binding assigned in both scopes would box)
         entry, apps = mktempdir(apps_dir(d); prefix = ".install-") do staging
             env = Environments.load_environment_from(joinpath(staging, "Project.toml"); depots = d)
-            planned = plan_add(env, registries, config, [request])
+            planned = plan_add(env, registries, config, AddTarget[target])
             result = Execution.apply!(env, planned, registries, config; io)
             ent = result.env.manifest[uuid]
             source = Execution.entry_source_path(result.env.manifest_file, ent, d)
@@ -467,9 +476,10 @@ end
     app_update(config, registries, [name]; io)
 
 Update installed apps: registry-tracked app packages are reinstalled at
-their latest resolvable version, path-tracked ones re-resolve in place;
-shims are rewritten either way. `name` (a package or app name) restricts
-the update; with no name every installed app updates.
+their latest resolvable version, repo-tracked ones fetch and reinstall their
+recorded revision, and path-tracked ones re-resolve in place. Shims are
+rewritten either way. `name` (a package or app name) restricts the update;
+with no name every installed app updates.
 """
 function app_update(
         config::Config, registries::Vector{RegistryInstance},
@@ -494,6 +504,13 @@ function app_update(
         path = entry_path(entry)
         if path !== nothing
             app_develop(config, registries, path; io)
+        elseif is_repo_tracked(entry)
+            repo = Git.materialize_repo_package!(
+                d, entry_repo_url(entry);
+                rev = entry_repo_rev(entry), subdir = entry_repo_subdir(entry),
+                refresh = true, io,
+            )
+            app_add(config, registries, repo; io)
         else
             app_add(config, registries, PackageRequest(entry.name, entry.uuid, nothing); io)
         end
