@@ -17,6 +17,7 @@ using VibePkg.REPLMode: parse_package_word
 using VibePkg: PackageSpec
 using VibePkg.Planning: UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR
 using VibePkg.Errors: PkgError
+using VibePkg.Utils: expanduser_path
 
 @testset "REPLMode" begin
     REPLMode.TEST_MODE[] = true
@@ -122,7 +123,7 @@ using VibePkg.Errors: PkgError
 
         # Pkg.jl#1435 — `~` expands to the home directory in path words
         api, args, _ = capture("dev ~/SomePkg")
-        @test args[1] == [PackageSpec(; path = expanduser("~/SomePkg"))]
+        @test args[1] == [PackageSpec(; path = expanduser_path("~/SomePkg"))]
 
         # options map to kwargs; short forms work
         api, args, opts = capture("rm --manifest Foo")

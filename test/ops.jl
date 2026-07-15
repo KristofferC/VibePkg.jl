@@ -1092,10 +1092,7 @@ end
             @test err isa PkgError
             @test occursin("expected at path", err.msg)
             @test occursin("referenced by manifest", err.msg)
-            @test any(
-                path -> occursin(path, err.msg),
-                (env.manifest_file, realpath(env.manifest_file)),
-            )
+            @test occursin(repr(env.manifest_file), err.msg)
         end
     end
 end
