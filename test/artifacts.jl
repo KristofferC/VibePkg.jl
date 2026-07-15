@@ -973,18 +973,21 @@ end
         d = depot_stack([dirname(depot1), dirname(depot2), dirname(depot3)])
         ov = ArtifactOps.load_overrides(d)
 
-        # hash-form: innermost depot's path override wins
-        @test ArtifactOps.override_for(ov, nothing, "x", foo) == path_b
+        # hash-form: innermost depot's path override wins. `override_for` returns
+        # the path exactly as written in Overrides.toml (forward-slashed by
+        # `toml_path`), so compare against that form rather than the native
+        # backslash `path_b`/`path_a` (a no-op off Windows)
+        @test ArtifactOps.override_for(ov, nothing, "x", foo) == toml_path(path_b)
         # clearing ("") in the innermost depot removes the outer depot's override
         @test ArtifactOps.override_for(ov, nothing, "x", baz) === nothing
         # a hash used only as an override *target* is not itself overridden
         @test ArtifactOps.override_for(ov, nothing, "x", bar) === nothing
         # name-based (uuid.name): innermost depot wins for `arty`
-        @test ArtifactOps.override_for(ov, aol_uuid, "arty", SHA1("0"^40)) == path_b
+        @test ArtifactOps.override_for(ov, aol_uuid, "arty", SHA1("0"^40)) == toml_path(path_b)
         # `barty` exists only in the outer depot
-        @test ArtifactOps.override_for(ov, aol_uuid, "barty", SHA1("0"^40)) == path_a
+        @test ArtifactOps.override_for(ov, aol_uuid, "barty", SHA1("0"^40)) == toml_path(path_a)
         # a uuid override does not apply to a different uuid
-        @test ArtifactOps.override_for(ov, Base.UUID("0"^8 * "-0000-0000-0000-" * "0"^12), "arty", foo) == path_b
+        @test ArtifactOps.override_for(ov, Base.UUID("0"^8 * "-0000-0000-0000-" * "0"^12), "arty", foo) == toml_path(path_b)
 
         # invalid Overrides.toml entry: a non-UUID key with a table value is
         # skipped with a warning (VibePkg divergence: it does NOT @error on the

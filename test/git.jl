@@ -30,6 +30,12 @@ using VibePkg.EnvFiles: entry_version, entry_repo_url, entry_repo_rev,
 # IO; tests run it against devnull
 quiet(f) = Base.ScopedValues.with(f, DEFAULT_IO => devnull)
 
+# embed a native filesystem path in a hand-written TOML basic string: a Windows
+# path's backslash separators (and any quotes) must be escaped so the parsed
+# value round-trips to the exact string (`\Users` would otherwise be read as an
+# invalid `\U` unicode escape)
+toml_str(s::AbstractString) = replace(s, '\\' => "\\\\", '"' => "\\\"")
+
 if !@isdefined(make_test_registry)
     include("testhelpers.jl")
 end
@@ -972,7 +978,7 @@ end
             LocalPkg = "$LOCAL_UUID"
 
             [sources]
-            Example = {url = "$src", rev = "$commit"}
+            Example = {url = "$(toml_str(src))", rev = "$commit"}
             LocalPkg = {path = "LocalPkg"}
             """
         )
@@ -1069,7 +1075,7 @@ const SIB_UUID = UUID("aa444444-4444-4444-4444-444444444444")
             SiblingPkg = "$SIB_UUID"
 
             [sources]
-            GrandchildPkg = {url = "$grand"}
+            GrandchildPkg = {url = "$(toml_str(grand))"}
             SiblingPkg = {path = "SiblingPkg"}
             """
         )
@@ -1089,7 +1095,7 @@ const SIB_UUID = UUID("aa444444-4444-4444-4444-444444444444")
             ChildPkg = "$CHILD_UUID"
 
             [sources]
-            ChildPkg = {url = "$child"}
+            ChildPkg = {url = "$(toml_str(child))"}
             """
         )
         write(joinpath(parent, "src", "ParentPkg.jl"), "module ParentPkg\nusing ChildPkg\nend\n")
