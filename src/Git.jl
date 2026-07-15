@@ -429,9 +429,9 @@ function install_tree_from_git!(
             end
             tree isa LibGit2.GitTree ||
                 pkgerror(
-                    "Expected revision $(string(hash)) for package $name [$uuid] to be a tree, " *
-                        "but found $(typeof(tree))"
-                )
+                "Expected revision $(string(hash)) for package $name [$uuid] to be a tree, " *
+                    "but found $(typeof(tree))"
+            )
             # stage the checkout in the depot's temp area (same filesystem) and
             # move it into place atomically: checking out into `version_path`
             # directly would leave an interrupted checkout to be accepted as a

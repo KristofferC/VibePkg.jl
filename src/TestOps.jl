@@ -43,6 +43,16 @@ import ..Resolve
 using ..Execution
 using ..Execution: entry_source_path
 import ..BuildOps
+
+# `Base.julia_cmd()` normally propagates the parent's coverage selector. Test
+# operations always supply their own `--code-coverage` value, so retaining an
+# inherited selector would give nested test runs two conflicting filters (for
+# example CI's `@repo` followed by a requested tracefile). Preserve every
+# other propagated Julia flag and install coverage exactly once below.
+function test_julia_cmd()
+    cmd = Base.julia_cmd()
+    return Cmd(filter(arg -> !startswith(arg, "--code-coverage"), cmd.exec))
+end
 using ..Utils: printpkgstyle
 
 export test!
@@ -231,7 +241,7 @@ requested packages before erroring with the collected failures).
         # packed-UInt8 form (`parse(CacheFlags, ...)` needs julia 1.13);
         # `--startup-file=no` last keeps the probe's output clean and does
         # not affect any cache flag.
-        probe = `$(Base.julia_cmd()) $flags --startup-file=no --eval 'print(Base._cacheflag_to_uint8(Base.CacheFlags()))'`
+        probe = `$(test_julia_cmd()) $flags --startup-file=no --eval 'print(Base._cacheflag_to_uint8(Base.CacheFlags()))'`
         cacheflags = Base.CacheFlags(parse(UInt8, read(probe, String)))
         old_project = Base.ACTIVE_PROJECT[]
         Base.ACTIVE_PROJECT[] = project_dir
@@ -246,7 +256,7 @@ requested packages before erroring with the collected failures).
     end
     sep = Sys.iswindows() ? ';' : ':'
     cmd = addenv(
-        `$(Base.julia_cmd()) --threads=$(test_threads_spec()) $flags $runtests $test_args`,
+        `$(test_julia_cmd()) --threads=$(test_threads_spec()) $flags $runtests $test_args`,
         "JULIA_LOAD_PATH" => "@$(sep)$(project_dir)",
         "JULIA_PROJECT" => nothing,
     )

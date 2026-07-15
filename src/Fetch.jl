@@ -271,9 +271,11 @@ function download(
         _download(url, dest, headers; io, progress_header, show_progress)
     catch err
         if err isa Downloads.RequestError
-            throw(Downloads.RequestError(
-                sanitize_url(err.url), err.code, sanitize_url(err.message), err.response,
-            ))
+            throw(
+                Downloads.RequestError(
+                    sanitize_url(err.url), err.code, sanitize_url(err.message), err.response,
+                )
+            )
         end
         rethrow()
     end

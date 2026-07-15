@@ -1084,7 +1084,7 @@ end
             end
             @test err isa PkgError
             @test occursin(string(bogus), err.msg)
-        @test occursin("declares uuid", lowercase(err.msg))
+            @test occursin("declares uuid", lowercase(err.msg))
             # nothing was installed
             @test !isfile(joinpath(depot, "registries", "General.toml"))
             @test !isfile(joinpath(depot, "registries", "General.tar.gz"))

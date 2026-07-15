@@ -97,10 +97,10 @@ function undo_redo_target(env::Environment, direction::Int)
     target_idx = state.idx + direction
     1 <= target_idx <= length(state.entries) ||
         pkgerror(
-            direction < 0 ?
-                "No more undo information is available for project $(repr(env.project_file))" :
-                "No more redo information is available for project $(repr(env.project_file))"
-        )
+        direction < 0 ?
+            "No more undo information is available for project $(repr(env.project_file))" :
+            "No more redo information is available for project $(repr(env.project_file))"
+    )
     return state, target_idx, state.entries[target_idx]
 end
 
