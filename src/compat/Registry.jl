@@ -1,8 +1,9 @@
 # Pkg.Registry-compatible namespace
 module Registry
 using Base: UUID
+using Dates: Dates
 
-using ..Depots: depot_stack
+using ..Depots: DepotStack, depot_stack
 using ..Utils: stderr_f
 using ..Errors: pkgerror
 using ..Display: printpkgstyle
@@ -18,10 +19,17 @@ Install registries. The no-argument form installs everything the package
 server advertises (or git clones of the known default registries when no
 package server is configured).
 """
-add(; io::IO = stderr_f()) = (Registries.add_default_registries!(depot_stack(); io); nothing)
-function add(specs::String...; io::IO = stderr_f())
+registry_depot_stack(::Nothing) = depot_stack()
+registry_depot_stack(depots::DepotStack) = depots
+registry_depot_stack(depot::AbstractString) = depot_stack([String(depot)])
+registry_depot_stack(depots::AbstractVector{<:AbstractString}) = depot_stack(String.(depots))
+
+add(; io::IO = stderr_f(), depots = nothing) =
+    (Registries.add_default_registries!(registry_depot_stack(depots); io); nothing)
+function add(specs::String...; io::IO = stderr_f(), depots = nothing)
+    stack = registry_depot_stack(depots)
     for spec in specs
-        Registries.add_registry!(depot_stack(), spec; io)
+        Registries.add_registry!(stack, spec; io)
     end
     return nothing
 end
@@ -65,13 +73,16 @@ end
 Update installed registries (all of them, or those selected by name, uuid,
 or `name=uuid`).
 """
-function update(specs::String...; io::IO = stderr_f())
+function update(
+        specs::String...; io::IO = stderr_f(), depots = nothing,
+        update_cooldown::Dates.Period = Dates.Second(1),
+    )
     if API.is_offline()
         # offline mode issues no network requests at all (Pkg.jl#4579)
         printpkgstyle(io, :Offline, "skipping registry update", color = Base.info_color())
         return nothing
     end
-    depots = depot_stack()
+    stack = registry_depot_stack(depots)
     selectors = if isempty(specs)
         nothing
     else
@@ -82,7 +93,19 @@ function update(specs::String...; io::IO = stderr_f())
         end
         unique(resolved)
     end
-    Registries.update_registries!(depots; selectors, io)
+    # Pkg's explicit Registry.update reports the physical registry path. Keep
+    # this at the public facade so automatic background updates remain quiet.
+    for reg in Registries.reachable_registries(stack)
+        selected = selectors === nothing || any(selectors) do selector
+            selector.uuid === nothing ?
+                selector.name == Registries.registry_name(reg) :
+                selector.uuid == Registries.registry_uuid(reg)
+        end
+        selected || continue
+        printstyled(io, lpad("Updating", 12); color = :green, bold = true)
+        println(io, " registry at `$(Base.contractuser(reg.path))`")
+    end
+    Registries.update_registries!(stack; selectors, io, update_cooldown)
     return nothing
 end
 

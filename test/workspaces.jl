@@ -15,9 +15,9 @@ using Base: UUID
 using VibePkg.Depots: depot_stack
 using VibePkg.Registries: reachable_registries
 using VibePkg.Environments
-using VibePkg.Planning: plan_resolve, plan_up, UPLEVEL_FIXED
+using VibePkg.Planning: plan_resolve, plan_up
 using VibePkg.Display: print_status
-using VibePkg.EnvFiles: entry_version, is_path_tracked, entry_path, read_project
+using VibePkg.EnvFiles: entry_version, is_path_tracked, entry_path, read_project, read_manifest
 using VibePkg.Errors: PkgError
 import VibePkg.Execution
 
@@ -189,12 +189,12 @@ end
         regs = reachable_registries(depots)
         env = load_environment(root; depots)
 
-        # fixed-level whole-env up: without workspace the member's dep is
-        # not seeded and floats; with workspace it is seeded and held
-        up_plain = plan_up(env, regs, Config(depots); level = UPLEVEL_FIXED)
-        @test entry_version(up_plain.manifest[EXAMPLE_UUID]) == v"0.5.1"
-        up_ws = plan_up(env, regs, Config(depots); level = UPLEVEL_FIXED, workspace = true)
-        @test entry_version(up_ws.manifest[EXAMPLE_UUID]) == v"0.5.0"
+        # A plain update leaves the member-only dependency untouched;
+        # workspace=true widens the update target and moves it to 0.5.1.
+        up_plain = plan_up(env, regs, Config(depots))
+        @test entry_version(up_plain.manifest[EXAMPLE_UUID]) == v"0.5.0"
+        up_ws = plan_up(env, regs, Config(depots); workspace = true)
+        @test entry_version(up_ws.manifest[EXAMPLE_UUID]) == v"0.5.1"
     end
 
     # instantiate --workspace: a member dep missing from the manifest only
@@ -457,23 +457,46 @@ end
     ROOT = UUID("aaaa0000-0000-0000-0000-000000000001")
     mktempdir() do dir
         depot = mkpath(joinpath(dir, "depot"))
-        make_test_registry(depot)
-        depots = depot_stack([depot])
-        regs = reachable_registries(depots)
 
         root = mkpath(joinpath(dir, "RootPkg"))
         mkpath(joinpath(root, "src"))
-        write(joinpath(root, "Project.toml"), "name = \"RootPkg\"\nuuid = \"$ROOT\"\nversion = \"0.1.0\"\n")
+        write(
+            joinpath(root, "Project.toml"),
+            "name = \"RootPkg\"\nuuid = \"$ROOT\"\nversion = \"0.1.0\"\n\n" *
+                "[workspace]\nprojects = [\"docs\"]\n",
+        )
         write(joinpath(root, "src", "RootPkg.jl"), "module RootPkg end\n")
 
         docs = mkpath(joinpath(root, "docs"))
         write(joinpath(docs, "Project.toml"), "[deps]\nRootPkg = \"$ROOT\"\n\n[sources]\nRootPkg = {path=\"..\"}\n")
 
-        env = load_environment(docs; depots)
-        planned = plan_resolve(env, regs, Config(depots))     # must not AssertionError
-        @test is_path_tracked(planned.manifest[ROOT])
-        @test entry_path(planned.manifest[ROOT]) == ".."
-        write_environment(env, planned)
+        manifest_file = joinpath(root, "Manifest.toml")
+        @test !isfile(manifest_file)
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_offline = VibePkg.API.OFFLINE_MODE[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        stack = [depot; Base.append_bundled_depot_path!(String[])]
+        sep = Sys.iswindows() ? ';' : ':'
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(docs, "Project.toml")
+            copy!(Base.DEPOT_PATH, stack)
+            VibePkg.API.OFFLINE_MODE[] = true
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            withenv("JULIA_DEPOT_PATH" => join(stack, sep), "JULIA_PKG_OFFLINE" => "true") do
+                VibePkg.instantiate(; io = devnull)            # must not AssertionError
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+            VibePkg.API.OFFLINE_MODE[] = old_offline
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+        @test isfile(manifest_file)
+        resolved = read_manifest(manifest_file)
+        # Project [sources] is docs-relative (`..`), while manifest paths are
+        # relative to the shared workspace root (`.`).
+        @test entry_path(resolved[ROOT]) == "."
         # the child's [sources] path stays project-relative, not rewritten to "."
         @test only(values(read_project(joinpath(docs, "Project.toml")).sources)).path == ".."
     end
@@ -706,6 +729,147 @@ end
         finally
             Base.ACTIVE_PROJECT[] = old_active
             copy!(Base.DEPOT_PATH, old_depots)
+        end
+    end
+end
+
+# The public half of Pkg.jl's top-level monorepo workspace scenario: a member
+# has its own nested test workspace, a member-only registry dependency updates
+# only with workspace=true, every environment loads in a fresh subprocess, and
+# both root/member tests run through VibePkg.test against the one root manifest.
+@testset "public nested workspace update, loading, and test" begin
+    LocalPkgServer.ensure!()
+    ROOT_UUID = UUID("12121212-1212-4212-8212-121212121212")
+    PRIVATE_UUID = UUID("34343434-3434-4434-8434-343434343434")
+    TEST_UUID = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+    mktempdir() do dir
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        VibePkg.Registries.add_default_registries!(depots; io = devnull)
+
+        root = mkpath(joinpath(dir, "MonoRoot"))
+        mkpath(joinpath(root, "src"))
+        write(
+            joinpath(root, "Project.toml"), """
+            name = "MonoRoot"
+            uuid = "$ROOT_UUID"
+            version = "0.1.0"
+
+            [workspace]
+            projects = ["PrivatePackage", "test"]
+
+            [deps]
+            PrivatePackage = "$PRIVATE_UUID"
+            """
+        )
+        write(
+            joinpath(root, "src", "MonoRoot.jl"),
+            "module MonoRoot\nusing PrivatePackage\nloaded() = PrivatePackage.loaded()\nend\n",
+        )
+
+        private = mkpath(joinpath(root, "PrivatePackage"))
+        mkpath(joinpath(private, "src"))
+        write(
+            joinpath(private, "Project.toml"), """
+            name = "PrivatePackage"
+            uuid = "$PRIVATE_UUID"
+            version = "0.1.0"
+
+            [workspace]
+            projects = ["test"]
+
+            [deps]
+            Example = "$EXAMPLE_UUID"
+
+            [compat]
+            Example = "=0.5.0"
+            """
+        )
+        write(
+            joinpath(private, "src", "PrivatePackage.jl"),
+            "module PrivatePackage\nusing Example\nloaded() = nameof(Example) == :Example\nend\n",
+        )
+
+        root_test = mkpath(joinpath(root, "test"))
+        write(
+            joinpath(root_test, "Project.toml"),
+            "[deps]\nMonoRoot = \"$ROOT_UUID\"\nTest = \"$TEST_UUID\"\n",
+        )
+        write(
+            joinpath(root_test, "runtests.jl"),
+            "using Test, MonoRoot\n@test MonoRoot.loaded()\n",
+        )
+        private_test = mkpath(joinpath(private, "test"))
+        write(
+            joinpath(private_test, "Project.toml"),
+            "[deps]\nPrivatePackage = \"$PRIVATE_UUID\"\nTest = \"$TEST_UUID\"\n",
+        )
+        write(
+            joinpath(private_test, "runtests.jl"),
+            "using Test, PrivatePackage\n@test PrivatePackage.loaded()\n",
+        )
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        stack = [depot; Base.append_bundled_depot_path!(String[])]
+        sep = Sys.iswindows() ? ';' : ':'
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(root, "Project.toml")
+            copy!(Base.DEPOT_PATH, stack)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            withenv("JULIA_DEPOT_PATH" => join(stack, sep)) do
+                VibePkg.resolve(; io = devnull)
+                manifest_file = joinpath(root, "Manifest.toml")
+                @test entry_version(VibePkg.EnvFiles.read_manifest(manifest_file)[EXAMPLE_UUID]) ==
+                    v"0.5.0"
+                @test !isfile(joinpath(private, "Manifest.toml"))
+                @test !isfile(joinpath(root_test, "Manifest.toml"))
+                @test !isfile(joinpath(private_test, "Manifest.toml"))
+
+                # Loosen only the member's compat. A root-scoped update holds
+                # the member-only dependency; the workspace update bumps it.
+                private_project = joinpath(private, "Project.toml")
+                write(
+                    private_project,
+                    replace(read(private_project, String), "Example = \"=0.5.0\"" => "Example = \"0.5\""),
+                )
+                VibePkg.up(; io = devnull)
+                @test entry_version(VibePkg.EnvFiles.read_manifest(manifest_file)[EXAMPLE_UUID]) ==
+                    v"0.5.0"
+                VibePkg.up(; workspace = true, io = devnull)
+                @test entry_version(VibePkg.EnvFiles.read_manifest(manifest_file)[EXAMPLE_UUID]) >
+                    v"0.5.0"
+
+                # Public test discovers both the root test member and the
+                # member's nested test member; neither receives a manifest.
+                @test VibePkg.test(; io = devnull) === nothing
+                Base.ACTIVE_PROJECT[] = joinpath(private, "Project.toml")
+                @test VibePkg.test(; io = devnull) === nothing
+                @test !isfile(joinpath(root_test, "Manifest.toml"))
+                @test !isfile(joinpath(private_test, "Manifest.toml"))
+
+                # Fresh Julia processes can load the root, member, and nested
+                # test environments from the same shared root manifest.
+                julia = Base.julia_cmd()
+                commands = [
+                    `$julia --startup-file=no --project=$root -e 'using MonoRoot; @assert MonoRoot.loaded()'`,
+                    `$julia --startup-file=no --project=$private -e 'using PrivatePackage; @assert PrivatePackage.loaded()'`,
+                    `$julia --startup-file=no --project=$private_test $(joinpath(private_test, "runtests.jl"))`,
+                ]
+                for cmd in commands
+                    proc = run(pipeline(ignorestatus(cmd); stdout = devnull, stderr = devnull))
+                    @test success(proc)
+                end
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
         end
     end
 end

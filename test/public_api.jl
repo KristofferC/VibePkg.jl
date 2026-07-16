@@ -33,6 +33,7 @@ if !@isdefined(make_test_registry)
 end
 
 const VIBEPKG_UUID = UUID("3f0b6c73-7bb3-486f-8fc9-2db233a17ba0")
+const PKG_STDLIB_UUID = UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f")
 
 # run `f` with the fixture registry active, a fresh depot, and `dir`'s
 # project activated — the pattern every API-level check here needs
@@ -52,6 +53,130 @@ function with_api_env(f, dir)
         Base.ACTIVE_PROJECT[] = old_active
         copy!(Base.DEPOT_PATH, old_depot_path)
         VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+    end
+end
+
+@testset "fixed stdlib add version validation (Pkg.jl#4335)" begin
+    current = VibePkg.Stdlibs.stdlib_version(PKG_STDLIB_UUID, VERSION)
+    @test current isa VersionNumber
+    wrong = VersionNumber(current.major, current.minor + 1, 0)
+    expected =
+        "Cannot add stdlib `Pkg` with version specification `$wrong`.\n" *
+        "The current Julia version v$(VERSION) uses `Pkg` v$current."
+
+    mktempdir() do dir
+        with_api_env(dir) do _, _
+            old_auto = API.AUTO_PRECOMPILE_ENABLED[]
+            try
+                API.AUTO_PRECOMPILE_ENABLED[] = false
+                for requested in (
+                        wrong,
+                        VibePkg.Versions.VersionSpec(wrong),
+                        string(wrong),
+                    )
+                    err = try
+                        VibePkg.add(
+                            VibePkg.PackageSpec(
+                                name = "Pkg", uuid = PKG_STDLIB_UUID,
+                                version = requested,
+                            ); io = devnull,
+                        )
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa PkgError
+                    @test err.msg == expected
+                end
+
+                # Correct exact (all public version forms), containing range,
+                # and unspecified requests keep their existing behavior.
+                for requested in (
+                        current,
+                        VibePkg.Versions.VersionSpec(current),
+                        string(current),
+                        VibePkg.Versions.VersionSpec("*"),
+                    )
+                    @test VibePkg.add(
+                        VibePkg.PackageSpec(
+                            name = "Pkg", uuid = PKG_STDLIB_UUID,
+                            version = requested,
+                        ); io = devnull,
+                    ) === nothing
+                end
+                @test VibePkg.add(
+                    VibePkg.PackageSpec(name = "Pkg", uuid = PKG_STDLIB_UUID);
+                    io = devnull,
+                ) === nothing
+
+                # The same mismatch must still fail after Pkg is already in
+                # the manifest (the add-promotion fast path may not mask it).
+                @test_throws PkgError VibePkg.add(
+                    VibePkg.PackageSpec(
+                        name = "Pkg", uuid = PKG_STDLIB_UUID, version = wrong,
+                    ); io = devnull,
+                )
+            finally
+                API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            end
+        end
+    end
+end
+
+@testset "add stdlib identity forms and bootstrap a missing default depot" begin
+    markdown = only(
+        info for info in values(VibePkg.Stdlibs.stdlib_infos()) if info.name == "Markdown"
+    )
+    profile = only(
+        info for info in values(VibePkg.Stdlibs.stdlib_infos()) if info.name == "Profile"
+    )
+    mktempdir() do dir
+        with_api_env(dir) do _, _
+            old_auto = API.AUTO_PRECOMPILE_ENABLED[]
+            try
+                API.AUTO_PRECOMPILE_ENABLED[] = false
+                @test VibePkg.add("Markdown"; io = devnull) === nothing
+                @test VibePkg.dependencies()[markdown.uuid].name == "Markdown"
+                @test VibePkg.add(
+                    VibePkg.PackageSpec(; uuid = profile.uuid); io = devnull,
+                ) === nothing
+                @test VibePkg.dependencies()[profile.uuid].name == "Profile"
+                @test VibePkg.add(
+                    VibePkg.PackageSpec(; name = "Markdown", uuid = markdown.uuid);
+                    io = devnull,
+                ) === nothing
+            finally
+                API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            end
+        end
+    end
+
+    mktempdir() do parent
+        missing_depot = joinpath(parent, "not-created-yet")
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_load_path = copy(Base.LOAD_PATH)
+        old_gate = API.UPDATED_REGISTRY_THIS_SESSION[]
+        old_auto = API.AUTO_PRECOMPILE_ENABLED[]
+        try
+            Base.ACTIVE_PROJECT[] = nothing
+            copy!(Base.DEPOT_PATH, [missing_depot; Base.append_bundled_depot_path!(String[])])
+            copy!(Base.LOAD_PATH, ["@v#.#", "@stdlib"])
+            API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            API.AUTO_PRECOMPILE_ENABLED[] = false
+            @test !ispath(missing_depot)
+            @test VibePkg.add("Markdown"; io = devnull) === nothing
+            project_path = VibePkg.project().path
+            @test isfile(project_path)
+            @test dirname(dirname(project_path)) ==
+                realpath(joinpath(missing_depot, "environments"))
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+            copy!(Base.LOAD_PATH, old_load_path)
+            API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+            API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
     end
 end
 
@@ -295,6 +420,7 @@ end
         pkg = mkpath(joinpath(dir, "ReresolvePkg"))
         mkpath(joinpath(pkg, "src"))
         mkpath(joinpath(pkg, "test"))
+        mkpath(joinpath(pkg, "deps"))
         pkg_uuid = UUID("cccccccc-1111-2222-3333-444444444444")
 
         write(
@@ -325,6 +451,12 @@ end
             using Test, ReresolvePkg
             @test ReresolvePkg.example_version() == v"0.5.0"
             """
+        )
+        write(
+            joinpath(pkg, "deps", "build.jl"), """
+            import Example
+            write(joinpath(@__DIR__, "build-version.txt"), string(Base.pkgversion(Example)))
+            """,
         )
 
         # A tiny registry whose package trees are served by LocalPkgServer.
@@ -390,6 +522,21 @@ end
             # The child must use the same fresh depot into which this API call
             # installs the recovered package source.
             withenv("JULIA_DEPOT_PATH" => depot) do
+                # Build uses the same sandbox contract as test: exact resolve
+                # exposes the yanked manifest entry, while the allowed fallback
+                # installs and loads the surviving version for deps/build.jl.
+                @test_throws VibePkg.Resolve.ResolverError VibePkg.build(
+                    "ReresolvePkg"; allow_reresolve = false, io = devnull,
+                )
+                build_output = IOBuffer()
+                VibePkg.build(
+                    "ReresolvePkg"; allow_reresolve = true, io = build_output,
+                )
+                build_text = String(take!(build_output))
+                @test occursin("Could not use exact versions", build_text)
+                @test occursin("Successfully re-resolved", build_text)
+                @test read(joinpath(pkg, "deps", "build-version.txt"), String) == "0.5.0"
+
                 # Preserve-exact must expose the broken checked-in manifest when
                 # fallback is forbidden.
                 @test_throws VibePkg.Resolve.ResolverError VibePkg.test(
@@ -450,16 +597,40 @@ end
             VibePkg.precompile("PrecompPkg"; io = devnull)                     # positional form
             VibePkg.precompile(PackageSpec(name = "PrecompPkg"); io = devnull) # spec form
 
-            # Pkg.jl api.jl "delayed precompilation with do-syntax" — auto-
-            # precompilation is deferred while the do-block runs, then restored,
-            # so batched manifest changes precompile once at block end.
-            @test VibePkg.API.AUTO_PRECOMPILE_ENABLED[]           # enabled to start
-            observed = Ref(true)
-            VibePkg.precompile(io = devnull) do
-                observed[] = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            # Pkg.jl api.jl "delayed precompilation with do-syntax": real
+            # add/rm/add mutations must not precompile individually. One pass
+            # happens at block exit, and the next manual pass is a no-op.
+            repo = LibGit2.init(pkg)
+            sig = LibGit2.Signature("fixture", "fixture@localhost")
+            LibGit2.add!(repo, ".")
+            LibGit2.commit(repo, "initial"; author = sig, committer = sig)
+            head = LibGit2.head(repo)
+            branch = try
+                LibGit2.shortname(head)
+            finally
+                close(head)
             end
-            @test observed[] == false                             # deferred inside
-            @test VibePkg.API.AUTO_PRECOMPILE_ENABLED[]           # restored after
+            close(repo)
+            spec = PackageSpec(; path = pkg, rev = branch)
+            cache = joinpath(
+                depot, "compiled", "v$(VERSION.major).$(VERSION.minor)", "PrecompPkg",
+            )
+            batchio = IOBuffer()
+            @test VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            observed = Ref(true)
+            VibePkg.precompile(io = batchio) do
+                observed[] = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+                VibePkg.rm("PrecompPkg"; io = batchio)
+                VibePkg.add(spec; io = batchio)
+                VibePkg.rm("PrecompPkg"; io = batchio)
+                Base.rm(cache; force = true, recursive = true)
+                VibePkg.add(spec; io = batchio)
+            end
+            @test !observed[]
+            @test VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+            @test count(r"Precompiling", String(take!(batchio))) == 1
+            VibePkg.precompile(; io = batchio)
+            @test !occursin("Precompiling", String(take!(batchio)))
         end
     end
 end
@@ -484,11 +655,118 @@ end
             write_environment(env, Planning.plan_develop(env, RegistryInstance[], Config(depots), pkg))
 
             io = IOBuffer()
-            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
-                VibePkg.instantiate(io = io)         # freshly dev'd → must precompile it
+            auto_precompile_available = withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+                API.should_autoprecompile()
             end
-            @test occursin("Precompiling", String(take!(io)))
+            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+                VibePkg.instantiate(io = io)
+            end
+            @test occursin("Precompiling", String(take!(io))) == auto_precompile_available
+            if !auto_precompile_available
+                # Non-default compiled-module modes deliberately disable only
+                # the automatic hook; explicit precompile remains functional.
+                VibePkg.precompile(; io)
+                @test occursin("Precompiling", String(take!(io)))
+            end
         end
+    end
+end
+
+@testset "instantiate project-only, lonely, old, and verbose forms" begin
+    old_auto = API.AUTO_PRECOMPILE_ENABLED[]
+    try
+        API.AUTO_PRECOMPILE_ENABLED[] = false
+        mktempdir() do dir
+            with_api_env(dir) do proj, depot
+                depots = depot_stack([depot])
+                # Name-only `Base.identify_package` can return `nothing` when
+                # CI starts the worker with `--compiled-modules=existing` and a
+                # strict depot/load path. Stdlib identities are stable.
+                markdown = Base.PkgId(
+                    UUID("d6f4376e-aef5-505a-96c1-9c027394607a"), "Markdown",
+                )
+                unicode = Base.PkgId(
+                    UUID("4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"), "Unicode",
+                )
+
+                # `manifest=false` ignores an incomplete manifest and resolves
+                # every direct project dependency from scratch.
+                write(
+                    joinpath(proj, "Project.toml"), """
+                    [deps]
+                    Markdown = "$(markdown.uuid)"
+                    Unicode = "$(unicode.uuid)"
+                    """,
+                )
+                write(
+                    joinpath(proj, "Manifest.toml"), """
+                    julia_version = "$VERSION"
+                    manifest_format = "2.0"
+
+                    [[deps.Markdown]]
+                    uuid = "$(markdown.uuid)"
+                    """,
+                )
+                @test VibePkg.instantiate(; manifest = false, io = devnull) === nothing
+                refreshed = load_environment(proj; depots)
+                @test haskey(refreshed.manifest, markdown.uuid)
+                @test haskey(refreshed.manifest, unicode.uuid)
+                @test VibePkg.instantiate(; verbose = true, io = devnull) === nothing
+
+                # A manifest without a Project.toml remains usable and gains
+                # its empty companion project at the active path.
+                localpkg = mkpath(joinpath(dir, "LonelyPkg"))
+                lonely_uuid = UUID("10101010-2020-3030-4040-505050505050")
+                mkpath(joinpath(localpkg, "src"))
+                write(
+                    joinpath(localpkg, "Project.toml"),
+                    "name = \"LonelyPkg\"\nuuid = \"$lonely_uuid\"\nversion = \"0.1.0\"\n",
+                )
+                write(joinpath(localpkg, "src", "LonelyPkg.jl"), "module LonelyPkg end\n")
+                lonely = mkpath(joinpath(dir, "lonely"))
+                lonely_project = joinpath(lonely, "Project.toml")
+                write(
+                    joinpath(lonely, "Manifest.toml"), """
+                    julia_version = "$VERSION"
+                    manifest_format = "2.0"
+
+                    [[deps.LonelyPkg]]
+                    path = "../LonelyPkg"
+                    uuid = "$lonely_uuid"
+                    version = "0.1.0"
+                    """,
+                )
+                Base.ACTIVE_PROJECT[] = lonely_project
+                @test !isfile(lonely_project)
+                @test VibePkg.instantiate(; io = devnull) === nothing
+                @test isfile(lonely_project)
+                @test haskey(load_environment(lonely; depots).manifest, lonely_uuid)
+
+                # Legacy v1 manifests use the package name as their top-level
+                # table and are accepted by the same public operation.
+                oldenv = mkpath(joinpath(dir, "old-manifest"))
+                write(
+                    joinpath(oldenv, "Project.toml"),
+                    "[deps]\nLonelyPkg = \"$lonely_uuid\"\n",
+                )
+                write(
+                    joinpath(oldenv, "Manifest.toml"), """
+                    [[LonelyPkg]]
+                    path = "../LonelyPkg"
+                    uuid = "$lonely_uuid"
+                    version = "0.1.0"
+                    """,
+                )
+                Base.ACTIVE_PROJECT[] = joinpath(oldenv, "Project.toml")
+                @test VibePkg.instantiate(; verbose = true, io = devnull) === nothing
+                old_loaded = load_environment(oldenv; depots)
+                @test haskey(old_loaded.manifest, lonely_uuid)
+                @test VibePkg.EnvFiles.entry_path(old_loaded.manifest[lonely_uuid]) ==
+                    joinpath("..", "LonelyPkg")
+            end
+        end
+    finally
+        API.AUTO_PRECOMPILE_ENABLED[] = old_auto
     end
 end
 
@@ -500,9 +778,11 @@ end
     old_auto = API.AUTO_PRECOMPILE_ENABLED[]
     try
         API.AUTO_PRECOMPILE_ENABLED[] = true
-        @test withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
+        auto_precompile_available = Base.JLOptions().use_compiled_modules == 1
+        enabled_with_env = withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
             API.should_autoprecompile()
         end
+        @test enabled_with_env == auto_precompile_available
         @test !withenv("JULIA_PKG_PRECOMPILE_AUTO" => "false") do
             API.should_autoprecompile()
         end
@@ -544,9 +824,20 @@ end
                     function assert_triggered_then_noop(f)
                         io = IOBuffer()
                         f(io)
-                        @test occursin("Precompiling", String(take!(io)))
+                        operation_precompiled = occursin("Precompiling", String(take!(io)))
                         VibePkg.precompile(; io)
-                        @test !occursin("Precompiling", String(take!(io)))
+                        manual_precompiled = occursin("Precompiling", String(take!(io)))
+                        if auto_precompile_available
+                            @test operation_precompiled
+                            @test !manual_precompiled
+                        else
+                            # Pkg suppresses automatic precompile in non-default
+                            # compiled-module modes; manual precompile still
+                            # creates the cache and proves the operation left a
+                            # valid environment.
+                            @test !operation_precompiled
+                            @test manual_precompiled
+                        end
                     end
 
                     withenv("JULIA_PKG_PRECOMPILE_AUTO" => "true") do
@@ -644,6 +935,65 @@ end
             end
             @test err !== nothing
             @test occursin("BrokenDep", sprint(showerror, err))
+        end
+    end
+end
+
+# Pkg.jl api.jl's opening precompile scenario: create a dependency chain by
+# developing Dep1 into the root, Dep2 into Dep1, and Dep3 into Dep2, then
+# return to the root and resolve/precompile sequentially. The modules append
+# while their caches are generated, making the dependency-first traversal
+# observable instead of merely checking that cache files eventually exist.
+@testset "sequential depth-first generated precompile graph" begin
+    mktempdir() do dir
+        with_api_env(dir) do proj, _
+            packages = mkpath(joinpath(dir, "packages"))
+            order_file = joinpath(dir, "precompile-order")
+            names = ["DepthDep1", "DepthDep2", "DepthDep3"]
+            uuids = [
+                "11111111-aaaa-bbbb-cccc-000000000001",
+                "11111111-aaaa-bbbb-cccc-000000000002",
+                "11111111-aaaa-bbbb-cccc-000000000003",
+            ]
+            paths = String[]
+            for (i, name) in pairs(names)
+                path = mkpath(joinpath(packages, name))
+                mkpath(joinpath(path, "src"))
+                write(
+                    joinpath(path, "Project.toml"),
+                    "name = \"$name\"\nuuid = \"$(uuids[i])\"\nversion = \"0.1.0\"\n",
+                )
+                dependency = i == length(names) ? "" : "using $(names[i + 1])\n"
+                write(
+                    joinpath(path, "src", "$name.jl"),
+                    "module $name\n$dependency" *
+                        "open(ENV[\"VIBEPKG_PRECOMPILE_ORDER\"], \"a\") do io\n" *
+                        "    println(io, \"$name\")\n" *
+                        "end\nend\n",
+                )
+                push!(paths, path)
+            end
+
+            VibePkg.develop(; path = paths[1], io = devnull)
+            VibePkg.activate(paths[1]; io = devnull)
+            VibePkg.develop(; path = paths[2], io = devnull)
+            VibePkg.activate(paths[2]; io = devnull)
+            VibePkg.develop(; path = paths[3], io = devnull)
+            VibePkg.activate(proj; io = devnull)
+            VibePkg.resolve(; io = devnull)
+
+            output = IOBuffer()
+            withenv(
+                "JULIA_NUM_PRECOMPILE_TASKS" => "1",
+                "VIBEPKG_PRECOMPILE_ORDER" => order_file,
+            ) do
+                VibePkg.precompile(; io = output)
+            end
+            @test occursin("Precompiling", String(take!(output)))
+            # When automatic compiled-module creation is unavailable, each root
+            # may load its dependency closure again, but the first occurrence
+            # of every module must still be dependency-first.
+            @test unique(readlines(order_file)) == reverse(names)
         end
     end
 end

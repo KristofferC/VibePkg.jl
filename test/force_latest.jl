@@ -97,10 +97,14 @@ end
 
 # a path test package depending on SomePkg with the given compat and a trivial
 # test target that loads it.
-function make_testpkg(dir, name, somecompat)
+function make_testpkg(dir, name, somecompat::Union{Nothing, String})
     pkg = joinpath(dir, name)
     mkpath(joinpath(pkg, "src"))
     mkpath(joinpath(pkg, "test"))
+    compat_block = somecompat === nothing ? "" : """
+        [compat]
+        SomePkg = "$somecompat"
+        """
     write(
         joinpath(pkg, "Project.toml"), """
         name = "$name"
@@ -110,8 +114,7 @@ function make_testpkg(dir, name, somecompat)
         [deps]
         SomePkg = "$SOME_UUID"
 
-        [compat]
-        SomePkg = "$somecompat"
+        $compat_block
 
         [extras]
         Test = "$TEST_UUID_STR"
@@ -266,6 +269,36 @@ end
                     )
                 end
             end
+        end
+    end
+end
+
+# A registered direct dependency without [compat] is unbounded. Forcing latest
+# remains successful, but warns so package authors know the test is not
+# constrained; force_latest=false stays silent. This ports upstream's
+# DirectDepWithoutCompatEntry matrix without a pinned General checkout.
+@testset "DirectDepWithoutCompatEntry warns only when forcing latest" begin
+    mktempdir() do dir
+        depot = setup_flc(dir)
+        pkg = make_testpkg(dir, "DirectDepWithoutCompatEntry", nothing)
+
+        @test_logs min_level = Base.CoreLogging.Warn begin
+            @test run_flc_test(
+                depot, pkg; force_latest_compatible_version = false,
+            ) === nothing
+        end
+        for allow_earlier in (nothing, false, true)
+            result = Ref{Any}()
+            kwargs = allow_earlier === nothing ?
+                (; force_latest_compatible_version = true) :
+                (;
+                    force_latest_compatible_version = true,
+                    allow_earlier_backwards_compatible_versions = allow_earlier,
+                )
+            @test_logs (:warn, r"Dependency does not have a \[compat\] entry") match_mode = :any begin
+                result[] = run_flc_test(depot, pkg; kwargs...)
+            end
+            @test result[] === nothing
         end
     end
 end

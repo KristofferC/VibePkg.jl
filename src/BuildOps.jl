@@ -13,8 +13,13 @@ using ..Utils: stderr_f, create_cachedir_tag
 using ..Timing: @timeit, TIMER
 using ..EnvFiles
 using ..EnvFiles: ManifestEntry, entry_tree_hash, is_path_tracked, with_project
+using ..Configs: Config
 using ..Depots: DepotStack, depots1, scratchspaces_dir, log_scratch_usage
-using ..Environments: Environment, write_environment
+using ..Registries: RegistryInstance
+using ..Environments: Environment, write_environment, load_environment_from
+using ..Planning: plan_resolve, plan_up, PackageRequest
+import ..Resolve
+import ..Execution
 using ..Execution: entry_source_path, sandbox_manifest, sandbox_preferences,
     write_sandbox_preferences
 using ..Utils: printpkgstyle, pathrepr
@@ -64,12 +69,20 @@ end
 function run_build(
         env::Environment, entry::ManifestEntry, source::String, log_file::String,
         depots::DepotStack; io::IO, verbose::Bool = false,
+        registries::Union{Nothing, Vector{RegistryInstance}} = nothing,
+        config::Union{Nothing, Config} = nothing,
+        allow_reresolve::Bool = true,
     )
     printpkgstyle(io, :Building, verbose ? entry.name : "$(entry.name) → $(pathrepr(log_file))")
     # isolated build sandbox: the package plus its dependency closure;
     # mktempdir-do removes it as soon as the build subprocess has finished
     ok = mktempdir() do sandbox
-        project = with_project(EnvFiles.Project(); deps = Dict{String, UUID}(entry.name => entry.uuid))
+        # Build scripts execute in Main, so the package's regular dependencies
+        # must be direct sandbox dependencies (not merely transitive through
+        # the package entry) to be importable from deps/build.jl.
+        deps = Dict{String, UUID}(entry.deps)
+        deps[entry.name] = entry.uuid
+        project = with_project(EnvFiles.Project(); deps)
         manifest = sandbox_manifest(env, depots, entry.uuid)
         sandbox_env = Environment(
             joinpath(sandbox, "Project.toml"), joinpath(sandbox, "Manifest.toml"),
@@ -86,6 +99,31 @@ function run_build(
         deps_project = EnvFiles.projectfile_path(joinpath(source, "deps"); strict = true)
         prefs_primary = something(deps_project, EnvFiles.projectfile_path(source))
         write_sandbox_preferences(sandbox, sandbox_preferences(env, prefs_primary))
+        if config !== nothing
+            registries === nothing && error("build sandbox resolution requires registries")
+            loaded = load_environment_from(sandbox_env.project_file; depots)
+            planned = try
+                plan_resolve(loaded, registries, config)
+            catch err
+                (err isa Resolve.ResolverError && allow_reresolve) || rethrow()
+                printpkgstyle(
+                    io, :Build,
+                    string(
+                        "Could not use exact versions of packages in manifest, re-resolving. ",
+                        "Note: if you do not check your manifest file into source control, ",
+                        "then you can probably ignore this message. ",
+                        "However, if you do check your manifest file into source control, ",
+                        "then you probably want to pass allow_reresolve=false ",
+                        "when calling VibePkg.build.",
+                    ),
+                    color = Base.warn_color(),
+                )
+                reresolved = plan_up(loaded, registries, config, PackageRequest[])
+                printpkgstyle(io, :Build, "Successfully re-resolved")
+                reresolved
+            end
+            Execution.apply!(loaded, planned, registries, config; io)
+        end
         code = """
         using Pkg
         cd($(repr(source)))
@@ -130,6 +168,9 @@ With an empty `uuids`, builds the project's direct dependencies that need it.
 @timeit TIMER "build packages" function build!(
         env::Environment, depots::DepotStack, uuids::Vector{UUID} = UUID[];
         verbose::Bool = false, io::IO = stderr_f(),
+        registries::Union{Nothing, Vector{RegistryInstance}} = nothing,
+        config::Union{Nothing, Config} = nothing,
+        allow_reresolve::Bool = true,
     )
     if isempty(uuids)
         uuids = collect(values(env.project.deps))
@@ -147,9 +188,24 @@ With an empty `uuids`, builds the project's direct dependencies that need it.
         # before running: failed builds retain their diagnostic log too.
         is_path_tracked(entry) ||
             log_scratch_usage(depots, dirname(log_file), env.project_file)
-        run_build(env, entry, source, log_file, depots; io, verbose)
+        run_build(
+            env, entry, source, log_file, depots;
+            io, verbose, registries, config, allow_reresolve,
+        )
     end
     return
+end
+
+function build!(
+        env::Environment, registries::Vector{RegistryInstance}, config::Config,
+        uuids::Vector{UUID} = UUID[];
+        verbose::Bool = false, allow_reresolve::Bool = true,
+        io::IO = config.io,
+    )
+    return build!(
+        env, config.depots, uuids;
+        verbose, io, registries, config, allow_reresolve,
+    )
 end
 
 end # module

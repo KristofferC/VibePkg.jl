@@ -26,10 +26,10 @@ include("Environments.jl")
 include("Planning.jl")
 include("Execution.jl")
 include("GCOps.jl")
+include("Display.jl")
 include("BuildOps.jl")
 include("TestOps.jl")
 include("AppsOps.jl")
-include("Display.jl")
 include("API.jl")
 
 using .Errors: PkgError
@@ -39,8 +39,10 @@ using .Configs: UpgradeLevel, UPLEVEL_PATCH, UPLEVEL_MINOR, UPLEVEL_MAJOR,
     PRESERVE_SEMVER, PRESERVE_TIERED, PRESERVE_TIERED_INSTALLED, PRESERVE_NONE,
     PackageMode, PKGMODE_PROJECT, PKGMODE_MANIFEST
 
-# Pkg-compatible namespaces (Pkg.Artifacts, Pkg.Registry, Pkg.Apps)
+# Pkg-compatible namespaces
+include("compat/BinaryPlatforms.jl")
 include("compat/Artifacts.jl")
+include("compat/PlatformEngines.jl")
 include("compat/Registry.jl")
 include("compat/Apps.jl")
 
@@ -65,6 +67,7 @@ const why = API.why
 const offline = API.offline
 const respect_sysimage_versions = API.respect_sysimage_versions
 const precompile = API.precompile
+const autoprecompilation_enabled = API.autoprecompilation_enabled
 const gc = API.gc
 const build = API.build
 const test = API.test
@@ -98,7 +101,8 @@ export PreserveLevel, PRESERVE_TIERED_INSTALLED, PRESERVE_TIERED, PRESERVE_ALL_I
 export Registry, Apps
 
 public gc, precompile, readonly, redo, undo, offline, dependencies, project,
-    respect_sysimage_versions, setprotocol!, PackageInfo, ProjectInfo
+    respect_sysimage_versions, autoprecompilation_enabled, setprotocol!,
+    PackageInfo, ProjectInfo
 
 """
     vpkg command [arguments...]

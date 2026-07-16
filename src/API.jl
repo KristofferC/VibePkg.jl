@@ -10,6 +10,7 @@
 module API
 
 using Base: UUID
+using Base.BinaryPlatforms: AbstractPlatform, HostPlatform
 import UUIDs
 using Dates: Dates
 
@@ -41,7 +42,7 @@ using ..Versions: VersionSpec
 
 export add, develop, rm, up, update, pin, free, resolve, instantiate, status,
     compat, activate, generate, why, offline, respect_sysimage_versions,
-    precompile, readonly
+    precompile, readonly, autoprecompilation_enabled
 
 ##################
 # Session state  #
@@ -64,6 +65,10 @@ in_repl_mode() = IN_REPL_MODE[]
 
 # the previously active project file, for `activate(prev = true)` / `activate -`
 const PREV_ENV_PATH = Ref{String}("")
+
+# `(project file, package)` pairs already reported by activate. Re-entering an
+# environment during one session should not repeat the same warning forever.
+const ACTIVATE_WARNED_LOADED = Set{Tuple{String, Base.PkgId}}()
 
 # Undo/redo: per-project stacks of environment snapshots. Environments are
 # immutable values, so a "snapshot" is just a reference — no copying.
@@ -135,6 +140,16 @@ should_autoprecompile() =
     AUTO_PRECOMPILE_ENABLED[] && Base.JLOptions().use_compiled_modules == 1 &&
     Base.get_bool_env("JULIA_PKG_PRECOMPILE_AUTO", true) != false
 
+"""
+    autoprecompilation_enabled(state::Bool)
+
+Globally enable or disable automatic precompilation after package operations.
+Manual calls to [`precompile`](@ref) are unaffected. The environment variable
+`JULIA_PKG_PRECOMPILE_AUTO=false` can still veto automatic precompilation when
+this global switch is enabled.
+"""
+autoprecompilation_enabled(state::Bool) = (AUTO_PRECOMPILE_ENABLED[] = state)
+
 "`auto_gc(on)`: toggle the periodic automatic `gc()` after `up`/`pin`/`free`/`rm`."
 auto_gc(on::Bool) = (AUTO_GC_ENABLED[] = on; nothing)
 
@@ -151,16 +166,22 @@ end
 # `update_registry`: :none, :auto (once per session, and per registry at
 # most once per day via Pkg's persisted update log; skipped offline), or
 # :force (`up` semantics — no cooldown; still skipped offline).
-function op_context(; io::IO = stderr_f(), update_registry::Symbol = :none)
+function op_context(;
+        io::IO = stderr_f(), update_registry::Symbol = :none,
+        bootstrap_registry::Bool = true,
+        use_git_for_all_downloads::Bool = false,
+        use_only_tarballs_for_downloads::Bool = false,
+    )
     config = Config(;
         io, offline = OFFLINE_MODE[],
         respect_sysimage_versions = RESPECT_SYSIMAGE_VERSIONS[],
+        use_git_for_all_downloads, use_only_tarballs_for_downloads,
     )
     depots, server = config.depots, config.server
     registries = reachable_registries(depots; read_from_tarball = server !== nothing)
     # fresh-depot bootstrap: every operation installs the default registries
     # when none are reachable
-    if isempty(registries) && !config.offline
+    if bootstrap_registry && isempty(registries) && !config.offline
         # with no server add_default_registries! bootstraps over git instead
         Registries.add_default_registries!(depots; io)
         registries = reachable_registries(depots; read_from_tarball = server !== nothing)
@@ -263,9 +284,13 @@ function run_plan(
         build_uuids::Vector{UUID} = UUID[],
         skip_writing_project::Bool = false,
         download_loadable_only::Bool = false,
+        platform::AbstractPlatform = HostPlatform(),
     )
     io = ctx.config.io
-    result = Execution.apply!(env, planned, ctx.registries, ctx.config; io, skip_writing_project, download_loadable_only)
+    result = Execution.apply!(
+        env, planned, ctx.registries, ctx.config;
+        io, skip_writing_project, download_loadable_only, platform,
+    )
     print_env_diff(io, env, result.env; registries = ctx.registries, depots = ctx.config.depots)
     record_undo!(env, result.env)
     # newly installed packages with a deps/build.jl get built; repo packages
@@ -441,6 +466,10 @@ end
         specs::Vector{PackageSpec};
         preserve::PreserveLevel = default_preserve(), target::Symbol = :deps,
         prefer_loaded_versions::Bool = in_repl_mode(), io::IO = stderr_f(),
+        julia_version::Union{VersionNumber, Nothing} = VERSION,
+        platform::AbstractPlatform = HostPlatform(),
+        use_git_for_all_downloads::Bool = false,
+        use_only_tarballs_for_downloads::Bool = false,
     )
     validate_specs(specs, "add")
     target === :deps || return _add_to_target(specs, target; io)
@@ -450,13 +479,31 @@ end
     for s in repo_like
         s.path === nothing && continue
         path = abspath(s.path)
-        isdir(path) || pkgerror("Package path $(repr(path)) does not exist")
+        isdir(path) || pkgerror("Path `$path` does not exist.")
         if !ispath(joinpath(path, ".git")) &&
                 (isfile(joinpath(path, "Project.toml")) || isfile(joinpath(path, "JuliaProject.toml")))
             pkgerror("Did not find a git repository at `$path`, perhaps you meant `VibePkg.develop`?")
         end
     end
-    ctx = op_context(; io, update_registry = :auto)
+    # A pure stdlib add must work in a brand-new depot without bootstrapping
+    # General. Resolve this stable identity set locally before building the
+    # operation context; every non-stdlib/ambiguous request retains the normal
+    # automatic registry path.
+    stdlib_info = Stdlibs.stdlib_infos()
+    only_stdlibs = isempty(repo_like) && isempty(name_rev) && !isempty(reqs) && all(reqs) do r
+        if r.uuid !== nothing
+            Stdlibs.is_stdlib(r.uuid, julia_version)
+        elseif r.name !== nothing
+            any(info -> info.name == r.name, values(stdlib_info))
+        else
+            false
+        end
+    end
+    ctx = op_context(;
+        io, update_registry = only_stdlibs ? :none : :auto,
+        bootstrap_registry = !only_stdlibs,
+        use_git_for_all_downloads, use_only_tarballs_for_downloads,
+    )
     env = load_environment(; depots = ctx.config.depots)
     repos = EnvFiles.RepoPackage[
         Git.materialize_repo_package!(
@@ -465,19 +512,35 @@ end
             ) for s in repo_like
     ]
     for s in name_rev
-        # `add Name#rev`: both the repository url and its package subdir come
-        # from the registry (an explicit PackageSpec subdir still wins).
+        # Registered identities always return to their canonical registry
+        # repository (#2935), even when a prior URL add left a stale fork in
+        # the project/manifest. Only an unregistered package reuses its stored
+        # URL, which preserves the branch-switch workflow for URL-added repos.
         name, uuid = Planning.resolve_request(env, ctx.registries, to_request(s))
-        source = registry_repo_source(ctx.registries, uuid)
-        source === nothing && pkgerror("No repository URL is recorded for package $name [$uuid] in the configured registries")
-        subdir = s.subdir === nothing ? source.subdir : s.subdir
-        push!(repos, Git.materialize_repo_package!(ctx.config.depots, source.url; rev = s.rev, subdir, io))
+        registry_source = registry_repo_source(ctx.registries, uuid)
+        if registry_source === nothing
+            entry = get(env.manifest, uuid, nothing)
+            url = entry === nothing ? nothing : EnvFiles.entry_repo_url(entry)
+            recorded_subdir = entry === nothing ? nothing : EnvFiles.entry_repo_subdir(entry)
+            if url === nothing
+                project_source = get(env.project.sources, name, nothing)
+                if project_source !== nothing && project_source.url !== nothing
+                    url = project_source.url
+                    recorded_subdir = project_source.subdir
+                end
+            end
+            url === nothing && pkgerror("No repository URL is recorded for package $name [$uuid] in the project, manifest, or configured registries")
+        else
+            url, recorded_subdir = registry_source.url, registry_source.subdir
+        end
+        subdir = s.subdir === nothing ? recorded_subdir : s.subdir
+        push!(repos, Git.materialize_repo_package!(ctx.config.depots, url; rev = s.rev, subdir, io))
     end
     # already-present fast path: when every requested package is already a
     # compatible registry-tracked manifest entry (and nothing is repo-tracked),
     # just promote it to [deps] and write it out — no resolve, install, or
     # precompile (Pkg's `can_skip_resolve_for_add`).
-    if isempty(repos)
+    if isempty(repos) && julia_version == VERSION
         promoted = Planning.plan_promote(
             env, ctx.registries, reqs;
             respect_sysimage_versions = ctx.config.respect_sysimage_versions,
@@ -502,7 +565,10 @@ end
     preferred_versions = prefer_loaded_versions ?
         collect_preferred_loaded_versions(env) : Dict{UUID, VersionNumber}()
     targets = AddTarget[reqs; repos]
-    planned = plan_add(env, ctx.registries, ctx.config, targets; preserve, preferred_versions, fetcher = source_fetcher(ctx.config))
+    planned = plan_add(
+        env, ctx.registries, ctx.config, targets;
+        preserve, julia_version, preferred_versions, fetcher = source_fetcher(ctx.config),
+    )
     print_preferred_loaded_note(io, env, planned, preferred_versions)
     added_names = String[r.name for r in repos]
     for r in reqs
@@ -511,7 +577,11 @@ end
         name === nothing || push!(added_names, name)
     end
     planned, compat_added = compat_on_add(planned, added_names)
-    run_plan(ctx, env, planned; precompile_pkgs = added_names, build_uuids = UUID[r.uuid for r in repos])
+    run_plan(
+        ctx, env, planned;
+        precompile_pkgs = added_names, build_uuids = UUID[r.uuid for r in repos],
+        platform,
+    )
     isempty(compat_added) ||
         printpkgstyle(io, :Compat, "entries added for $(join(compat_added, ", "))")
     return nothing
@@ -660,8 +730,8 @@ end
             isdir(clone_dir) || Git.ensure_clone(io, clone_dir, s.url)
             s.subdir === nothing || (track_path = joinpath(track_path, s.subdir))
             push!(paths, track_path)
-        elseif s.name !== nothing
-            push!(paths, _develop_name_path(ctx, env, s.name; shared, io))
+        elseif s.name !== nothing || s.uuid !== nothing
+            push!(paths, _develop_request_path(ctx, env, to_request(s); shared, io))
         else
             pkgerror("Package specification must include a name, UUID, URL, or filesystem path")
         end
@@ -693,7 +763,14 @@ end
 # (`plan_develop` interprets relative paths against the project). Returns
 # `(clone_dir, track_path)`.
 function dev_clone_target(config::Config, name::String; shared::Bool)
-    shared && return (joinpath(config.devdir, name), joinpath(config.devdir, name))
+    if shared
+        # Base deliberately preserves relative JULIA_DEPOT_PATH entries. A
+        # shared checkout nevertheless has an absolute identity: recording a
+        # relative depot/dev path would make the planner reinterpret it from
+        # the active project directory instead of the operation cwd.
+        path = abspath(config.devdir, name)
+        return path, path
+    end
     project_dir = dirname(Environments.find_project_file())
     return (joinpath(project_dir, "dev", name), joinpath("dev", name))
 end
@@ -746,9 +823,12 @@ end
 develop(pkg::AbstractString; kwargs...) = develop([String(pkg)]; kwargs...)
 develop(pkgs::AbstractVector{<:AbstractString}; kwargs...) = develop([PackageSpec(; name) for name in pkgs]; kwargs...)
 
-"develop by name: clone the registry repo into the dev dir, return the track path"
-function _develop_name_path(ctx::OpContext, env::Environment, pkg::String; shared::Bool, io::IO)
-    name, uuid = Planning.resolve_request(env, ctx.registries, PackageRequest(pkg))
+"develop by name or UUID: clone the registry repo into the dev dir"
+function _develop_request_path(
+        ctx::OpContext, env::Environment, request::PackageRequest;
+        shared::Bool, io::IO,
+    )
+    name, uuid = Planning.resolve_request(env, ctx.registries, request)
     # a manifest entry already tracking a repository knows the url (and
     # subdir) even when the package is unregistered; the registry is the
     # fallback
@@ -820,6 +900,7 @@ up(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _up_requests(requests(pk
         update_registry::Union{Nothing, Symbol} = nothing,
         skip_writing_project::Bool = false,
         download_loadable_only::Bool = false,
+        platform::AbstractPlatform = HostPlatform(),
     )
     mode = Configs.mode_symbol(mode)
     # fully-pinned environments short-circuit before any registry work.
@@ -839,10 +920,16 @@ up(pkgs::AbstractVector{<:AbstractString}; kwargs...) = _up_requests(requests(pk
     end
     ctx = op_context(; io, update_registry = reg)
     env = load_environment(; depots = ctx.config.depots)
-    repos = refresh_repo_packages(ctx, env, reqs; mode, workspace, io)
+    # Pkg's upgrade level gates moving repository refs too: only a major
+    # update is allowed to fetch a newer branch tip. Fixed/patch/minor leave
+    # repo-tracked entries at their recorded tree (their package version is
+    # not a meaningful semver bound on an arbitrary branch).
+    repos = level == UPLEVEL_MAJOR ?
+        refresh_repo_packages(ctx, env, reqs; mode, workspace, io) :
+        EnvFiles.RepoPackage[]
     printpkgstyle(io, :Resolving, "package versions...")
     planned = plan_up(env, ctx.registries, ctx.config, reqs; level, preserve, mode, workspace, repos, fetcher = source_fetcher(ctx.config))
-    run_plan(ctx, env, planned; skip_writing_project, download_loadable_only)
+    run_plan(ctx, env, planned; skip_writing_project, download_loadable_only, platform)
     _auto_gc(ctx)
     return nothing
 end
@@ -970,7 +1057,10 @@ authored input: by default it is never rewritten (Pkg.jl#4713); pass
 end
 
 """
-    instantiate(; manifest, verbose, workspace, julia_version_strict, update_on_mismatch, io)
+    instantiate(;
+        manifest, verbose, workspace, julia_version_strict,
+        update_on_mismatch, platform, io
+    )
 
 Make the environment ready to use. With a
 manifest, download everything it records; without one (or with
@@ -979,30 +1069,47 @@ workspace resolves into the shared manifest, but unless `workspace = true`
 only the active project's loadable dependencies are downloaded
 (Pkg.jl#4699). `update_on_mismatch = true` falls back to `up` when the
 manifest does not match the project or was resolved with a different julia
-minor version. `verbose` sends build output of newly-installed packages to
-`stdout`/`stderr` instead of their log files.
+minor version. `platform` selects artifact variants for a target platform and
+defaults to the host. `verbose` sends build output of newly-installed packages
+to `stdout`/`stderr` instead of their log files.
 """
 @operation function instantiate(;
         manifest::Union{Nothing, Bool} = nothing, verbose::Bool = false,
         workspace::Bool = false, julia_version_strict::Bool = false,
-        update_on_mismatch::Bool = false, io::IO = stderr_f(),
+        update_on_mismatch::Bool = false,
+        platform::AbstractPlatform = HostPlatform(), io::IO = stderr_f(),
     )
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     ensure_manifest_registries!(ctx, env; io)
+    # A standalone Manifest.toml is a valid environment input. Materialize
+    # the empty companion project at the active location, matching Pkg's
+    # lonely-manifest behavior and making the activation persistent.
+    if !isfile(env.project_file) && isfile(env.manifest_file)
+        EnvFiles.write_project(env.project, env.project_file)
+    end
     # decision tree: no manifest (or `manifest = false`) ⇒
     # full `up()`; a mismatched manifest under `update_on_mismatch` too.
     # `instantiate` delegates to `up` with `update_registry = :auto` so it
     # respects the once-per-session / daily cooldown instead of forcing a
     # redundant registry re-download (Pkg.jl#3555).
     if manifest === false || (manifest === nothing && isempty(env.manifest.deps) && !isfile(env.manifest_file))
-        return up(; io, update_registry = :auto, skip_writing_project = true, download_loadable_only = !workspace)
+        return up(;
+            io, update_registry = :auto, skip_writing_project = true,
+            download_loadable_only = !workspace, platform,
+        )
     end
     if update_on_mismatch && !Execution.manifest_matches_project(env)
         printpkgstyle(io, :Info, "The manifest does not match the project, updating...", color = Base.info_color())
-        return up(; io, update_registry = :auto, skip_writing_project = true, download_loadable_only = !workspace)
+        return up(;
+            io, update_registry = :auto, skip_writing_project = true,
+            download_loadable_only = !workspace, platform,
+        )
     end
-    installed = Execution.instantiate!(env, ctx.registries, ctx.config; julia_version_strict, workspace, io)
+    installed = Execution.instantiate!(
+        env, ctx.registries, ctx.config;
+        julia_version_strict, workspace, platform, io,
+    )
     isempty(installed) || BuildOps.build!(env, ctx.config.depots, [i.uuid for i in installed]; verbose, io)
     _auto_precompile(ctx)
     return nothing
@@ -1207,6 +1314,14 @@ status(reqs::Vector{PackageRequest}; kwargs...) =
         end
     end
     print_status(io, env; manifest_mode = mode === :manifest, outdated, deprecated, workspace, extensions, registries = ctx.registries, depots = ctx.config.depots, diff_env, filter_uuids, filter_names)
+    if is_manifest_current(env) === false
+        printpkgstyle(
+            io, :Warning,
+            "The project dependencies or compat requirements have changed since the manifest was last resolved. " *
+                "It is recommended to `VibePkg.resolve()` or consider `VibePkg.update()` if necessary.";
+            color = Base.warn_color(),
+        )
+    end
     return nothing
 end
 
@@ -1377,14 +1492,17 @@ function why_print_node(io, env, relevant, target::UUID, expanded, uuid, prefix,
 end
 
 """
-    build(pkgs = []; io)
+    build(pkgs = []; allow_reresolve, io)
 
 Run `deps/build.jl` of the given packages (default: the project's direct
 dependencies that have one), dependencies first.
 """
 build(pkg::AbstractString; kwargs...) = build([String(pkg)]; kwargs...)
 build(pkgs::AbstractVector{<:AbstractString}; kwargs...) = build(String.(pkgs); kwargs...)
-@operation function build(pkgs::Vector{String}; verbose::Bool = false, io::IO = stderr_f())
+@operation function build(
+        pkgs::Vector{String}; verbose::Bool = false,
+        allow_reresolve::Bool = true, io::IO = stderr_f(),
+    )
     ctx = op_context(; io)
     env = load_environment(; depots = ctx.config.depots)
     uuids = UUID[]
@@ -1392,7 +1510,10 @@ build(pkgs::AbstractVector{<:AbstractString}; kwargs...) = build(String.(pkgs); 
         _, uuid = Planning.resolve_request(env, ctx.registries, PackageRequest(pkg))
         push!(uuids, uuid)
     end
-    BuildOps.build!(env, ctx.config.depots, uuids; verbose, io)
+    BuildOps.build!(
+        env, ctx.registries, ctx.config, uuids;
+        verbose, allow_reresolve, io,
+    )
     # a rebuild invalidates the built packages' caches (Pkg parity)
     _auto_precompile(ctx)
     return nothing
@@ -1622,6 +1743,91 @@ shared environment `environments/<name>` from the first depot that has it
 a project dependency tracking a local path activates that path. Never
 installs anything.
 """
+function depot_package_slug(path::AbstractString)
+    parts = splitpath(path)
+    for i in (length(parts) - 1):-1:2
+        parts[i - 1] == "packages" || continue
+        return parts[i + 1]
+    end
+    return nothing
+end
+
+# Warn when code already loaded in this process would resolve to another
+# source tree in the newly-active environment. The manifest's complete graph
+# is used, since transitive mismatches trigger the same stale-code hazards as
+# direct dependencies.
+function warn_loaded_module_path_mismatch(io::IO)
+    project_file = Base.active_project()
+    project_file === nothing && return
+    isfile(project_file) || return
+    isempty(Base.loaded_modules) && return
+
+    env = try
+        load_environment(; depots = depot_stack())
+    catch err
+        err isa InterruptException && rethrow()
+        return
+    end
+    environment_versions = Dict{UUID, Union{VersionNumber, Nothing}}(
+        uuid => EnvFiles.entry_version(entry) for (uuid, entry) in env.manifest
+    )
+    if isempty(environment_versions)
+        for uuid in values(env.project.deps)
+            environment_versions[uuid] = nothing
+        end
+    end
+    isempty(environment_versions) && return
+
+    mismatches = Tuple{Base.PkgId, String, String, Union{VersionNumber, Nothing}}[]
+    for (pkgid, mod) in Base.loaded_modules
+        mod isa Module || continue
+        pkgid.uuid === nothing && continue
+        haskey(environment_versions, pkgid.uuid) || continue
+        (project_file, pkgid) in ACTIVATE_WARNED_LOADED && continue
+        loaded_path = pathof(mod)
+        loaded_path === nothing && continue
+        environment_path = try
+            Base.locate_package(pkgid)
+        catch
+            nothing
+        end
+        environment_path === nothing && continue
+        same = try
+            Base.samefile(loaded_path, environment_path)
+        catch
+            loaded_path == environment_path
+        end
+        same && continue
+        # Content-addressed depot trees with the same slug are byte-identical
+        # even if the depot prefixes differ.
+        loaded_slug = depot_package_slug(loaded_path)
+        environment_slug = depot_package_slug(environment_path)
+        loaded_slug !== nothing && loaded_slug == environment_slug && continue
+        push!(mismatches, (pkgid, loaded_path, environment_path, Base.pkgversion(mod)))
+    end
+    isempty(mismatches) && return
+
+    printpkgstyle(
+        io, :Warning,
+        "Some loaded packages differ from the active environment, which may affect reproducibility and trigger recompilation:";
+        color = Base.warn_color(),
+    )
+    for (pkgid, loaded_path, environment_path, loaded_version) in mismatches
+        environment_version = environment_versions[pkgid.uuid]
+        if loaded_version !== nothing && environment_version !== nothing &&
+                loaded_version != environment_version
+            println(io, "  $(pkgid.name): loaded v$loaded_version, environment specifies v$environment_version")
+        else
+            version = loaded_version === nothing ? "" : " (v$loaded_version)"
+            println(io, "  $(pkgid.name)$version")
+            println(io, "    loaded:      $loaded_path")
+            println(io, "    environment: $environment_path")
+        end
+        push!(ACTIVATE_WARNED_LOADED, (project_file, pkgid))
+    end
+    return
+end
+
 function activate(path::Union{Nothing, String} = nothing; temp::Bool = false, shared::Bool = false, prev::Bool = false, io::IO = stderr_f())
     if temp
         path === nothing || pkgerror("Cannot specify both a path and temp=true")
@@ -1664,6 +1870,7 @@ function activate(path::Union{Nothing, String} = nothing; temp::Bool = false, sh
         printpkgstyle(io, :Activating, "$(fresh)project at $(pathrepr(dirname(project_file)))")
     end
     previous === nothing || (PREV_ENV_PATH[] = previous)
+    warn_loaded_module_path_mismatch(io)
     return nothing
 end
 

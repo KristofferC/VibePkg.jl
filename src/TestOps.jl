@@ -36,12 +36,14 @@ using ..EnvFiles: ManifestEntry, PathTracked, SourceSpec, with_project,
 using ..Configs: Config
 import ..Registries
 using ..Registries: RegistryInstance
+using ..Stdlibs: stdlib_infos
 using ..Environments
 using ..Environments: Environment
 using ..Planning
 import ..Resolve
 using ..Execution
 using ..Execution: entry_source_path
+using ..Display: print_status
 import ..BuildOps
 
 # `Base.julia_cmd()` normally propagates the parent's coverage selector. Test
@@ -101,7 +103,8 @@ function force_latest_compat(
     compat = Dict{String, EnvFiles.Compat}(project.compat)
     for (name, uuid) in project.deps
         uuid == pkg_uuid && continue
-        existing = haskey(compat, name) ? compat[name].val : VersionSpec()
+        missing_compat = !haskey(compat, name)
+        existing = missing_compat ? VersionSpec() : compat[name].val
         latest_compatible = nothing
         for reg in registries
             pkg = get(reg, uuid, nothing)
@@ -119,6 +122,10 @@ function force_latest_compat(
             end
         end
         latest_compatible === nothing && continue
+        if missing_compat
+            @warn "Dependency does not have a [compat] entry" dependency = name
+            continue
+        end
         floor = if allow_earlier_backwards_compatible_versions
             lc = latest_compatible
             lc.major > 0 ? VersionNumber(lc.major, 0, 0) :
@@ -140,21 +147,61 @@ end
 # the build sandbox
 const sliced_manifest = Execution.sandbox_manifest
 
+# Pkg2-era test/REQUIRE support intentionally ignores version bounds, matching
+# Pkg's compatibility path. Platform selectors (for example `@osx Foo`) are
+# likewise stripped rather than evaluated: this mechanism exists for old
+# packages whose tests still need a named dependency made loadable.
+function parse_test_require(path::String)
+    packages = String[]
+    for raw in eachline(path)
+        line = strip(raw)
+        (isempty(line) || startswith(line, '#')) && continue
+        words = split(line)
+        startswith(first(words), '@') && popfirst!(words)
+        isempty(words) || push!(packages, String(first(words)))
+    end
+    return packages
+end
+
+function require_uuid(name::String, deps::Dict{String, UUID}, registries::Vector{RegistryInstance})
+    haskey(deps, name) && return deps[name]
+    uuids = UUID[]
+    for registry in registries
+        append!(uuids, Registries.uuids_from_name(registry, name))
+    end
+    unique!(uuids)
+    length(uuids) == 1 && return only(uuids)
+    length(uuids) > 1 && pkgerror(
+        "Multiple registered packages are named $(repr(name)); test/REQUIRE cannot disambiguate them"
+    )
+    for (uuid, info) in stdlib_infos()
+        info.name == name && return uuid
+    end
+    pkgerror("Package $(repr(name)) from test/REQUIRE was not found in the package dependencies, configured registries, or standard libraries")
+end
+
 # the sandbox project: test/Project.toml if present, else generated from
-# the legacy [targets]/[extras] sections; the tested package is force-added
-function sandbox_project(pkg_source::String, pkg_name::String, pkg_uuid::UUID, parent::Project)
+# the legacy [targets]/[extras] sections (plus a deprecated test/REQUIRE when
+# present); the tested package is force-added
+function sandbox_project(
+        pkg_source::String, pkg_name::String, pkg_uuid::UUID, parent::Project;
+        registries::Vector{RegistryInstance} = RegistryInstance[],
+        package_deps::Dict{String, UUID} = Dict{String, UUID}(),
+    )
     test_project_file = joinpath(pkg_source, "test", "Project.toml")
     has_test_project = isfile(test_project_file)
     project = if has_test_project
         read_project(test_project_file)
     else
-        pkg_project = read_project(EnvFiles.projectfile_path(pkg_source))
+        pkg_project_file = EnvFiles.projectfile_path(pkg_source; strict = true)
+        pkg_project = pkg_project_file === nothing ? Project() : read_project(pkg_project_file)
         # The legacy targets-based test environment contains both the
         # package's regular dependencies and its targeted test dependencies.
         # Tests are allowed to import regular dependencies directly, so
         # keeping them only as transitive dependencies of the tested package
         # is not sufficient for Julia's environment loader.
-        deps = Dict{String, UUID}(pkg_project.deps)
+        deps = pkg_project_file === nothing ?
+            Dict{String, UUID}(package_deps) : Dict{String, UUID}(pkg_project.deps)
         for target_dep in get(pkg_project.targets, "test", String[])
             uuid = get(pkg_project.extras, target_dep, nothing)
             uuid === nothing && (uuid = get(pkg_project.weakdeps, target_dep, nothing))
@@ -167,6 +214,13 @@ function sandbox_project(pkg_source::String, pkg_name::String, pkg_uuid::UUID, p
             name => pkg_project.compat[name]
                 for name in keys(deps) if haskey(pkg_project.compat, name)
         )
+        require_file = joinpath(pkg_source, "test", "REQUIRE")
+        if isfile(require_file)
+            @warn "using test/REQUIRE files is deprecated and current support is lacking in some areas"
+            for name in parse_test_require(require_file)
+                deps[name] = require_uuid(name, deps, registries)
+            end
+        end
         with_project(Project(); deps, sources = pkg_project.sources, compat)
     end
     # [sources] paths from an explicit test project are relative to test/;
@@ -195,8 +249,16 @@ function test_subprocess_flags(
         julia_args::Union{Cmd, AbstractVector{<:AbstractString}},
     )
     coverage_arg = coverage isa Bool ? (coverage ? "@$(source)" : "none") : coverage
+    # CacheFlags does not encode --code-coverage on Julia 1.12. Without this,
+    # a cache produced by an earlier ordinary test run is reused by a later
+    # coverage run, so none of the package's source is instrumented and no
+    # .cov/LCOV output is emitted. Loading source directly is the portable
+    # fallback; explicit julia_args remain last and may override it.
+    coverage_compile_arg = coverage === true || (coverage isa String && coverage != "none") ?
+        `--compiled-modules=no` : ``
     return ```
         --code-coverage=$(coverage_arg)
+        $(coverage_compile_arg)
         --color=$(Base.have_color === nothing ? "auto" : Base.have_color ? "yes" : "no")
         --warn-overwrite=$(Base.JLOptions().warn_overwrite == 1 ? "yes" : "no")
         --depwarn=$(("no", "yes", "error")[Base.JLOptions().depwarn + 1])
@@ -350,7 +412,11 @@ function test!(
     # the sandbox is scoped to the run: mktempdir-do removes it as soon as
     # the test subprocess has finished (not at process exit)
     return mktempdir() do sandbox
-        project = sandbox_project(source, name, pkg_uuid, env.project)
+        project = sandbox_project(
+            source, name, pkg_uuid, env.project;
+            registries,
+            package_deps = entry === nothing ? Dict{String, UUID}() : entry.deps,
+        )
         # preferences travel into the sandbox pre-merged (Pkg parity): the
         # cascade is anchored at the test project (the package's own project
         # for the legacy [targets] path), so test-level preferences win over
@@ -415,7 +481,12 @@ function test!(
             printpkgstyle(io, :Test, "Successfully re-resolved")
             reresolved
         end
-        Execution.apply!(loaded, planned, registries, config; io)
+        applied = Execution.apply!(loaded, planned, registries, config; io)
+        # Pkg prints both sandbox views before launching the subprocess. This
+        # is useful diagnostic output when a test-only dependency resolves
+        # differently than expected, and keeps `Pkg.test(; io)` self-contained.
+        print_status(io, applied.env; registries, depots)
+        print_status(io, applied.env; manifest_mode = true, registries, depots)
         run_test_process(name, sandbox, runtests, source; coverage, julia_args, test_args, autoprecompile, io)
     end
 end

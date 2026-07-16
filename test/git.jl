@@ -11,7 +11,8 @@ import LibGit2
 import TOML
 using FileWatching: mkpidlock
 using VibePkg
-using VibePkg.Configs: Config
+using VibePkg.Configs: Config, UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR,
+    UPLEVEL_MAJOR
 using VibePkg.Errors: PkgError
 using VibePkg.Depots: depot_stack, find_installed
 using VibePkg.Git
@@ -213,6 +214,7 @@ end
 end
 
 const TRACKPKG_UUID = UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+const TRACKPARENT_UUID = UUID("ffffffff-ffff-ffff-ffff-fffffffffff1")
 
 function make_track_repo(dir)
     src = joinpath(dir, "TrackPkg")
@@ -294,6 +296,35 @@ end
                 # idempotent: a second up with no upstream movement stays put
                 VibePkg.up(io = devnull)
                 @test entry_tree_hash(entry(env_branch)) == entry_tree_hash(b2)
+
+                # Repo refs obey the update level too. A moved branch is held
+                # by fixed/patch/minor and fetched only by a major update.
+                write(joinpath(src, "src", "TrackPkg.jl"), "module TrackPkg\nf() = 3\nend\n")
+                repo = LibGit2.GitRepo(src)
+                LibGit2.add!(repo, ".")
+                sig = LibGit2.Signature("tester", "tester@example.com")
+                commit3 = string(LibGit2.commit(repo, "third"; author = sig, committer = sig))
+                LibGit2.close(repo)
+                @test commit3 != commit2
+                tree2 = entry_tree_hash(b2)
+                for level in (UPLEVEL_FIXED, UPLEVEL_PATCH, UPLEVEL_MINOR)
+                    VibePkg.up("TrackPkg"; level, io = devnull)
+                    @test entry_tree_hash(entry(env_branch)) == tree2
+                end
+                VibePkg.up("TrackPkg"; level = UPLEVEL_MAJOR, io = devnull)
+                b3 = entry(env_branch)
+                @test entry_tree_hash(b3) != tree2
+
+                # Pinning remains the stronger hold even at the major level.
+                VibePkg.pin("TrackPkg"; io = devnull)
+                write(joinpath(src, "src", "TrackPkg.jl"), "module TrackPkg\nf() = 4\nend\n")
+                repo = LibGit2.GitRepo(src)
+                LibGit2.add!(repo, ".")
+                commit4 = string(LibGit2.commit(repo, "fourth"; author = sig, committer = sig))
+                LibGit2.close(repo)
+                @test commit4 != commit3
+                VibePkg.up("TrackPkg"; level = UPLEVEL_MAJOR, io = devnull)
+                @test entry_tree_hash(entry(env_branch)) == entry_tree_hash(b3)
             end
         finally
             Base.ACTIVE_PROJECT[] = old_active
@@ -345,6 +376,72 @@ end
             Base.ACTIVE_PROJECT[] = old_active
             append!(empty!(Base.DEPOT_PATH), old_depots)
             VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+        end
+    end
+end
+
+@testset "re-add by name reuses an unregistered package URL" begin
+    mktempdir() do dir
+        dir = realpath(dir)
+        src, commit1, branch = make_track_repo(dir)
+        repo = LibGit2.GitRepo(src)
+        LibGit2.close(
+            LibGit2.GitReference(
+                repo, LibGit2.GitHash(commit1), "refs/heads/oldtip",
+            )
+        )
+        LibGit2.close(repo)
+        write(joinpath(src, "src", "TrackPkg.jl"), "module TrackPkg\nf() = 2\nend\n")
+        repo = LibGit2.GitRepo(src)
+        LibGit2.add!(repo, ".")
+        sig = LibGit2.Signature("tester", "tester@example.com")
+        commit2 = string(LibGit2.commit(repo, "second"; author = sig, committer = sig))
+        LibGit2.close(repo)
+
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        envdir = mkpath(joinpath(dir, "env"))
+        manifest_file = joinpath(envdir, "Manifest.toml")
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            withenv("JULIA_PKG_SERVER" => "") do
+                VibePkg.add(; url = src, rev = branch, io = devnull)
+                latest = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test entry_repo_url(latest) == src
+                @test entry_repo_rev(latest) == branch
+                @test entry_tree_hash(latest) == git_tree_hash(src, commit2)
+
+                # No registry knows TrackPkg. Its name resolves from the
+                # manifest and the URL/subdir come from the stored source.
+                VibePkg.add(; name = "TrackPkg", rev = "oldtip", io = devnull)
+                old = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test entry_repo_url(old) == src
+                @test entry_repo_rev(old) == "oldtip"
+                @test entry_tree_hash(old) == git_tree_hash(src, commit1)
+                @test entry_tree_hash(old) != entry_tree_hash(latest)
+
+                # An explicit URL add cannot override a pin either.
+                VibePkg.pin("TrackPkg"; io = devnull)
+                pinned = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test pinned.pinned
+                VibePkg.add(; url = src, rev = branch, io = devnull)
+                held = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test held.pinned
+                @test entry_repo_rev(held) == "oldtip"
+                @test entry_tree_hash(held) == entry_tree_hash(pinned)
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
         end
     end
 end
@@ -542,6 +639,131 @@ function make_track_registry(depot, repo_url, tree1)
     return reg
 end
 
+function add_track_parent_to_registry!(reg, dir)
+    src = joinpath(dir, "TrackParent")
+    mkpath(joinpath(src, "src"))
+    write(
+        joinpath(src, "Project.toml"), """
+        name = "TrackParent"
+        uuid = "$TRACKPARENT_UUID"
+        version = "1.0.0"
+
+        [deps]
+        TrackPkg = "$TRACKPKG_UUID"
+        """,
+    )
+    write(joinpath(src, "src", "TrackParent.jl"), "module TrackParent\nusing TrackPkg\nend\n")
+    LibGit2.close(LibGit2.init(src))
+    commit = commit_all!(src, "initial")
+    tree = string(git_tree_hash(src, commit))
+
+    open(joinpath(reg, "Registry.toml"), "a") do io
+        println(io, "$TRACKPARENT_UUID = { name = \"TrackParent\", path = \"T/TrackParent\" }")
+    end
+    pkg = mkpath(joinpath(reg, "T", "TrackParent"))
+    open(joinpath(pkg, "Package.toml"), "w") do io
+        TOML.print(io, Dict("name" => "TrackParent", "uuid" => string(TRACKPARENT_UUID), "repo" => src))
+    end
+    write(joinpath(pkg, "Versions.toml"), "[\"1.0.0\"]\ngit-tree-sha1 = \"$tree\"\n")
+    write(joinpath(pkg, "Deps.toml"), "[\"1\"]\nTrackPkg = \"$TRACKPKG_UUID\"\n")
+    return src
+end
+
+@testset "add a registered version overrides repo tracking" begin
+    mktempdir() do dir
+        dir = realpath(dir)
+        src, commit1, branch = make_track_repo(dir)
+        tree1 = git_tree_hash(src, commit1)
+        write(joinpath(src, "src", "TrackPkg.jl"), "module TrackPkg\nf() = 2\nend\n")
+        commit2 = commit_all!(src, "second")
+
+        depot = mkpath(joinpath(dir, "depot"))
+        make_track_registry(depot, src, string(tree1))
+        envdir = mkpath(joinpath(dir, "env"))
+        manifest_file = joinpath(envdir, "Manifest.toml")
+        project_file = joinpath(envdir, "Project.toml")
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            Base.ACTIVE_PROJECT[] = project_file
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            withenv("JULIA_PKG_SERVER" => "") do
+                VibePkg.add(; url = src, rev = branch, io = devnull)
+                repo_entry = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test is_repo_tracked(repo_entry)
+                @test entry_tree_hash(repo_entry) == git_tree_hash(src, commit2)
+
+                VibePkg.add(; name = "TrackPkg", version = v"0.1.0", io = devnull)
+                registered = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test is_registry_tracked(registered)
+                @test entry_version(registered) == v"0.1.0"
+                @test entry_tree_hash(registered) == tree1
+                project = load_environment(envdir; depots = depot_stack([depot])).project
+                @test !haskey(project.sources, "TrackPkg")
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end
+
+@testset "add a registered version overrides indirect repo tracking" begin
+    mktempdir() do dir
+        dir = realpath(dir)
+        src, commit1, branch = make_track_repo(dir)
+        tree1 = git_tree_hash(src, commit1)
+        write(joinpath(src, "src", "TrackPkg.jl"), "module TrackPkg\nf() = 2\nend\n")
+        commit_all!(src, "second")
+        depot = mkpath(joinpath(dir, "depot"))
+        reg = make_track_registry(depot, src, string(tree1))
+        add_track_parent_to_registry!(reg, dir)
+        envdir = mkpath(joinpath(dir, "env"))
+        manifest_file = joinpath(envdir, "Manifest.toml")
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            withenv("JULIA_PKG_SERVER" => "") do
+                VibePkg.add("TrackParent"; io = devnull)
+                initial = read_manifest(manifest_file)
+                @test is_registry_tracked(initial[TRACKPKG_UUID])
+                @test !("TrackPkg" in keys(load_environment(envdir; depots = depot_stack([depot])).project.deps))
+
+                VibePkg.add(; url = src, rev = branch, io = devnull)
+                @test is_repo_tracked(read_manifest(manifest_file)[TRACKPKG_UUID])
+                VibePkg.rm("TrackPkg"; io = devnull)
+                indirect = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test is_repo_tracked(indirect)
+                @test !haskey(load_environment(envdir; depots = depot_stack([depot])).project.deps, "TrackPkg")
+
+                VibePkg.add(; name = "TrackPkg", version = v"0.1.0", io = devnull)
+                registered = read_manifest(manifest_file)[TRACKPKG_UUID]
+                @test is_registry_tracked(registered)
+                @test entry_tree_hash(registered) == tree1
+                @test load_environment(envdir; depots = depot_stack([depot])).project.deps["TrackPkg"] == TRACKPKG_UUID
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+    end
+end
+
 # Pkg.jl#4165: a lone `rev` in `[sources]` is honored, with the url inferred
 # from the registry
 @testset "lone rev in [sources]" begin
@@ -649,6 +871,69 @@ end
         path, installed = find_installed(depots2, "TrackPkg", TRACKPKG_UUID, rp2.tree_hash)
         @test installed
         @test occursin("f() = 613", read(joinpath(path, "src", "TrackPkg.jl"), String))
+    end
+end
+
+# Pkg's URL-repository cache has two distinct recovery jobs: it can restore a
+# missing content-addressed checkout without contacting the origin, and, when
+# that cache is gone too, instantiate can recreate it from the recorded URL.
+@testset "instantiate reuses and recreates a URL clone cache" begin
+    mktempdir() do dir
+        dir = realpath(dir)
+        src, _, branch = make_track_repo(dir)
+        depot = mkpath(joinpath(dir, "depot"))
+        make_test_registry(depot)
+        depots = depot_stack([depot])
+        envdir = mkpath(joinpath(dir, "env"))
+        project_file = joinpath(envdir, "Project.toml")
+
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            Base.ACTIVE_PROJECT[] = project_file
+            append!(empty!(Base.DEPOT_PATH), [depot; old_depots[2:end]])
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            withenv("JULIA_PKG_SERVER" => "") do
+                VibePkg.add(; url = src, rev = branch, io = devnull)
+                entry = read_manifest(joinpath(envdir, "Manifest.toml"))[TRACKPKG_UUID]
+                hash = entry_tree_hash(entry)
+                pkgdir, installed = find_installed(depots, "TrackPkg", TRACKPKG_UUID, hash)
+                cache = Git.repo_cache_path(depots, src)
+                @test installed
+                @test isdir(cache)
+
+                # With the origin temporarily unavailable, success proves the
+                # existing bare clone—not the source repository—restores the tree.
+                Base.rm(pkgdir; recursive = true)
+                hidden_src = src * ".away"
+                Base.mv(src, hidden_src)
+                try
+                    VibePkg.instantiate(; io = devnull)
+                    @test isfile(joinpath(pkgdir, "src", "TrackPkg.jl"))
+                finally
+                    Base.mv(hidden_src, src)
+                end
+
+                # Remove both layers. The same public operation must clone the
+                # recorded URL again and reproduce the identical installed tree.
+                Base.rm(pkgdir; recursive = true)
+                clones = joinpath(depot, "clones")
+                Base.rm(clones; recursive = true)
+                @test !ispath(pkgdir) && !ispath(clones)
+                VibePkg.instantiate(; io = devnull)
+                @test isfile(joinpath(pkgdir, "src", "TrackPkg.jl"))
+                @test isdir(clones) && !isempty(readdir(clones))
+                @test entry_tree_hash(read_manifest(joinpath(envdir, "Manifest.toml"))[TRACKPKG_UUID]) == hash
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            append!(empty!(Base.DEPOT_PATH), old_depots)
+            VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
     end
 end
 
@@ -804,9 +1089,7 @@ end
 end
 
 # Pkg.jl new.jl "downloads with JULIA_PKG_USE_CLI_GIT" — with the env var set,
-# repo materialization goes through the command-line git instead of libgit2 and
-# still installs a working, read-only source tree. (VibePkg gates only on
-# JULIA_PKG_USE_CLI_GIT; it has no use_git_for_all_downloads/only-tarballs kwargs.)
+# repo materialization goes through the command-line git instead of libgit2.
 @testset "materialize via CLI git" begin
     if Sys.which("git") === nothing
         @test_skip "git CLI not available"
@@ -826,6 +1109,126 @@ end
                 @test is_repo_tracked(planned.manifest[GITPKG_UUID])
             end
         end
+    end
+end
+
+@testset "public add download modes" begin
+    fx = LocalPkgServer.ensure!()
+    for cli_git in (nothing, "true")
+        if cli_git !== nothing && Sys.which("git") === nothing
+            @test_skip "git CLI not available"
+            continue
+        end
+        withenv("JULIA_PKG_USE_CLI_GIT" => cli_git) do
+            mktempdir() do dir
+                depot = mkpath(joinpath(dir, "depot"))
+                envdir = mkpath(joinpath(dir, "env"))
+                old_active = Base.ACTIVE_PROJECT[]
+                old_depots = copy(Base.DEPOT_PATH)
+                old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+                old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+                try
+                    Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                    copy!(Base.DEPOT_PATH, [depot])
+                    VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+                    VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+
+                    # Force a registered package down the git installer even
+                    # though the local package server has a valid tarball.
+                    VibePkg.add(
+                        PackageSpec(name = "Example", version = v"0.5.4");
+                        use_git_for_all_downloads = true, io = devnull,
+                    )
+                    env = load_environment(envdir; depots = depot_stack([depot]))
+                    source = VibePkg.Execution.entry_source_path(
+                        env.manifest_file, env.manifest[EXAMPLE_UUID], depot_stack([depot]),
+                    )
+                    @test isfile(joinpath(source, "src", "Example.jl"))
+                    regular_files = String[
+                        joinpath(root, file)
+                            for (root, _, files) in walkdir(source) for file in files
+                            if !islink(joinpath(root, file))
+                    ]
+                    @test !isempty(regular_files)
+                    @test all(p -> filemode(p) & 0o222 == 0, regular_files)
+                    @test isdir(joinpath(depot, "clones", string(EXAMPLE_UUID)))
+
+                    missing = joinpath(dir, "does-not-exist.git")
+                    @test_throws PkgError VibePkg.add(
+                        ; url = missing, use_git_for_all_downloads = true,
+                        io = devnull,
+                    )
+                    @test_throws PkgError VibePkg.Registry.add(
+                        missing; depots = depot, io = devnull,
+                    )
+                finally
+                    Base.ACTIVE_PROJECT[] = old_active
+                    copy!(Base.DEPOT_PATH, old_depots)
+                    VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+                    VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+                end
+            end
+
+            # Tarball-only is also a public add mode. A fresh depot proves it
+            # did not populate the UUID-keyed git clone fallback cache.
+            mktempdir() do dir
+                depot = mkpath(joinpath(dir, "depot"))
+                envdir = mkpath(joinpath(dir, "env"))
+                old_active = Base.ACTIVE_PROJECT[]
+                old_depots = copy(Base.DEPOT_PATH)
+                old_auto = VibePkg.API.AUTO_PRECOMPILE_ENABLED[]
+                old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+                try
+                    Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                    copy!(Base.DEPOT_PATH, [depot])
+                    VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = false
+                    VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+                    VibePkg.add(
+                        PackageSpec(name = "Example", version = v"0.5.4");
+                        use_only_tarballs_for_downloads = true, io = devnull,
+                    )
+                    env = load_environment(envdir; depots = depot_stack([depot]))
+                    @test entry_version(env.manifest[EXAMPLE_UUID]) == v"0.5.4"
+                    @test !isdir(joinpath(depot, "clones", string(EXAMPLE_UUID)))
+                finally
+                    Base.ACTIVE_PROJECT[] = old_active
+                    copy!(Base.DEPOT_PATH, old_depots)
+                    VibePkg.API.AUTO_PRECOMPILE_ENABLED[] = old_auto
+                    VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+                end
+            end
+        end
+    end
+
+    # A server miss whose tree is available from git distinguishes strict
+    # tarball mode from the ordinary archive-then-git fallback.
+    mktempdir() do dir
+        depots = depot_stack([mkpath(joinpath(dir, "depot"))])
+        uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        hash = SHA1(fx.version_hashes["0.5.4"])
+        @test_throws PkgError VibePkg.Fetch.ensure_package_installed!(
+            depots, "TarballOnlyProbe", uuid, hash, [fx.git_repo];
+            archive_urls = String[], server = fx.url,
+            use_only_tarballs_for_downloads = true, io = devnull,
+        )
+        path, new = VibePkg.Fetch.ensure_package_installed!(
+            depots, "TarballOnlyProbe", uuid, hash, [fx.git_repo];
+            archive_urls = String[], server = fx.url, io = devnull,
+        )
+        @test new
+        @test isfile(joinpath(path, "src", "Example.jl"))
+
+        # As in Pkg.Context, an explicit all-git mode takes precedence when
+        # both implementation switches are supplied.
+        both_uuid = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef")
+        both_path, both_new = VibePkg.Fetch.ensure_package_installed!(
+            depots, "BothModesProbe", both_uuid, hash, [fx.git_repo];
+            archive_urls = String[], server = fx.url,
+            use_git_for_all_downloads = true,
+            use_only_tarballs_for_downloads = true, io = devnull,
+        )
+        @test both_new
+        @test isfile(joinpath(both_path, "src", "Example.jl"))
     end
 end
 

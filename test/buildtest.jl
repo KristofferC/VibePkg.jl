@@ -44,6 +44,7 @@ const MT_UUID = UUID("cececece-1111-2222-3333-444444444444")
 const RG_UUID = UUID("dfdfdfdf-1111-2222-3333-444444444444")
 const AI_UUID = UUID("edededed-1111-2222-3333-444444444444")
 const TH_UUID = UUID("edededed-2222-3333-4444-555555555555")
+const REQUIRE_UUID = UUID("edededed-3333-4444-5555-666666666666")
 const INSTALLED_BUILD_UUID = UUID("74736554-676b-5064-6c69-75426c696146")
 const EX_UUID = UUID("7876af07-990d-54b4-ab0e-23690620f79a")   # Example
 
@@ -168,11 +169,14 @@ end
         @test isfile(joinpath(pkg, "deps", "build.log"))
 
         # test: sandbox resolve + subprocess run.
-        # Pkg.jl new.jl "test: printing" — the run prints a "Testing" banner
-        # and a "<pkg> tests passed" line on success.
+        # Pkg.jl new.jl "test: printing" — the run prints its testing banner,
+        # both sandbox status views, and a success line.
         testio = IOBuffer()
         TestOps.test!(env, RegistryInstance[], Config(depots), BT_UUID; test_args = ["extra"], io = testio)
         testout = String(take!(testio))
+        @test occursin(r"Testing BTPkg", testout)
+        @test occursin(r"Status `.+Project\.toml`", testout)
+        @test occursin(r"Status `.+Manifest\.toml`", testout)
         @test occursin("Running tests...", testout)
         @test occursin("BTPkg tests passed", testout)
 
@@ -783,6 +787,88 @@ end
         @test sandbox.deps == Dict("NoTargets" => NF_UUID)
         @test isempty(sandbox.sources)
         @test TestOps.test!(env, RegistryInstance[], Config(depots), NF_UUID; io = devnull) === nothing
+    end
+end
+
+# Pkg.jl new.jl "using a test/REQUIRE file" — retain the deprecated Pkg2
+# compatibility path for packages that still declare test dependencies by
+# name. Version text is deliberately ignored, as in upstream Pkg; this local
+# fixture covers registry and stdlib name resolution without network access.
+@testset "test: deprecated test/REQUIRE dependencies" begin
+    LocalPkgServer.ensure!()
+    mktempdir() do dir
+        pkg = joinpath(dir, "LegacyRequire")
+        mkpath(joinpath(pkg, "src"))
+        mkpath(joinpath(pkg, "test"))
+        write(joinpath(pkg, "src", "LegacyRequire.jl"), "module LegacyRequire\nend\n")
+        write(
+            joinpath(pkg, "test", "REQUIRE"), """
+            # Pkg2 version bounds are ignored by the compatibility shim.
+            @legacy-platform Example 99
+            Test
+            """
+        )
+        write(
+            joinpath(pkg, "test", "runtests.jl"), """
+            using Example, Test
+            @test Example.domath(37) == 42
+            """
+        )
+
+        depot = mkpath(joinpath(dir, "depot"))
+        depots = depot_stack([depot])
+        envdir = mkpath(joinpath(dir, "env"))
+        write(
+            joinpath(envdir, "Project.toml"),
+            "[deps]\nLegacyRequire = \"$REQUIRE_UUID\"\n",
+        )
+        write(
+            joinpath(envdir, "Manifest.toml"), """
+            julia_version = "$VERSION"
+            manifest_format = "2.0"
+
+            [[deps.LegacyRequire]]
+            path = $(repr(pkg))
+            uuid = "$REQUIRE_UUID"
+            version = "0.0.0"
+            """,
+        )
+        env = load_environment(envdir; depots)
+        add_default_registries!(depots; io = devnull)
+        regs = reachable_registries(depots)
+        sandbox = TestOps.sandbox_project(
+            pkg, "LegacyRequire", REQUIRE_UUID, env.project;
+            registries = regs, package_deps = env.manifest[REQUIRE_UUID].deps,
+        )
+        @test sandbox.deps["Example"] == EX_UUID
+        @test sandbox.deps["Test"] == UUID("8dfed614-e22c-5e08-85e1-65c5234f0b40")
+
+        result = Ref{Any}()
+        test_io = IOBuffer()
+        subprocess_depots = join(
+            [joinpath(dir, "depot"); Base.DEPOT_PATH[2:end]], LocalPkgServer.DEPOT_SEP,
+        )
+        old_active = Base.ACTIVE_PROJECT[]
+        old_depots = copy(Base.DEPOT_PATH)
+        old_gate = VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[]
+        try
+            Base.ACTIVE_PROJECT[] = env.project_file
+            copy!(Base.DEPOT_PATH, [depot; old_depots[2:end]])
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = true
+            @test_logs (:warn, r"using test/REQUIRE files is deprecated") match_mode = :any begin
+                result[] = withenv("JULIA_DEPOT_PATH" => subprocess_depots) do
+                    VibePkg.test("LegacyRequire"; io = test_io)
+                end
+            end
+        finally
+            Base.ACTIVE_PROJECT[] = old_active
+            copy!(Base.DEPOT_PATH, old_depots)
+            VibePkg.API.UPDATED_REGISTRY_THIS_SESSION[] = old_gate
+        end
+        result[] === nothing || error(
+            "LegacyRequire test subprocess failed:\n" * String(take!(test_io)),
+        )
+        @test result[] === nothing
     end
 end
 

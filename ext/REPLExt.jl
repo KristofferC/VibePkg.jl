@@ -10,13 +10,19 @@ end
 
 using REPL: REPL
 using REPL.LineEdit: LineEdit
+using REPL: TerminalMenus
 
 import VibePkg
+using VibePkg.Depots: depot_stack
 using VibePkg.Environments: find_workspace_root, safe_realpath
+using VibePkg.Environments: load_environment
 using VibePkg.EnvFiles: read_project
 using VibePkg.REPLMode: REPLMode, do_cmd
 using VibePkg.Errors: PkgError
-using VibePkg.Utils: unstableio
+using VibePkg.Utils: unstableio, stderr_f, printpkgstyle, pathrepr
+import VibePkg.Display
+import VibePkg.Fetch
+import VibePkg.Registries
 
 # The prompt is recomputed at most once per change, not per keystroke:
 # `promptf` serves the cache and `invalidate_prompt!` drops it after every
@@ -80,10 +86,15 @@ end
 struct VibeCompletionProvider <: LineEdit.CompletionProvider end
 
 function LineEdit.complete_line(::VibeCompletionProvider, s; hint::Bool = false)
-    buf = LineEdit.buffer(s)
-    partial = String(buf.data[1:(buf.ptr - 1)])
+    partial = REPL.beforecursor(s.input_buffer)
     matches, word = REPLMode.completions_for(partial)
-    return matches, word, !isempty(matches)
+    named_completions = map(LineEdit.NamedCompletion, matches)
+    # LineEdit's current interface uses a zero-based byte region. The core
+    # completion API replaces the final word, so its bounds are determined
+    # directly from the before-cursor string.
+    stop = ncodeunits(partial)
+    region = (stop - ncodeunits(word)) => stop
+    return named_completions, region, !isempty(matches)
 end
 
 function create_mode(repl::REPL.AbstractREPL, main::LineEdit.Prompt)
@@ -172,6 +183,157 @@ function REPLMode.install_repl!(; key::Char = ']')
     return install_in(Base.active_repl; key)
 end
 
+############################
+# Missing-package add hook #
+############################
+
+function registered_missing_packages(pkgs::Vector{Symbol})
+    registries = Registries.reachable_registries(
+        depot_stack(); read_from_tarball = Fetch.pkg_server() !== nothing,
+    )
+    available = Symbol[]
+    for pkg in pkgs
+        name = String(pkg)
+        found = false
+        for registry in registries, (uuid, entry) in Registries.registry_pkgs(registry)
+            if entry.name == name && uuid != Registries.JULIA_UUID
+                found = true
+                break
+            end
+        end
+        found && push!(available, pkg)
+    end
+    return available
+end
+
+"Prompt to install names that Julia's loader could not find."
+function try_prompt_pkg_add(
+        pkgs::Vector{Symbol}; input_io::IO = stdin, io::IO = stderr_f(),
+    )
+    available = registered_missing_packages(pkgs)
+    isempty(available) && return false
+    shown = length(available) == 1 ? String(only(available)) : "[$(join(available, ", "))]"
+    plural = length(available) == 1 ? "package" : "packages"
+    println(io, "Missing $plural $shown available from a registry.")
+    print(io, "Install $plural? [y/n]: ")
+    flush(io)
+    response = try
+        readline(input_io)
+    catch err
+        err isa EOFError || rethrow()
+        return false
+    end
+    answer = lowercase(strip(response))
+    (isempty(answer) || answer in ("y", "yes")) || return false
+    VibePkg.add(string.(available); io)
+    return length(available) == length(pkgs)
+end
+
+#############################
+# Interactive compat editor #
+#############################
+
+function edit_compat_buffer(
+        input_io::IO, io::IO, dep::String, initial::String,
+    )
+    prompt = "  Edit compat entry for $dep:"
+    print(io, prompt)
+    buffer = initial
+    cursor = length(buffer)
+    start_pos = length(prompt) + 2
+    move_start = "\e[$(start_pos)G"
+    clear_to_end = "\e[0J"
+    tty = input_io isa Base.TTY
+    tty && ccall(:jl_tty_set_mode, Int32, (Ptr{Cvoid}, Int32), input_io.handle, true)
+    return try
+        while true
+            print(io, move_start, clear_to_end, buffer, "\e[$(start_pos + cursor)G")
+            key = TerminalMenus._readkey(input_io)::Union{Char, TerminalMenus.Key}
+            if key == '\r'
+                println(io)
+                return buffer
+            elseif key == '\x03'
+                println(io)
+                return nothing
+            elseif key == TerminalMenus.ARROW_RIGHT
+                cursor = min(length(buffer), cursor + 1)
+            elseif key == TerminalMenus.ARROW_LEFT
+                cursor = max(0, cursor - 1)
+            elseif key == TerminalMenus.HOME_KEY
+                cursor = 0
+            elseif key == TerminalMenus.END_KEY
+                cursor = length(buffer)
+            elseif key == TerminalMenus.DEL_KEY
+                if cursor == 0 && !isempty(buffer)
+                    buffer = buffer[2:end]
+                elseif cursor < length(buffer)
+                    buffer = buffer[1:cursor] * buffer[(cursor + 2):end]
+                end
+            elseif key isa TerminalMenus.Key
+                # Other escaped multi-byte keys do not edit the entry.
+            elseif key == '\x7f'
+                # In particular, backspace at the start of an empty entry is
+                # a no-op (Pkg.jl #3828), never a bounds error.
+                if cursor > 0
+                    buffer = cursor == 1 ? buffer[2:end] :
+                        cursor == length(buffer) ? buffer[1:(end - 1)] :
+                        buffer[1:(cursor - 1)] * buffer[(cursor + 1):end]
+                    cursor -= 1
+                end
+            else
+                buffer = cursor == 0 ? key * buffer :
+                    cursor == length(buffer) ? buffer * key :
+                    buffer[1:cursor] * key * buffer[(cursor + 1):end]
+                cursor += 1
+            end
+        end
+    finally
+        tty && ccall(:jl_tty_set_mode, Int32, (Ptr{Cvoid}, Int32), input_io.handle, false)
+    end
+end
+
+function interactive_compat(; io::IO = stderr_f(), input_io::IO = stdin)
+    env = load_environment(; depots = depot_stack())
+    printpkgstyle(io, :Compat, pathrepr(env.project_file))
+    deps = sort!(collect(env.project.deps); by = first)
+    longest = max(length("julia"), maximum(length(first(dep)) for dep in deps; init = 0))
+    labels = String[
+        Display.compat_line(
+            io, "julia", nothing, Display.get_compat_str(env.project, "julia"),
+            longest; indent = "",
+        ),
+    ]
+    names = String["julia"]
+    for (name, uuid) in deps
+        push!(
+            labels,
+            Display.compat_line(
+                io, name, uuid, Display.get_compat_str(env.project, name),
+                longest; indent = "",
+            ),
+        )
+        push!(names, name)
+    end
+    menu = TerminalMenus.RadioMenu(labels; pagesize = length(labels), charset = :ascii)
+    terminal = TerminalMenus.default_terminal(in = input_io, out = io)
+    choice = try
+        TerminalMenus.request(terminal, "  Select an entry to edit:", menu)
+    catch err
+        err isa InterruptException || rethrow()
+        println(io)
+        return false
+    end
+    choice == -1 && return false
+    dep = names[choice]
+    initial = something(Display.get_compat_str(env.project, dep), "")
+    edited = edit_compat_buffer(input_io, io, dep, initial)
+    edited === nothing && return false
+    VibePkg.compat(dep, strip(edited); io)
+    return nothing
+end
+
+REPLMode.INTERACTIVE_COMPAT_HOOK[] = interactive_compat
+
 # The mode installs itself: into a running REPL when the extension loads
 # late, or via atreplinit when VibePkg is loaded from a startup file.
 function __init__()
@@ -192,6 +354,11 @@ function __init__()
             end
         end
     end
+    if isdefined(REPL, :install_packages_hooks) &&
+            !(try_prompt_pkg_add in REPL.install_packages_hooks)
+        push!(REPL.install_packages_hooks, try_prompt_pkg_add)
+    end
+    REPLMode.INTERACTIVE_COMPAT_HOOK[] = interactive_compat
     return
 end
 

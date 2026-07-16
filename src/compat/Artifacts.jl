@@ -7,22 +7,26 @@
 module Artifacts
 using Artifacts: artifact_meta, artifact_hash, artifact_exists, artifact_path,
     find_artifacts_toml, select_downloadable_artifacts,
-    pack_platform!, unpack_platform
+    pack_platform!, unpack_platform, with_artifacts_directory,
+    artifacts_dirs, query_override
 using Base: SHA1
 using Base.BinaryPlatforms: AbstractPlatform, HostPlatform, platforms_match, triplet
+using SHA: sha256
 import TOML
 
 using ..Errors: pkgerror
 using ..Utils: stderr_f, create_cachedir_tag, mv_temp_dir_retries, atomic_toml_write
-using ..Depots: depot_stack, depots1, artifacts_dir, log_usage
+using ..Depots: depot_stack, log_usage
 using FileWatching: mkpidlock
 import ..ArtifactOps
+import ..Fetch
 import ..TreeHash
 
 export artifact_meta, artifact_hash, artifact_exists, artifact_path,
     find_artifacts_toml, select_downloadable_artifacts,
     ensure_artifact_installed, remove_artifact, verify_artifact,
-    create_artifact, bind_artifact!, unbind_artifact!
+    create_artifact, archive_artifact, with_artifacts_directory,
+    bind_artifact!, unbind_artifact!
 
 """
     ensure_artifact_installed(name, artifacts_toml; platform, io) -> path
@@ -54,8 +58,12 @@ end
 
 "Delete the artifact tree for `hash` (no-op when absent)."
 function remove_artifact(hash::SHA1)
-    path, installed = ArtifactOps.artifact_tree_path(depot_stack(), hash)
-    installed && Base.rm(path; recursive = true, force = true)
+    # Never delete an override target: it is user-owned, not an artifact-store
+    # installation.  `artifacts_dirs` also observes with_artifacts_directory().
+    query_override(hash) === nothing || return nothing
+    for path in artifacts_dirs(string(hash))
+        isdir(path) && Base.rm(path; recursive = true, force = true)
+    end
     return nothing
 end
 
@@ -81,7 +89,10 @@ Set `legacy_symlink_size = true` only when compatibility with hashes made by
 older Pkg versions is required.
 """
 function create_artifact(f::Function; legacy_symlink_size::Bool = false)
-    store = mkpath(artifacts_dir(depots1(depot_stack())))
+    # Artifacts.artifacts_dirs() incorporates with_artifacts_directory(); using
+    # it here makes the compatibility surface and our mutating implementation
+    # agree on both the creation and lookup location.
+    store = mkpath(first(artifacts_dirs()))
     create_cachedir_tag(store)
     temp_dir = mktempdir(store)
     return try
@@ -94,6 +105,25 @@ function create_artifact(f::Function; legacy_symlink_size::Bool = false)
     finally
         Base.rm(temp_dir; recursive = true, force = true)
     end
+end
+
+"""
+    archive_artifact(hash, tarball_path; honor_overrides = false) -> String
+
+Archive an installed artifact and return the tarball's SHA-256 as lowercase
+hex.  Override targets are rejected by default because they are user-owned.
+"""
+function archive_artifact(
+        hash::SHA1, tarball_path::String;
+        honor_overrides::Bool = false,
+    )
+    override = query_override(hash)
+    override === nothing || honor_overrides ||
+        error("Will not archive an overridden artifact unless `honor_overrides` is set!")
+    artifact_exists(hash; honor_overrides) ||
+        error("Unable to archive artifact $(string(hash)): does not exist!")
+    Fetch.package(artifact_path(hash; honor_overrides), tarball_path)
+    return bytes2hex(open(sha256, tarball_path))
 end
 
 # whether a `[[<name>]]` entry binds a platform semantically equivalent to

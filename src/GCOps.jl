@@ -151,6 +151,42 @@ function gc_registries!(gc_depots::Vector{String}; verbose::Bool, io::IO)
     return
 end
 
+# Base records paths which could not be removed immediately (notably on
+# Windows) as one-line files under `delayed_delete_ref()`. A manual package GC
+# is a useful retry point even though these paths need not belong to a depot.
+function cleanup_delayed_deletes!()
+    isdefined(Base.Filesystem, :delayed_delete_ref) || return
+    refs = Base.Filesystem.delayed_delete_ref()
+    isdir(refs) || return
+    delayed_dirs = Set{String}()
+    for ref in readdir(refs; join = true)
+        path = nothing
+        try
+            path = readline(ref)
+            push!(delayed_dirs, dirname(path))
+            Base.Filesystem.prepare_for_deletion(path)
+            Base.rm(
+                path; recursive = true, force = true,
+                allow_delayed_delete = false,
+            )
+            Base.rm(ref; force = true)
+        catch err
+            @debug "Failed to process delayed-delete reference $(repr(ref))" path exception = err
+        end
+    end
+    for dir in delayed_dirs
+        if isdir(dir) && basename(dir) == "julia_delayed_deletes" && isempty(readdir(dir))
+            Base.Filesystem.prepare_for_deletion(dir)
+            Base.rm(dir; recursive = true)
+        end
+    end
+    if isdir(refs) && isempty(readdir(refs))
+        Base.Filesystem.prepare_for_deletion(refs)
+        Base.rm(refs; recursive = true)
+    end
+    return
+end
+
 """
     gc(depots; verbose = false, force = false, io)
 
@@ -315,6 +351,7 @@ function gc(
     else
         printpkgstyle(io, :Deleted, join(parts, ", ") * " ($(format_mib(freed)))")
     end
+    cleanup_delayed_deletes!()
     gc_registries!(gc_depots; verbose, io)
     touch(gc_stamp(depots1(d)))
     return nothing

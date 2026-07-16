@@ -203,6 +203,11 @@ end
 
 @testset "setprotocol! rewrites clone urls per domain" begin
     domain = "mygit.example.com"
+    default_domain = "github.com"
+    had_default_protocol = haskey(Git.GIT_PROTOCOLS, default_domain)
+    had_default_user = haskey(Git.GIT_USERS, default_domain)
+    old_default_protocol = get(Git.GIT_PROTOCOLS, default_domain, nothing)
+    old_default_user = get(Git.GIT_USERS, default_domain, nothing)
     try
         # protocol unset: urls pass through untouched
         @test Git.normalize_url("git@$domain:Org/Pkg.jl.git") == "git@$domain:Org/Pkg.jl.git"
@@ -214,6 +219,14 @@ end
         VibePkg.setprotocol!(domain = domain, protocol = "ssh")
         @test Git.normalize_url("https://$domain/Org/Pkg.jl.git") == "ssh://git@$domain/Org/Pkg.jl.git"
 
+        # The former positional API remains callable, but points callers at
+        # the keyword form through the standard deprecation mechanism. Like
+        # upstream, that old shape controls the default github.com domain.
+        @test_deprecated VibePkg.setprotocol!("https")
+        @test Git.normalize_url("git@$default_domain:Org/Pkg.jl.git") == "https://$default_domain/Org/Pkg.jl.git"
+        @test_deprecated Git.setprotocol!("ssh")
+        @test Git.normalize_url("https://$default_domain/Org/Pkg.jl.git") == "ssh://git@$default_domain/Org/Pkg.jl.git"
+
         # nothing delegates the choice back to the url author
         VibePkg.setprotocol!(domain = domain, protocol = nothing)
         @test Git.normalize_url("git@$domain:Org/Pkg.jl.git") == "git@$domain:Org/Pkg.jl.git"
@@ -224,6 +237,12 @@ end
     finally
         delete!(Git.GIT_PROTOCOLS, domain)
         delete!(Git.GIT_USERS, domain)
+        had_default_protocol ?
+            (Git.GIT_PROTOCOLS[default_domain] = old_default_protocol) :
+            delete!(Git.GIT_PROTOCOLS, default_domain)
+        had_default_user ?
+            (Git.GIT_USERS[default_domain] = old_default_user) :
+            delete!(Git.GIT_USERS, default_domain)
     end
 end
 
@@ -262,8 +281,25 @@ end
             VibePkg.develop(path = devved, io = devnull)
             VibePkg.activate("Devved"; io = devnull)
             @test canon(Base.active_project()) == canon(joinpath(devved, "Project.toml"))
-            # a non-dep name is treated as a plain (new) path
+            # Resolution by dependency name is anchored to the active
+            # manifest, not the caller's cwd.
             VibePkg.activate("-"; io = devnull)
+            elsewhere = mkpath(joinpath(dir, "elsewhere"))
+            cd(elsewhere) do
+                VibePkg.activate("Devved"; io = devnull)
+                @test canon(Base.active_project()) == canon(joinpath(devved, "Project.toml"))
+            end
+
+            # A registered, non-developed dependency is deliberately not
+            # activated from its package-store source. Its name remains an
+            # ordinary relative path, just like any non-dependency name.
+            VibePkg.activate(envdir; io = devnull)
+            VibePkg.add("Example"; io = devnull)
+            cd(envdir) do
+                VibePkg.activate("Example"; io = devnull)
+                @test normpath(Base.active_project()) ==
+                    joinpath(realpath(envdir), "Example", "Project.toml")
+            end
         finally
             API.PREV_ENV_PATH[] = old_prev
         end

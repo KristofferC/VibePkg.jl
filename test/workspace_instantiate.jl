@@ -108,9 +108,16 @@ end
         write(joinpath(ws, "Project.toml"), "name = \"WS\"\nuuid = \"96f64aaf-235f-491a-a76e-24269ac5efad\"\nversion = \"0.1.0\"\n\n[workspace]\nprojects = [\"test\"]\n")
         write(joinpath(ws, "src", "WS.jl"), "module WS end\n")
         write(joinpath(ws, "test", "Project.toml"), "[deps]\nExample = \"$EX_UUID\"\nTest = \"$TST_UUID\"\n")
-        # Example is a test-only dep — verify it precompiled against the test
-        # project (not the parent) and loads.
-        write(joinpath(ws, "test", "runtests.jl"), "using Test\n@test Base.isprecompiled(Base.identify_package(\"Example\"))\nusing Example\n")
+        # Example is a test-only dep and must load from the shared workspace
+        # manifest. Pkg intentionally suppresses the precompile hook when the
+        # parent process uses a non-default compiled-module mode, so only pin
+        # the cache assertion when that hook is available.
+        precompile_assertion = Base.JLOptions().use_compiled_modules == 1 ?
+            "@test Base.isprecompiled(Base.identify_package(\"Example\"))\n" : ""
+        write(
+            joinpath(ws, "test", "runtests.jl"),
+            "using Test\n$(precompile_assertion)using Example\n@test Example.hello(\"CI\") == \"Hello, CI\"\n",
+        )
 
         @test !isfile(joinpath(ws, "Manifest.toml"))
         @test !isfile(joinpath(ws, "test", "Manifest.toml"))

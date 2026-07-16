@@ -31,6 +31,19 @@ export pkgstr, do_cmd, TEST_MODE, completions_for
 
 const TEST_MODE = Ref(false)
 
+# Installed by the REPL extension. Keeping the headless parser independent of
+# REPL lets `compat` retain its non-interactive API behavior when the stdlib is
+# unavailable, while a real `vpkg>` session gets the interactive editor.
+const INTERACTIVE_COMPAT_HOOK = Ref{Union{Nothing, Function}}(nothing)
+
+function compat_repl(args...; io::IO = stderr_f(), kwargs...)
+    hook = INTERACTIVE_COMPAT_HOOK[]
+    if isempty(args) && isempty(kwargs) && hook !== nothing
+        return hook(; io)
+    end
+    return API.compat(args...; io, kwargs...)
+end
+
 #################
 # Command table #
 #################
@@ -186,14 +199,14 @@ function build_command_table()
     )
     register!("generate", nothing, API.generate, :splat, 1:1; help = "generate path\n\nCreate a new package skeleton.")
     register!(
-        "compat", nothing, API.compat, :splat, 0:2,
+        "compat", nothing, compat_repl, :splat, 0:2,
         Dict("current" => (:current => true));
-        help = "compat [pkg] [version]\n\nNo arguments: show the [compat] table. One argument: remove the entry. Two: set it and re-check the environment. `--current` fills missing entries from resolved versions."
+        help = "compat [pkg] [version]\n\nNo arguments in vpkg mode: interactively edit the [compat] table. One argument: remove the entry. Two: set it and re-check the environment. `--current` fills missing entries from resolved versions."
     )
     register!(
-        "why", nothing, API.why, :strings, 1:typemax(Int),
+        "why", nothing, API.why, :strings, 1:1,
         Dict("workspace" => (:workspace => true));
-        help = "why [--workspace] pkg ...\n\nShow the dependency paths leading to a package as a tree; `(*)` marks an already-printed sub-tree (`--workspace`: from any workspace member's dependencies)."
+        help = "why [--workspace] pkg\n\nShow the dependency paths leading to a package as a tree; `(*)` marks an already-printed sub-tree (`--workspace`: from any workspace member's dependencies)."
     )
     return specs
 end
@@ -551,6 +564,15 @@ function parse_statement(words::Vector{Word})
             pkgerror("Unknown app subcommand $(repr(sub)); expected add, develop, rm, update, or status")
         end
     end
+    if cmdword == "package"
+        length(words) >= 2 || pkgerror(
+            "package requires a subcommand; type ? to list available package commands"
+        )
+        # `package` is the explicit spelling of the ordinary command
+        # namespace (`package add X` == `add X`). Re-enter the same parser so
+        # options, aliases, and argument validation cannot drift.
+        return parse_statement(words[2:end])
+    end
     if cmdword == "registry"
         length(words) >= 2 || pkgerror("registry requires a subcommand; expected add, remove, update, or status")
         sub = words[2].raw
@@ -626,6 +648,21 @@ function parse_statement(words::Vector{Word})
             append!(tokens, package_word_tokens(w))
         end
         specs = fold_package_tokens(tokens)
+        # A bare identifier remains a package name even when an exactly
+        # case-matching directory exists in the cwd. Point the user at the
+        # explicit `./Name` spelling without silently changing its meaning.
+        if spec.canonical in ("add", "develop")
+            for pkg in specs
+                if pkg.name !== nothing && pkg.uuid === nothing &&
+                        pkg.version === nothing && pkg.rev === nothing &&
+                        pkg.subdir === nothing
+                    local_path = abspath(pkg.name)
+                    isdir(local_path) && @info(
+                        "Use `./$(pkg.name)` to add or develop the local directory at `$local_path`."
+                    )
+                end
+            end
+        end
         if spec.canonical ∉ ("add", "develop")
             for s in specs
                 (s.url === nothing && s.path === nothing) ||
@@ -706,7 +743,7 @@ function split_statements(input::AbstractString)
         elseif c == '"' || c == '\''
             write(buf, c)
             quote_char = c
-        elseif c == ';'
+        elseif c == ';' || c == '\n' || c == '\r'
             push!(statements, String(take!(buf)))
         else
             write(buf, c)
@@ -717,6 +754,14 @@ function split_statements(input::AbstractString)
 end
 
 function do_cmd(input::AbstractString; io::IO = stderr_f())
+    # Pasting a command copied with the Julia-mode transition key is benign
+    # inside package mode: strip one accidental leading `]`. A bare bracket is
+    # therefore a no-op, matching Pkg's REPL behavior.
+    input = lstrip(input)
+    if startswith(input, ']')
+        @warn "Removing leading `]`, which should only be used once to switch to pkg> mode"
+        input = lstrip(input[nextind(input, firstindex(input)):end])
+    end
     parsed_commands = ParsedCommand[]
     comma_break = uses_comma_sugar(input)
     for statement in split_statements(input)
@@ -767,7 +812,15 @@ function registered_package_names()
     cached === nothing || return copy(cached)
     names = String[]
     for registry in reachable_registries(), (_, package) in Registries.registry_pkgs(registry)
-        push!(names, package.name)
+        info = Registries.registry_info(registry, package)
+        compatible = any(keys(info.version_info)) do version
+            Registries.isyanked(info, version) && return false
+            julia_compat = Registries.query_compat_for_version(
+                info, version, Registries.JULIA_UUID,
+            )
+            return julia_compat === nothing || VERSION in julia_compat
+        end
+        compatible && push!(names, package.name)
     end
     sort!(unique!(names))
     REGISTERED_PACKAGE_NAMES[] = names
@@ -801,6 +854,46 @@ end
 
 stdlib_names() = sort!([info.name for info in values(Stdlibs.stdlib_infos())])
 
+function canonical_command_names()
+    names = String[spec.canonical for spec in values(command_specs())]
+    append!(names, ("registry", "app"))
+    return sort!(unique!(names))
+end
+
+function specified_package_names(words::Vector{String})
+    names = Set{String}()
+    for word in words[2:end]
+        startswith(word, '-') && continue
+        name = first(split(word, ['@', '#', '=', ':']; limit = 2))
+        isempty(name) || push!(names, name)
+    end
+    return names
+end
+
+function directory_completions(word::String; trailing_separator::Bool)
+    # Keep the spelling the user typed (including `./` and `~/`) in the
+    # replacement candidate while resolving the directory against the
+    # filesystem. Only directories are candidates: add/develop accept package
+    # roots, not arbitrary files.
+    if word == "~"
+        return [joinpath(homedir(), "")]
+    end
+    separator = findlast(c -> c == '/' || c == '\\', word)
+    typed_dir = separator === nothing ? "" : word[firstindex(word):separator]
+    prefix = separator === nothing ? word : word[nextind(word, separator):end]
+    disk_dir = expanduser_path(isempty(typed_dir) ? "." : typed_dir)
+    isdir(disk_dir) || return String[]
+    candidates = String[]
+    for entry in readdir(disk_dir)
+        startswith(entry, prefix) || continue
+        isdir(joinpath(disk_dir, entry)) || continue
+        candidate = isempty(typed_dir) ? entry : typed_dir * entry
+        trailing_separator && (candidate = joinpath(candidate, ""))
+        push!(candidates, candidate)
+    end
+    return candidates
+end
+
 # registry add / remove / update invalidates the caches automatically,
 # without every frontend having to remember reset_completion_cache!
 push!(Registries.REGISTRY_CHANGE_HOOKS, reset_completion_cache!)
@@ -815,11 +908,16 @@ a command. Never throws.
 function completions_for(partial::AbstractString)
     word = String(match(r"[^\s]*$", partial).match)
     before = strip(partial[1:(end - length(word))])
-    words = isempty(before) ? String[] : String.(split(before))
+    words = isempty(before) ? String[] : collect(String, split(before))
     specs = command_specs()
     cands = try
-        if isempty(words)
+        if isempty(words) && startswith(word, "?")
+            prefix = word[nextind(word, firstindex(word)):end]
+            ["?" * name for name in canonical_command_names() if startswith(name, prefix)]
+        elseif isempty(words)
             sort!(unique!(vcat(collect(keys(specs)), ["registry", "app", "help"])))
+        elseif words[1] in ("?", "help")
+            canonical_command_names()
         elseif words[1] == "registry"
             ["add", "remove", "status", "update"]
         elseif words[1] == "app"
@@ -831,15 +929,25 @@ function completions_for(partial::AbstractString)
             spec = get(specs, words[1], nothing)
             if spec === nothing
                 String[]
-            elseif spec.canonical in ("remove", "update", "pin", "free", "why", "build", "test", "compat")
+            elseif spec.canonical == "compat"
+                # Compat's second position is still package-name completion,
+                # not a version-string completion (#3562). Re-offering the
+                # selected name is intentional; a following version prefix
+                # naturally filters the name list to empty.
                 environment_dependency_names()
+            elseif spec.canonical in ("remove", "update", "pin", "free", "why", "build", "test")
+                specified_removals = specified_package_names(words)
+                filter(name -> name ∉ specified_removals, environment_dependency_names())
             elseif spec.canonical in ("add", "develop")
+                paths = directory_completions(word; trailing_separator = true)
                 names = vcat(registered_package_names(), stdlib_names())
-                filter(n -> !startswith(n, word) || !is_deprecated_package_name(n), names)
+                specified_additions = specified_package_names(words)
+                filter!(name -> name ∉ specified_additions, names)
+                filter!(name -> !startswith(name, word) || !is_deprecated_package_name(name), names)
+                append!(names, paths)
+                names
             elseif spec.canonical == "activate"
-                base = isempty(word) ? "." : (isdir(expanduser_path(word)) ? word : dirname(word))
-                dir = expanduser_path(base)
-                isdir(dir) ? [joinpath(base == "." ? "" : base, d) for d in readdir(dir) if isdir(joinpath(dir, d))] : String[]
+                directory_completions(word; trailing_separator = false)
             else
                 String[]
             end

@@ -739,7 +739,7 @@ end
             @test !isdir("Foobar")
             e_path = grab(() -> VibePkg.add(PackageSpec(; path = "./Foobar"); io = devnull))
             @test e_path isa PkgError
-            @test e_path.msg == "Package path $(repr(abspath("./Foobar"))) does not exist"
+            @test e_path.msg == "Path `$(abspath("./Foobar"))` does not exist."
         end
     end
 end
@@ -1612,10 +1612,9 @@ end
 
 # Pkg.jl manifests.jl "project_hash for identifying out of sync manifest" (239) —
 # a [compat] change since the last resolve flips is_manifest_current /
-# manifest_matches_project to false. Divergence: Pkg's `status` then prints an
-# out-of-sync warning; VibePkg's print_status stays silent (predicate-only), so
-# this asserts the flip end-to-end and pins the absence of the status message.
-@testset "stale manifest predicate flips (status stays silent)" begin
+# manifest_matches_project to false and public status prints the out-of-sync
+# warning before resolve/update restores a current manifest.
+@testset "stale manifest predicate flips and public status warns" begin
     mktempdir() do depot
         make_test_registry(depot)
         depots = depot_stack([depot])
@@ -1637,11 +1636,17 @@ end
             @test is_manifest_current(stale) === false
             @test !manifest_matches_project(stale)
 
-            out = sprint() do io
-                print_status(io, stale; registries = regs)
+            out = IOBuffer()
+            old_active = Base.ACTIVE_PROJECT[]
+            try
+                Base.ACTIVE_PROJECT[] = joinpath(envdir, "Project.toml")
+                @test VibePkg.status(; io = out) === nothing
+            finally
+                Base.ACTIVE_PROJECT[] = old_active
             end
-            @test occursin("Example", out)              # status still renders
-            @test !occursin("last resolved", out)       # no out-of-sync footer (divergence)
+            rendered = String(take!(out))
+            @test occursin("Example", rendered)
+            @test occursin("last resolved", rendered)
         end
     end
 end
